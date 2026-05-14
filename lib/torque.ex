@@ -299,6 +299,47 @@ defmodule Torque do
   end
 
   @doc """
+  Extracts multiple values from a parsed document with per-path defaults.
+
+  Takes a map of `%{path => default}` and returns a map of the same shape
+  where each value is either the parsed value or the supplied default (if
+  the path is missing).
+
+  More ergonomic than the two-call `get_many_nil/2` + `Enum.map` pattern
+  when consumers need defaults at the call site.
+
+  Equivalent to:
+
+      get_many_nil(doc, Map.keys(defaults))
+      |> then(&Enum.zip(Map.keys(defaults), &1))
+      |> Map.new(fn {p, nil} -> {p, Map.get(defaults, p)}; pv -> pv end)
+
+  Note: a parsed JSON `null` at the path is indistinguishable from a missing
+  field (same as `get_many_nil/2`) — both substitute the default.
+
+  ## Examples
+
+      iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":null}))
+      iex> Torque.get_many_defaults(doc, %{"/a" => 0, "/b" => 0, "/c" => "missing"})
+      %{"/a" => 1, "/b" => 0, "/c" => "missing"}
+  """
+  @doc group: :parse_get
+  @spec get_many_defaults(reference(), %{binary() => term()}) ::
+          %{binary() => term()}
+  def get_many_defaults(doc, defaults)
+      when is_reference(doc) and is_map(defaults) do
+    paths = Map.keys(defaults)
+    values = Torque.Native.get_many_nil(doc, paths)
+
+    paths
+    |> Enum.zip(values)
+    |> Map.new(fn
+      {path, nil} -> {path, Map.get(defaults, path)}
+      pv -> pv
+    end)
+  end
+
+  @doc """
   Returns the length of an array at the given JSON Pointer path, or `nil` if
   the path does not exist or does not point to an array.
 
