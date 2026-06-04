@@ -38,15 +38,15 @@ defmodule Torque.MixProject do
 
   defp deps do
     [
-      {:rustler_precompiled, "~> 0.8"},
-      {:rustler, ">= 0.0.0", optional: true},
-      {:ex_doc, "~> 0.35", only: :dev, runtime: false},
+      {:benchee, "~> 1.3", only: :bench},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
-      {:jason, "~> 1.4"},
-      {:stream_data, "~> 1.1", only: :test},
-      {:simdjsone, "~> 0.5.0", only: :bench},
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false},
+      {:jason, "~> 1.4", optional: true},
       {:jiffy, "~> 1.1", only: :bench},
-      {:benchee, "~> 1.3", only: [:bench, :dev]}
+      {:rustler, ">= 0.0.0", optional: true},
+      {:rustler_precompiled, "~> 0.8"},
+      {:simdjsone, "~> 0.5.0", only: :bench},
+      {:stream_data, "~> 1.1", only: :test}
     ]
   end
 
