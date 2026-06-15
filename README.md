@@ -2,7 +2,7 @@
 
 High-performance JSON library for Elixir via [Rustler](https://github.com/rustler-magic/rustler) NIFs, powered by [sonic-rs](https://github.com/cloudwego/sonic-rs) (SIMD-accelerated).
 
-Torque provides the fastest JSON encoding and decoding available in the BEAM ecosystem, with a selective field extraction API for workloads that only need a subset of fields from each document.
+Torque provides among the fastest JSON encoding and decoding available in the BEAM ecosystem, with a selective field extraction API for workloads that only need a subset of fields from each document.
 
 ## Features
 
@@ -166,79 +166,88 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 
 ## Benchmarks
 
-Apple M2 Pro, OTP 28, Elixir 1.19:
+Apple M2 Pro, OTP 29, Elixir 1.20:
 
 ### Decode (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** | **262.5K** | **3.81 μs** | **3.63 μs** | **7.83 μs** | **1.56 KB** |
-| **simdjsone** | 182.7K | 5.47 μs | 5.13 μs | 11.88 μs | 1.59 KB |
-| **jiffy** | 144.6K | 6.92 μs | 6.21 μs | 17.17 μs | **1.56 KB** |
-| **otp json** | 129.6K | 7.72 μs | 7.21 μs | 16.50 μs | 7.73 KB |
-| **jason** | 103.6K | 9.65 μs | 8.71 μs | 22.75 μs | 9.54 KB |
+| **glazer** | **371.2K** | **2.69 μs** | **2.50 μs** | 6.42 μs | 1.56 KB |
+| **torque** | 284.3K | 3.52 μs | 3.42 μs | **5.71 μs** | 1.56 KB |
+| **jiffy** | 215.7K | 4.64 μs | 4.21 μs | 8.71 μs | **1.55 KB** |
+| **simdjsone** | 194.9K | 5.13 μs | 4.96 μs | 8.96 μs | 1.59 KB |
+| **otp json** | 145.6K | 6.87 μs | 6.58 μs | 11.63 μs | 7.73 KB |
+| **jason** | 113.4K | 8.82 μs | 8.42 μs | 16.08 μs | 9.54 KB |
 
 ### Decode (750 KB Twitter)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** | **476.0** | **2.10 ms** | **1.87 ms** | **4.73 ms** | **1.56 KB** |
-| **simdjsone** | 459.4 | 2.18 ms | 1.85 ms | 3.20 ms | **1.56 KB** |
-| **otp json** | 195.1 | 5.13 ms | 5.12 ms | 6.16 ms | 2.49 MB |
-| **jason** | 142.0 | 7.04 ms | 6.91 ms | 11.47 ms | 3.55 MB |
-| **jiffy** | 115.9 | 8.63 ms | 8.72 ms | 9.94 ms | 5.53 MB |
+| **glazer** | **592.9** | **1.69 ms** | **1.50 ms** | **2.21 ms** | 1.58 KB |
+| **torque** | 543.6 | 1.84 ms | 1.66 ms | 2.36 ms | **1.57 KB** |
+| **simdjsone** | 438.4 | 2.28 ms | 1.80 ms | 3.40 ms | 1.59 KB |
+| **jiffy** | 311.5 | 3.21 ms | 3.31 ms | 3.71 ms | 2.30 MB |
+| **otp json** | 213.1 | 4.69 ms | 4.73 ms | 5.68 ms | 2.48 MB |
+| **jason** | 152.0 | 6.58 ms | 6.58 ms | 6.88 ms | 3.52 MB |
 
 ### Encode (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **otp json** [map() :: iodata()] | **1091.6K** | **0.92 μs** | **0.83 μs** | 1.46 μs | 3928 B |
-| **torque** [proplist() :: binary()] | 1073.6K | 0.93 μs | 0.88 μs | **1.13 μs** | 88 B |
-| **torque** [proplist() :: iodata()] | 1069.3K | 0.94 μs | 0.88 μs | 1.17 μs | **64 B** |
-| **torque** [map() :: binary()] | 917.5K | 1.09 μs | 1.00 μs | 1.33 μs | 88 B |
-| **torque** [map() :: iodata()] | 914.6K | 1.09 μs | 1.00 μs | 1.42 μs | **64 B** |
-| **jason** [map() :: iodata()] | 571.8K | 1.75 μs | 1.54 μs | 3.75 μs | 3848 B |
-| **jiffy** [proplist() :: iodata()] | 518.4K | 1.93 μs | 1.67 μs | 2.75 μs | 120 B |
-| **jiffy** [map() :: iodata()] | 427.6K | 2.34 μs | 2.08 μs | 4.33 μs | 824 B |
-| **simdjsone** [proplist() :: iodata()] | 415.4K | 2.41 μs | 2.21 μs | 3.96 μs | 184 B |
-| **jason** [map() :: binary()] | 385.1K | 2.60 μs | 2.38 μs | 5.00 μs | 3912 B |
-| **simdjsone** [map() :: iodata()] | 346.8K | 2.88 μs | 2.67 μs | 4.33 μs | 888 B |
+| **torque** [proplist() :: iodata()] | **1260K** | **0.79 μs** | **0.71 μs** | **0.92 μs** | **64 B** |
+| **torque** [proplist() :: binary()] | 1250K | 0.80 μs | 0.75 μs | **0.92 μs** | 88 B |
+| **otp json** [map() :: iodata()] | 1180K | 0.85 μs | 0.79 μs | 1.25 μs | 3928 B |
+| **torque** [map() :: binary()] | 1050K | 0.96 μs | 0.88 μs | 1.04 μs | 88 B |
+| **glazer** [map() :: binary()] | 1020K | 0.98 μs | 0.83 μs | 1.63 μs | **64 B** |
+| **torque** [map() :: iodata()] | 1010K | 0.99 μs | 0.88 μs | 1.96 μs | **64 B** |
+| **jiffy** [proplist() :: iodata()] | 730K | 1.37 μs | 1.17 μs | 1.63 μs | 120 B |
+| **jason** [map() :: iodata()] | 610K | 1.63 μs | 1.50 μs | 2.63 μs | 3848 B |
+| **jiffy** [map() :: iodata()] | 590K | 1.71 μs | 1.42 μs | 3.71 μs | 824 B |
+| **simdjsone** [proplist() :: iodata()] | 450K | 2.23 μs | 2.04 μs | 2.75 μs | 184 B |
+| **simdjsone** [map() :: iodata()] | 370K | 2.67 μs | 2.42 μs | 4.67 μs | 888 B |
+| **jason** [map() :: binary()] | 290K | 3.48 μs | 2.42 μs | 20.04 μs | 3912 B |
 
 ### Encode (750 KB Twitter)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: iodata()] | **1026.4** | **0.97 ms** | **0.96 ms** | **1.18 ms** | **64 B** |
-| **torque** [proplist() :: binary()] | 983.5 | 1.02 ms | 0.98 ms | 1.69 ms | 88 B |
-| **torque** [map() :: binary()] | 918.5 | 1.09 ms | 1.08 ms | 1.31 ms | 88 B |
-| **torque** [map() :: iodata()] | 905.4 | 1.10 ms | 1.09 ms | 1.35 ms | **64 B** |
-| **jiffy** [proplist() :: iodata()] | 342.6 | 2.92 ms | 2.86 ms | 4.35 ms | 37.7 KB |
-| **jiffy** [map() :: iodata()] | 270.8 | 3.69 ms | 3.53 ms | 5.94 ms | 1.06 MB |
-| **jason** [map() :: iodata()] | 254.9 | 3.92 ms | 3.70 ms | 6.50 ms | 4.96 MB |
-| **simdjsone** [proplist() :: iodata()] | 247.4 | 4.04 ms | 3.98 ms | 5.63 ms | 37.7 KB |
-| **otp json** [map() :: iodata()] | 246.9 | 4.05 ms | 4.13 ms | 5.64 ms | 5.40 MB |
-| **simdjsone** [map() :: iodata()] | 210.5 | 4.75 ms | 4.78 ms | 5.41 ms | 1.06 MB |
-| **jason** [map() :: binary()] | 141.1 | 7.09 ms | 7.02 ms | 8.40 ms | 4.96 MB |
+| **torque** [proplist() :: binary()] | **1245.8** | **0.80 ms** | **0.79 ms** | **0.98 ms** | 88 B |
+| **torque** [proplist() :: iodata()] | 1241.5 | 0.81 ms | **0.79 ms** | **0.98 ms** | **64 B** |
+| **torque** [map() :: binary()] | 1121.0 | 0.89 ms | 0.88 ms | 1.05 ms | 88 B |
+| **torque** [map() :: iodata()] | 1096.7 | 0.91 ms | 0.90 ms | 1.08 ms | **64 B** |
+| **glazer** [map() :: binary()] | 1001.0 | 1.00 ms | 0.99 ms | 1.10 ms | **64 B** |
+| **jiffy** [proplist() :: iodata()] | 544.7 | 1.84 ms | 1.83 ms | 2.04 ms | 37.7 KB |
+| **jiffy** [map() :: iodata()] | 402.6 | 2.48 ms | 2.63 ms | 2.97 ms | 1.06 MB |
+| **otp json** [map() :: iodata()] | 277.6 | 3.60 ms | 3.40 ms | 4.71 ms | 5.40 MB |
+| **simdjsone** [proplist() :: iodata()] | 258.6 | 3.87 ms | 3.81 ms | 5.82 ms | 37.7 KB |
+| **jason** [map() :: iodata()] | 240.0 | 4.17 ms | 3.91 ms | 6.22 ms | 4.96 MB |
+| **simdjsone** [map() :: iodata()] | 218.6 | 4.57 ms | 4.66 ms | 5.31 ms | 1.06 MB |
+| **jason** [map() :: binary()] | 129.6 | 7.72 ms | 7.71 ms | 8.34 ms | 4.96 MB |
 
 ### Parse (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse(unique_keys) | **596.6K** | **1.68 μs** | **1.33 μs** | **3.13 μs** |
-| **torque** parse | 579.2K | 1.73 μs | **1.33 μs** | 3.88 μs |
-| **simdjsone** parse | 364.9K | 2.74 μs | 1.17 μs | 4.92 μs |
+| **torque** parse(unique_keys) | **570.0K** | **1.75 μs** | 1.33 μs | 5.79 μs |
+| **torque** parse | 545.2K | 1.83 μs | 1.33 μs | 6.08 μs |
+| **simdjsone** parse | 360.1K | 2.78 μs | **1.17 μs** | **5.63 μs** |
 
 ### Get (5 fields) (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** get_many_nil (unique_keys) | **2.49M** | **402 ns** | **375 ns** | **500 ns** | **240 B** |
-| **torque** get_many (unique_keys) | 2.37M | 422 ns | **375 ns** | **500 ns** | 360 B |
-| **torque** get_many_nil | 2.16M | 463 ns | 458 ns | 583 ns | **240 B** |
-| **torque** get_many | 2.07M | 483 ns | 458 ns | 584 ns | 360 B |
-| **simdjsone** get | 1.77M | 564 ns | 458 ns | 1083 ns | 384 B |
-| **torque** get (unique_keys) | 1.67M | 601 ns | 583 ns | 709 ns | 384 B |
-| **torque** get | 1.50M | 669 ns | 625 ns | 792 ns | 384 B |
+| **glazer** find (decoded) | **2.83M** | **353 ns** | **333 ns** | **459 ns** | 424 B |
+| **torque** get_many_nil (unique_keys) | 2.43M | 411 ns | 375 ns | 500 ns | **240 B** |
+| **torque** get_many (unique_keys) | 2.36M | 423 ns | 375 ns | 500 ns | 360 B |
+| **torque** get_many_nil | 2.13M | 469 ns | 458 ns | 584 ns | **240 B** |
+| **torque** get_many | 2.04M | 491 ns | 458 ns | 625 ns | 360 B |
+| **simdjsone** get | 1.76M | 568 ns | 458 ns | 1000 ns | 384 B |
+| **torque** get (unique_keys) | 1.56M | 641 ns | 584 ns | 792 ns | 384 B |
+| **torque** get | 1.41M | 709 ns | 667 ns | 916 ns | 384 B |
+
+`glazer find` runs over a fully decoded term (decode cost excluded, as parse
+cost is excluded for `torque`/`simdjsone`); glazer has no parse-to-handle API,
+so it is absent from the parse benchmark.
 
 Run benchmarks locally:
 
