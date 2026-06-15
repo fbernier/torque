@@ -627,5 +627,4 @@ defmodule Torque.PropertyTest do
       assert {:error, :no_such_field} = Torque.get(doc2, "/a/0/x")
     end
   end
-
 end
