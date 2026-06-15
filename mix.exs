@@ -41,6 +41,7 @@ defmodule Torque.MixProject do
       {:benchee, "~> 1.3", only: :bench},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
+      {:glazer, "~> 0.5", only: :bench},
       {:jason, "~> 1.4", optional: true},
       {:jiffy, "~> 2.0", only: :bench},
       {:rustler, ">= 0.0.0", optional: true},
