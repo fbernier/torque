@@ -4,6 +4,7 @@ use rustler::sys::{
 };
 use rustler::{Env, NewBinary, Term};
 use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
+use std::mem::MaybeUninit;
 
 use crate::atoms;
 
@@ -57,14 +58,19 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
             let count = arr.len();
             let child_depth = depth - 1;
             if count <= STACK_SIZE {
-                let mut terms: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
+                let mut terms: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                    [MaybeUninit::uninit(); STACK_SIZE];
                 for (i, v) in arr.iter().enumerate() {
-                    terms[i] = value_to_term(env, v, child_depth)?.as_c_arg();
+                    terms[i].write(value_to_term(env, v, child_depth)?.as_c_arg());
                 }
                 unsafe {
                     Some(Term::new(
                         env,
-                        enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), count as u32),
+                        enif_make_list_from_array(
+                            env.as_c_arg(),
+                            terms.as_ptr() as *const ERL_NIF_TERM,
+                            count as u32,
+                        ),
                     ))
                 }
             } else {
@@ -88,18 +94,20 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
             let count = obj.len();
             let child_depth = depth - 1;
             if count <= STACK_SIZE {
-                let mut keys: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
-                let mut vals: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
+                let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                    [MaybeUninit::uninit(); STACK_SIZE];
+                let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                    [MaybeUninit::uninit(); STACK_SIZE];
                 for (i, (k, v)) in obj.iter().enumerate() {
-                    keys[i] = make_binary_term(env, k).as_c_arg();
-                    vals[i] = value_to_term(env, v, child_depth)?.as_c_arg();
+                    keys[i].write(make_binary_term(env, k).as_c_arg());
+                    vals[i].write(value_to_term(env, v, child_depth)?.as_c_arg());
                 }
                 let mut map: ERL_NIF_TERM = 0;
                 unsafe {
                     if enif_make_map_from_arrays(
                         env.as_c_arg(),
-                        keys.as_ptr(),
-                        vals.as_ptr(),
+                        keys.as_ptr() as *const ERL_NIF_TERM,
+                        vals.as_ptr() as *const ERL_NIF_TERM,
                         count,
                         &mut map,
                     ) != 0
