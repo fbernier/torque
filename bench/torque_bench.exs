@@ -1,4 +1,4 @@
-# Benchmark: Torque vs simdjsone, jiffy, Jason, OTP JSON
+# Benchmark: Torque vs glazer, simdjsone, jiffy, Jason, OTP JSON
 #
 # Run with: MIX_ENV=bench mix run bench/torque_bench.exs
 # CI JSON output: BENCH_OUTPUT=json MIX_ENV=bench mix run bench/torque_bench.exs
@@ -306,6 +306,7 @@ IO.puts("=== DECODE BENCHMARK ===\n")
 
 Benchee.run(
   %{
+    "glazer decode" => fn -> :glazer_json.decode(sample_json) end,
     "jason decode" => fn -> Jason.decode!(sample_json) end,
     "jiffy decode" => fn -> :jiffy.decode(sample_json, [:return_maps]) end,
     "otp json decode" => fn -> :json.decode(sample_json) end,
@@ -327,6 +328,7 @@ IO.puts("\n=== LARGE JSON DECODE BENCHMARK ===\n")
 
 Benchee.run(
   %{
+    "glazer decode" => fn -> :glazer_json.decode(large_json) end,
     "jason decode" => fn -> Jason.decode!(large_json) end,
     "jiffy decode" => fn -> :jiffy.decode(large_json, [:return_maps]) end,
     "otp json decode" => fn -> :json.decode(large_json) end,
@@ -355,6 +357,7 @@ Benchee.run(
       :jiffy.encode(bid_response_proplist, [:force_utf8])
     end,
     "otp json [map() :: iodata()]" => fn -> :json.encode(bid_response) end,
+    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(bid_response) end,
     "simdjsone [map() :: iodata()]" => fn -> :simdjson.encode(bid_response) end,
     "simdjsone [proplist() :: iodata()]" => fn -> :simdjson.encode(bid_response_proplist) end,
     "torque [map() :: binary()]" => fn -> Torque.encode!(bid_response) end,
@@ -382,6 +385,7 @@ Benchee.run(
     "jiffy [map() :: iodata()]" => fn -> :jiffy.encode(large_decoded_json) end,
     "jiffy [proplist() :: iodata()]" => fn -> :jiffy.encode(large_decoded_proplist) end,
     "otp json [map() :: iodata()]" => fn -> :json.encode(large_decoded_json) end,
+    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(large_decoded_json) end,
     "simdjsone [map() :: iodata()]" => fn -> :simdjson.encode(large_decoded_json) end,
     "simdjsone [proplist() :: iodata()]" => fn -> :simdjson.encode(large_decoded_proplist) end,
     "torque [map() :: binary()]" => fn -> Torque.encode!(large_decoded_json) end,
@@ -402,6 +406,16 @@ Benchee.run(
 {:ok, pre_doc} = Torque.parse(sample_json)
 {:ok, pre_doc_uk} = Torque.parse(sample_json, unique_keys: true)
 pre_ref = :simdjson.parse(sample_json)
+
+# glazer has no parse-to-handle API; glazer:find/2 runs over a decoded term, so
+# it appears under "get" (decode once, reuse) rather than "parse".
+glazer_decoded = :glazer_json.decode(sample_json)
+
+glazer_paths =
+  Enum.map(
+    [".id", ".site.domain", ".device.ip", ".device.geo.country", ".user.id"],
+    &:glazer.compile_path/1
+  )
 
 BenchGroup.set("Parse — 1.2 KB OpenRTB")
 IO.puts("\n=== PARSE BENCHMARK ===\n")
@@ -429,6 +443,9 @@ IO.puts("\n=== GET BENCHMARK ===\n")
 
 Benchee.run(
   %{
+    "glazer find (decoded)" => fn ->
+      for p <- glazer_paths, do: :glazer.find(glazer_decoded, p)
+    end,
     "simdjsone get" => fn -> for f <- fields, do: :simdjson.get(pre_ref, f) end,
     "torque get" => fn -> for f <- fields, do: Torque.get(pre_doc, f) end,
     "torque get_many" => fn -> Torque.get_many(pre_doc, fields) end,
