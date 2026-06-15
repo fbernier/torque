@@ -42,7 +42,7 @@ defmodule Torque.MixProject do
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:jason, "~> 1.4", optional: true},
-      {:jiffy, "~> 1.1", only: :bench},
+      {:jiffy, "~> 2.0", only: :bench},
       {:rustler, ">= 0.0.0", optional: true},
       {:rustler_precompiled, "~> 0.8"},
       {:simdjsone, "~> 0.5.0", only: :bench},
