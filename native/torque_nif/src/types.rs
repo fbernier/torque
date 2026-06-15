@@ -9,9 +9,12 @@ use crate::atoms;
 
 const STACK_SIZE: usize = 64;
 
-/// Maximum JSON nesting depth accepted by `value_to_term`. Inputs nested deeper
-/// than this return `{:error, :nesting_too_deep}` rather than crashing the VM.
-pub const MAX_DEPTH: u32 = 512;
+/// Maximum JSON nesting depth accepted by `value_to_term`, the serde decoder,
+/// and the encoder. Inputs nested deeper than this return
+/// `{:error, :nesting_too_deep}` rather than overflowing the stack and crashing
+/// the VM. Sized for the small dirty-CPU-scheduler stack, which inputs >20 KB
+/// are dispatched to: depths near 512 overflow it, so the limit is kept well below.
+pub const MAX_DEPTH: u32 = 128;
 
 #[inline]
 fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {

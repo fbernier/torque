@@ -149,7 +149,7 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 
 | Atom | Returned by | Meaning |
 |------|-------------|---------|
-| `:nesting_too_deep` | `decode/1`, `get/2`, `get_many/2` | Document exceeds 512 nesting levels |
+| `:nesting_too_deep` | `decode/1`, `get/2`, `get_many/2` | Document exceeds 128 nesting levels |
 
 `parse/1` and `decode/1` also return `{:error, binary}` with a message from sonic-rs for malformed JSON.
 
@@ -162,7 +162,7 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 | `:invalid_key` | `encode/1` | Map key is not an atom or binary (e.g. integer key) |
 | `:malformed_proplist` | `encode/1` | `{proplist}` contains a non-`{key, value}` element |
 | `:non_finite_float` | `encode/1` | Float is infinity or NaN (unreachable from normal BEAM code) |
-| `:nesting_too_deep` | `encode/1` | Term exceeds 512 nesting levels |
+| `:nesting_too_deep` | `encode/1` | Term exceeds 128 nesting levels |
 
 ## Benchmarks
 
@@ -248,7 +248,7 @@ MIX_ENV=bench mix run bench/torque_bench.exs
 
 ## Limitations
 
-- **Nesting depth**: JSON documents nested deeper than 512 levels return `{:error, :nesting_too_deep}` from `decode/1`, `get/2`, `get_many/2`, and `encode/1` rather than crashing the VM. Real-world documents are never this deep; the limit exists to prevent stack overflow in the NIF.
+- **Nesting depth**: JSON documents nested deeper than 128 levels return `{:error, :nesting_too_deep}` from `decode/1`, `get/2`, `get_many/2`, and `encode/1` rather than crashing the VM. Real-world documents are never this deep; the limit exists to prevent stack overflow in the NIF (the dirty CPU scheduler, used for inputs over 20 KB, has a small stack).
 
 ## License
 

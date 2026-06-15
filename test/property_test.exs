@@ -446,36 +446,44 @@ defmodule Torque.PropertyTest do
 
   # ---- Nesting depth limit ----
 
-  describe "nesting depth limit (512)" do
-    test "decode returns error at depth 513" do
-      json = Enum.reduce(1..513, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
+  describe "nesting depth limit (128)" do
+    test "decode returns error at depth 129" do
+      json = Enum.reduce(1..129, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
       assert {:error, :nesting_too_deep} = Torque.decode(json)
     end
 
-    test "decode succeeds at depth 512" do
-      json = Enum.reduce(1..512, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
+    test "decode succeeds at depth 128" do
+      json = Enum.reduce(1..128, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
       assert {:ok, _} = Torque.decode(json)
     end
 
-    test "get returns error at depth 513" do
-      json = Enum.reduce(1..513, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
+    test "get returns error at depth 129" do
+      json = Enum.reduce(1..129, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
       {:ok, doc} = Torque.parse(json)
       assert {:error, :nesting_too_deep} = Torque.get(doc, "")
     end
 
-    test "encode returns error at depth 513" do
-      term = Enum.reduce(1..513, "leaf", fn _, acc -> %{"x" => acc} end)
+    test "encode returns error at depth 129" do
+      term = Enum.reduce(1..129, "leaf", fn _, acc -> %{"x" => acc} end)
       assert {:error, :nesting_too_deep} = Torque.encode(term)
     end
 
-    test "encode succeeds at depth 512" do
-      term = Enum.reduce(1..512, "leaf", fn _, acc -> %{"x" => acc} end)
+    test "encode succeeds at depth 128" do
+      term = Enum.reduce(1..128, "leaf", fn _, acc -> %{"x" => acc} end)
       assert {:ok, _} = Torque.encode(term)
     end
 
-    test "encode_to_iodata raises at depth 513" do
-      term = Enum.reduce(1..513, "leaf", fn _, acc -> %{"x" => acc} end)
+    test "encode_to_iodata raises at depth 129" do
+      term = Enum.reduce(1..129, "leaf", fn _, acc -> %{"x" => acc} end)
       assert_raise ArgumentError, ~r/nesting_too_deep/, fn -> Torque.encode_to_iodata(term) end
+    end
+
+    # Regression for issue #23: JSONTestSuite n_structure_100000_opening_arrays.
+    # >20 KB, so it runs on the dirty CPU scheduler, whose small stack overflowed
+    # at the old depth limit. Must reject, not crash the VM.
+    test "decode rejects 100k unclosed arrays without crashing" do
+      json = String.duplicate("[", 100_000)
+      assert {:error, :nesting_too_deep} = Torque.decode(json)
     end
   end
 
