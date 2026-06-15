@@ -232,22 +232,20 @@ Apple M2 Pro, OTP 29, Elixir 1.20:
 | **torque** parse | 549.5K | 1.82 μs | 1.33 μs | 6.08 μs |
 | **simdjsone** parse | 320.4K | 3.12 μs | **1.21 μs** | 5.96 μs |
 
-### Get (5 fields) (1.2 KB OpenRTB)
+### Extract 5 fields from raw JSON (1.2 KB OpenRTB)
 
-| Library | ips | mean | median | p99 | memory |
-|---|---|---|---|---|---|
-| **glazer** find (decoded) | **2.81M** | **356 ns** | **333 ns** | **459 ns** | 424 B |
-| **torque** get_many_nil (unique_keys) | 2.53M | 395 ns | 375 ns | 500 ns | **240 B** |
-| **torque** get_many (unique_keys) | 2.44M | 411 ns | 375 ns | 500 ns | 360 B |
-| **torque** get_many_nil | 2.15M | 464 ns | 417 ns | 583 ns | **240 B** |
-| **torque** get_many | 2.10M | 475 ns | 458 ns | 583 ns | 360 B |
-| **simdjsone** get | 1.73M | 579 ns | 458 ns | 1083 ns | 384 B |
-| **torque** get (unique_keys) | 1.63M | 612 ns | 583 ns | 750 ns | 384 B |
-| **torque** get | 1.47M | 680 ns | 625 ns | 833 ns | 384 B |
+End-to-end cost of pulling 5 fields out of a JSON blob: `parse` + `get`
+(torque, simdjsone) vs `decode` + `find` (glazer has no lazy handle, so it must
+fully decode first). This is the apples-to-apples version of "get" — torque's
+selective extraction skips materializing the whole document.
 
-`glazer find` runs over a fully decoded term (decode cost excluded, as parse
-cost is excluded for `torque`/`simdjsone`); glazer has no parse-to-handle API,
-so it is absent from the parse benchmark.
+| Library | ips | mean | median | p99 |
+|---|---|---|---|---|
+| **torque** parse(unique_keys) + get_many | **443.3K** | **2.26 μs** | 1.71 μs | 6.67 μs |
+| **torque** parse + get_many | 425.3K | 2.35 μs | 1.79 μs | **6.04 μs** |
+| **torque** parse + get x5 | 419.9K | 2.38 μs | 2.00 μs | 6.92 μs |
+| **simdjsone** parse + get x5 | 371.7K | 2.69 μs | **1.67 μs** | 7.00 μs |
+| **glazer** decode + find x5 | 317.0K | 3.15 μs | 2.83 μs | 7.71 μs |
 
 Run benchmarks locally:
 
