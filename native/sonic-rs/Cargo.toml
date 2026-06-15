@@ -1,0 +1,50 @@
+# Vendored copy of sonic-rs 0.3.17 with a minimal Torque patch:
+#   * `JsonVisitor` and `RawStr` made public + re-exported
+#   * `parse_into_visitor` entry added, so Torque can build Erlang terms
+#     directly during the native SIMD parse (one pass, zero-copy strings)
+#     instead of going through the slower serde path
+#   * a recursion-depth limit added to the DOM parser so deeply nested input
+#     returns an error instead of overflowing the stack and crashing the VM
+# Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0)
+
+# Standalone manifest so this is not pulled into the torque workspace.
+[workspace]
+
+[package]
+edition = "2021"
+name = "sonic-rs"
+version = "0.3.17"
+authors = ["Volo Team <volo@cloudwego.io>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Sonic-rs is a fast Rust JSON library based on SIMD (vendored, patched for Torque)"
+license = "Apache-2.0"
+repository = "https://github.com/cloudwego/sonic-rs"
+
+[lib]
+name = "sonic_rs"
+path = "src/lib.rs"
+
+[dependencies]
+bumpalo = "3.13"
+bytes = "1.9"
+cfg-if = "1.0"
+faststr = { version = "0.2", features = ["serde"] }
+itoa = "1.0"
+ref-cast = "1.0"
+ryu = "1.0"
+serde = { version = "1.0", features = ["rc", "derive"] }
+simdutf8 = "0.1"
+sonic-number = "0.1"
+sonic-simd = "0.1"
+thiserror = "2.0"
+
+[features]
+arbitrary_precision = []
+default = []
+sort_keys = []
+use_raw = []
+utf8_lossy = []

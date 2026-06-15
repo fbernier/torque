@@ -1,6 +1,6 @@
 use crate::atoms;
+use crate::native_decode;
 use crate::nif_util::make_tuple2;
-use crate::serde_decode;
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
 use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
@@ -118,6 +118,20 @@ fn do_parse(bytes: &[u8], unique_keys: bool) -> Result<ResourceArc<ParsedDocumen
     }
 }
 
+/// Build the `{:error, _}` term for a parse failure. The vendored sonic-rs caps
+/// DOM nesting and reports it with a "...layers deep" message; surface that as
+/// `:nesting_too_deep` for parity with decode/get/encode. Other errors keep the
+/// sonic-rs message string.
+#[inline]
+fn parse_error_term<'a>(env: Env<'a>, reason: String) -> Term<'a> {
+    let err_raw = atoms::error().as_c_arg();
+    if reason.contains("layers deep") {
+        make_tuple2(env, err_raw, atoms::nesting_too_deep().as_c_arg())
+    } else {
+        make_tuple2(env, err_raw, reason.encode(env).as_c_arg())
+    }
+}
+
 #[rustler::nif]
 fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
     match do_parse(json.as_slice(), false) {
@@ -125,11 +139,7 @@ fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
         }
-        Err(reason) => make_tuple2(
-            env,
-            atoms::error().as_c_arg(),
-            reason.encode(env).as_c_arg(),
-        ),
+        Err(reason) => parse_error_term(env, reason),
     }
 }
 
@@ -137,11 +147,7 @@ fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
 fn parse_dirty<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
     match do_parse(json.as_slice(), false) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-        Err(reason) => make_tuple2(
-            env,
-            atoms::error().as_c_arg(),
-            reason.encode(env).as_c_arg(),
-        ),
+        Err(reason) => parse_error_term(env, reason),
     }
 }
 
@@ -152,11 +158,7 @@ fn parse_opts<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
         }
-        Err(reason) => make_tuple2(
-            env,
-            atoms::error().as_c_arg(),
-            reason.encode(env).as_c_arg(),
-        ),
+        Err(reason) => parse_error_term(env, reason),
     }
 }
 
@@ -164,11 +166,7 @@ fn parse_opts<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
 fn parse_opts_dirty<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
     match do_parse(json.as_slice(), unique_keys) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-        Err(reason) => make_tuple2(
-            env,
-            atoms::error().as_c_arg(),
-            reason.encode(env).as_c_arg(),
-        ),
+        Err(reason) => parse_error_term(env, reason),
     }
 }
 
@@ -288,7 +286,7 @@ fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) 
 #[rustler::nif]
 fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    let result = serde_decode::decode_to_term(env, input_term, json.as_slice());
+    let result = native_decode::decode_to_term(env, input_term, json.as_slice());
     schedule::consume_timeslice(env, timeslice_percent(json.len()));
     result
 }
@@ -296,7 +294,7 @@ fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_dirty<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    serde_decode::decode_to_term(env, input_term, json.as_slice())
+    native_decode::decode_to_term(env, input_term, json.as_slice())
 }
 
 #[rustler::nif]

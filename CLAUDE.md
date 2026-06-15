@@ -31,13 +31,13 @@ The script reads the version from `mix.exs`, creates a git tag, waits for the re
 
 ## Architecture
 
-Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON).
+Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON). sonic-rs is **vendored** under `native/sonic-rs/` with a minimal patch (see that crate's `Cargo.toml`): its native push-based `JsonVisitor` is made public, and its DOM parser is capped at 128 nesting levels so deeply nested input returns an error instead of overflowing the stack.
 
 ### Decoding Strategies
 
-1. **Parse + Get** — `parse/1` returns an opaque reference to a parsed document. `get/2,3` extracts fields by JSON Pointer (RFC 6901) path. `get_many/2` extracts multiple fields in a single NIF call. Ideal when only a subset of fields is needed.
+1. **Parse + Get** — `parse/1` returns an opaque reference to a parsed document (`sonic_rs::Value`). `get/2,3` extracts fields by JSON Pointer (RFC 6901) path via `value_to_term`. `get_many/2` extracts multiple fields in a single NIF call. Ideal when only a subset of fields is needed.
 
-2. **Full decode** — `decode/1` converts an entire JSON binary into Elixir terms in one pass.
+2. **Full decode** — `decode/1` builds Erlang terms directly during the SIMD parse by implementing sonic-rs's native `JsonVisitor` (`native_decode.rs`): single pass, no intermediate `Value`, zero-copy sub-binaries for unescaped strings.
 
 ### Encoding
 
@@ -45,7 +45,7 @@ Torque is a high-performance JSON library for Elixir using Rustler NIFs backed b
 
 ### Scheduler Awareness
 
-Inputs larger than 10 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
+Inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
 
 ### Type Conversion
 
@@ -65,6 +65,8 @@ Inputs larger than 10 KB are automatically dispatched to dirty CPU schedulers to
 - `lib/torque/native.ex` — RustlerPrecompiled NIF stubs (set `TORQUE_BUILD=true` to compile from source)
 - `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` resource
 - `native/torque_nif/src/decoder.rs` — parse, get, get_many, decode NIFs
+- `native/torque_nif/src/native_decode.rs` — fused decoder; builds terms during the SIMD parse via sonic-rs's `JsonVisitor`
 - `native/torque_nif/src/encoder.rs` — direct term-walking JSON encoder
-- `native/torque_nif/src/types.rs` — sonic_rs Value → Erlang term conversion
+- `native/torque_nif/src/types.rs` — sonic_rs Value → Erlang term conversion (used by get/get_many)
 - `native/torque_nif/src/atoms.rs` — cached atoms (ok, error, nil, no_such_field, nesting_too_deep, unsupported_type, non_finite_float, invalid_key, malformed_proplist, invalid_utf8)
+- `native/sonic-rs/` — vendored, Torque-patched sonic-rs (native `JsonVisitor` exposed + DOM recursion-depth limit)
