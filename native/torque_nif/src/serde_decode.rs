@@ -16,6 +16,7 @@ use rustler::{Encoder, Env, NewBinary, Term};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use std::fmt;
+use std::mem::MaybeUninit;
 
 use crate::atoms;
 use crate::nif_util::make_tuple2;
@@ -38,6 +39,14 @@ fn make_binary_term(env: Env, s: &str) -> ERL_NIF_TERM {
     binary.as_mut_slice().copy_from_slice(bytes);
     let term: Term = binary.into();
     term.as_c_arg()
+}
+
+/// View the initialized `count`-element prefix of a MaybeUninit stack array.
+///
+/// SAFETY: callers must have written `arr[..count]` before calling.
+#[inline]
+unsafe fn stack_slice(arr: &[MaybeUninit<ERL_NIF_TERM>], count: usize) -> &[ERL_NIF_TERM] {
+    std::slice::from_raw_parts(arr.as_ptr() as *const ERL_NIF_TERM, count)
 }
 
 /// Try to create a sub-binary; fall back to copy if the str is not in the input buffer.
@@ -189,7 +198,8 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
         let input = self.input;
 
         if hint <= STACK_SIZE {
-            let mut stack: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
+            let mut stack: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                [MaybeUninit::uninit(); STACK_SIZE];
             let mut count = 0;
 
             while count < STACK_SIZE {
@@ -199,19 +209,23 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
                     depth: child_depth,
                 })? {
                     Some(term) => {
-                        stack[count] = term;
+                        stack[count].write(term);
                         count += 1;
                     }
                     None => {
                         return Ok(unsafe {
-                            enif_make_list_from_array(env.as_c_arg(), stack.as_ptr(), count as u32)
+                            enif_make_list_from_array(
+                                env.as_c_arg(),
+                                stack.as_ptr() as *const ERL_NIF_TERM,
+                                count as u32,
+                            )
                         });
                     }
                 }
             }
 
             let mut heap = Vec::with_capacity(STACK_SIZE * 2);
-            heap.extend_from_slice(&stack[..count]);
+            heap.extend(stack.iter().map(|s| unsafe { s.assume_init() }));
             while let Some(term) = seq.next_element_seed(TermSeed {
                 env,
                 input,
@@ -247,8 +261,10 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
         let input = self.input;
 
         if hint <= STACK_SIZE {
-            let mut key_stack: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
-            let mut val_stack: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
+            let mut key_stack: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                [MaybeUninit::uninit(); STACK_SIZE];
+            let mut val_stack: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                [MaybeUninit::uninit(); STACK_SIZE];
             let mut count = 0;
 
             while count < STACK_SIZE {
@@ -259,20 +275,22 @@ impl<'de, 'a> Visitor<'de> for TermVisitor<'a> {
                             input,
                             depth: child_depth,
                         })?;
-                        key_stack[count] = key;
-                        val_stack[count] = val;
+                        key_stack[count].write(key);
+                        val_stack[count].write(val);
                         count += 1;
                     }
                     None => {
-                        return build_map(env, &key_stack[..count], &val_stack[..count], count);
+                        let keys = unsafe { stack_slice(&key_stack, count) };
+                        let vals = unsafe { stack_slice(&val_stack, count) };
+                        return build_map(env, keys, vals, count);
                     }
                 }
             }
 
             let mut keys = Vec::with_capacity(STACK_SIZE * 2);
             let mut vals = Vec::with_capacity(STACK_SIZE * 2);
-            keys.extend_from_slice(&key_stack[..count]);
-            vals.extend_from_slice(&val_stack[..count]);
+            keys.extend(key_stack.iter().map(|s| unsafe { s.assume_init() }));
+            vals.extend(val_stack.iter().map(|s| unsafe { s.assume_init() }));
             while let Some(key) = map.next_key_seed(KeySeed { env, input })? {
                 let val = map.next_value_seed(TermSeed {
                     env,
