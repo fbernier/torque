@@ -403,14 +403,8 @@ Benchee.run(
     ] ++ ci_formatters
 )
 
-{:ok, pre_doc} = Torque.parse(sample_json)
-{:ok, pre_doc_uk} = Torque.parse(sample_json, unique_keys: true)
-pre_ref = :simdjson.parse(sample_json)
-
-# glazer has no parse-to-handle API; glazer:find/2 runs over a decoded term, so
-# it appears under "get" (decode once, reuse) rather than "parse".
-glazer_decoded = :glazer_json.decode(sample_json)
-
+# Pre-compiled jq paths for glazer (application-time constants, like torque's
+# JSON pointer strings) — reused inside the timed function below.
 glazer_paths =
   Enum.map(
     [".id", ".site.domain", ".device.ip", ".device.geo.country", ".user.id"],
@@ -438,25 +432,40 @@ Benchee.run(
     ] ++ ci_formatters
 )
 
-BenchGroup.set("Get (5 fields) — 1.2 KB OpenRTB")
-IO.puts("\n=== GET BENCHMARK ===\n")
+BenchGroup.set("Extract 5 fields — 1.2 KB OpenRTB")
+IO.puts("\n=== EXTRACT 5 FIELDS BENCHMARK ===\n")
 
+# End-to-end from raw JSON: each library does its full setup plus 5 extractions,
+# so the comparison is apples-to-apples — torque/simdjsone parse + get, glazer
+# decode + find (it has no lazy handle). memory_time is 0 because simdjsone's
+# parse resource is freed during Benchee's memory runs and its destructor
+# use-after-frees (segfault).
 Benchee.run(
   %{
-    "glazer find (decoded)" => fn ->
-      for p <- glazer_paths, do: :glazer.find(glazer_decoded, p)
+    "glazer decode + find x5" => fn ->
+      d = :glazer_json.decode(sample_json)
+      for p <- glazer_paths, do: :glazer.find(d, p)
     end,
-    "simdjsone get" => fn -> for f <- fields, do: :simdjson.get(pre_ref, f) end,
-    "torque get" => fn -> for f <- fields, do: Torque.get(pre_doc, f) end,
-    "torque get_many" => fn -> Torque.get_many(pre_doc, fields) end,
-    "torque get_many_nil" => fn -> Torque.get_many_nil(pre_doc, fields) end,
-    "torque get (unique_keys)" => fn -> for f <- fields, do: Torque.get(pre_doc_uk, f) end,
-    "torque get_many (unique_keys)" => fn -> Torque.get_many(pre_doc_uk, fields) end,
-    "torque get_many_nil (unique_keys)" => fn -> Torque.get_many_nil(pre_doc_uk, fields) end
+    "simdjsone parse + get x5" => fn ->
+      r = :simdjson.parse(sample_json)
+      for f <- fields, do: :simdjson.get(r, f)
+    end,
+    "torque parse + get x5" => fn ->
+      {:ok, doc} = Torque.parse(sample_json)
+      for f <- fields, do: Torque.get(doc, f)
+    end,
+    "torque parse + get_many" => fn ->
+      {:ok, doc} = Torque.parse(sample_json)
+      Torque.get_many(doc, fields)
+    end,
+    "torque parse(unique_keys) + get_many" => fn ->
+      {:ok, doc} = Torque.parse(sample_json, unique_keys: true)
+      Torque.get_many(doc, fields)
+    end
   },
   warmup: 2,
   time: 5,
-  memory_time: 2,
+  memory_time: 0,
   percentiles: [50, 95, 99],
   formatters:
     [

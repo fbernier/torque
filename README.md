@@ -2,7 +2,7 @@
 
 High-performance JSON library for Elixir via [Rustler](https://github.com/rustler-magic/rustler) NIFs, powered by [sonic-rs](https://github.com/cloudwego/sonic-rs) (SIMD-accelerated).
 
-Torque provides among the fastest JSON encoding and decoding available in the BEAM ecosystem, with a selective field extraction API for workloads that only need a subset of fields from each document.
+Torque provides the fastest JSON encoding and decoding available in the BEAM ecosystem, with a selective field extraction API for workloads that only need a subset of fields from each document.
 
 ## Features
 
@@ -20,7 +20,7 @@ Add to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:torque, "~> 0.1.10"}
+    {:torque, "~> 0.2.0"}
   ]
 end
 ```
@@ -149,7 +149,7 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 
 | Atom | Returned by | Meaning |
 |------|-------------|---------|
-| `:nesting_too_deep` | `decode/1`, `get/2`, `get_many/2` | Document exceeds 128 nesting levels |
+| `:nesting_too_deep` | `decode/1`, `parse/1`, `get/2`, `get_many/2` | Document exceeds 128 nesting levels |
 
 `parse/1` and `decode/1` also return `{:error, binary}` with a message from sonic-rs for malformed JSON.
 
@@ -172,82 +172,80 @@ Apple M2 Pro, OTP 29, Elixir 1.20:
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **glazer** | **371.2K** | **2.69 μs** | **2.50 μs** | 6.42 μs | 1.56 KB |
-| **torque** | 284.3K | 3.52 μs | 3.42 μs | **5.71 μs** | 1.56 KB |
-| **jiffy** | 215.7K | 4.64 μs | 4.21 μs | 8.71 μs | **1.55 KB** |
-| **simdjsone** | 194.9K | 5.13 μs | 4.96 μs | 8.96 μs | 1.59 KB |
-| **otp json** | 145.6K | 6.87 μs | 6.58 μs | 11.63 μs | 7.73 KB |
-| **jason** | 113.4K | 8.82 μs | 8.42 μs | 16.08 μs | 9.54 KB |
+| **torque** | **392.8K** | **2.55 μs** | **2.46 μs** | **4.25 μs** | 1.56 KB |
+| **glazer** | 298.9K | 3.35 μs | 3.00 μs | 8.92 μs | 1.56 KB |
+| **jiffy** | 208.8K | 4.79 μs | 4.33 μs | 10.13 μs | **1.55 KB** |
+| **simdjsone** | 181.6K | 5.51 μs | 5.29 μs | 9.88 μs | 1.59 KB |
+| **otp json** | 125.2K | 7.99 μs | 7.71 μs | 13.08 μs | 7.73 KB |
+| **jason** | 92.6K | 10.80 μs | 10.13 μs | 22.33 μs | 9.54 KB |
 
 ### Decode (750 KB Twitter)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **glazer** | **592.9** | **1.69 ms** | **1.50 ms** | **2.21 ms** | 1.58 KB |
-| **torque** | 543.6 | 1.84 ms | 1.66 ms | 2.36 ms | **1.57 KB** |
-| **simdjsone** | 438.4 | 2.28 ms | 1.80 ms | 3.40 ms | 1.59 KB |
-| **jiffy** | 311.5 | 3.21 ms | 3.31 ms | 3.71 ms | 2.30 MB |
-| **otp json** | 213.1 | 4.69 ms | 4.73 ms | 5.68 ms | 2.48 MB |
-| **jason** | 152.0 | 6.58 ms | 6.58 ms | 6.88 ms | 3.52 MB |
+| **torque** | **655.1** | **1.53 ms** | **1.32 ms** | **2.16 ms** | **1.57 KB** |
+| **glazer** | 590.8 | 1.69 ms | 1.53 ms | 2.56 ms | 1.58 KB |
+| **simdjsone** | 392.5 | 2.55 ms | 2.10 ms | 4.53 ms | 1.59 KB |
+| **jiffy** | 286.3 | 3.49 ms | 3.59 ms | 3.92 ms | 2.30 MB |
+| **otp json** | 165.2 | 6.05 ms | 5.42 ms | 16.57 ms | 2.48 MB |
+| **jason** | 142.1 | 7.04 ms | 7.01 ms | 8.15 ms | 3.54 MB |
 
 ### Encode (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: iodata()] | **1260K** | **0.79 μs** | **0.71 μs** | **0.92 μs** | **64 B** |
-| **torque** [proplist() :: binary()] | 1250K | 0.80 μs | 0.75 μs | **0.92 μs** | 88 B |
-| **otp json** [map() :: iodata()] | 1180K | 0.85 μs | 0.79 μs | 1.25 μs | 3928 B |
-| **torque** [map() :: binary()] | 1050K | 0.96 μs | 0.88 μs | 1.04 μs | 88 B |
-| **glazer** [map() :: binary()] | 1020K | 0.98 μs | 0.83 μs | 1.63 μs | **64 B** |
-| **torque** [map() :: iodata()] | 1010K | 0.99 μs | 0.88 μs | 1.96 μs | **64 B** |
-| **jiffy** [proplist() :: iodata()] | 730K | 1.37 μs | 1.17 μs | 1.63 μs | 120 B |
-| **jason** [map() :: iodata()] | 610K | 1.63 μs | 1.50 μs | 2.63 μs | 3848 B |
-| **jiffy** [map() :: iodata()] | 590K | 1.71 μs | 1.42 μs | 3.71 μs | 824 B |
-| **simdjsone** [proplist() :: iodata()] | 450K | 2.23 μs | 2.04 μs | 2.75 μs | 184 B |
-| **simdjsone** [map() :: iodata()] | 370K | 2.67 μs | 2.42 μs | 4.67 μs | 888 B |
-| **jason** [map() :: binary()] | 290K | 3.48 μs | 2.42 μs | 20.04 μs | 3912 B |
+| **torque** [proplist() :: iodata()] | **1280K** | **0.78 μs** | **0.71 μs** | **0.88 μs** | **64 B** |
+| **torque** [proplist() :: binary()] | 1190K | 0.84 μs | 0.75 μs | 1.63 μs | 88 B |
+| **glazer** [map() :: binary()] | 1090K | 0.92 μs | 0.83 μs | 1.13 μs | **64 B** |
+| **otp json** [map() :: iodata()] | 1080K | 0.92 μs | 0.79 μs | 2.04 μs | 3928 B |
+| **torque** [map() :: iodata()] | 1050K | 0.95 μs | 0.88 μs | 1.13 μs | **64 B** |
+| **torque** [map() :: binary()] | 1040K | 0.96 μs | 0.88 μs | 1.13 μs | 88 B |
+| **jiffy** [proplist() :: iodata()] | 730K | 1.37 μs | 1.13 μs | 2.33 μs | 120 B |
+| **jiffy** [map() :: iodata()] | 620K | 1.62 μs | 1.42 μs | 2.04 μs | 824 B |
+| **jason** [map() :: iodata()] | 610K | 1.63 μs | 1.50 μs | 2.88 μs | 3848 B |
+| **simdjsone** [proplist() :: iodata()] | 440K | 2.25 μs | 2.04 μs | 2.88 μs | 184 B |
+| **jason** [map() :: binary()] | 380K | 2.66 μs | 2.38 μs | 6.29 μs | 3912 B |
+| **simdjsone** [map() :: iodata()] | 370K | 2.69 μs | 2.42 μs | 4.79 μs | 888 B |
 
 ### Encode (750 KB Twitter)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: binary()] | **1245.8** | **0.80 ms** | **0.79 ms** | **0.98 ms** | 88 B |
-| **torque** [proplist() :: iodata()] | 1241.5 | 0.81 ms | **0.79 ms** | **0.98 ms** | **64 B** |
-| **torque** [map() :: binary()] | 1121.0 | 0.89 ms | 0.88 ms | 1.05 ms | 88 B |
-| **torque** [map() :: iodata()] | 1096.7 | 0.91 ms | 0.90 ms | 1.08 ms | **64 B** |
-| **glazer** [map() :: binary()] | 1001.0 | 1.00 ms | 0.99 ms | 1.10 ms | **64 B** |
-| **jiffy** [proplist() :: iodata()] | 544.7 | 1.84 ms | 1.83 ms | 2.04 ms | 37.7 KB |
-| **jiffy** [map() :: iodata()] | 402.6 | 2.48 ms | 2.63 ms | 2.97 ms | 1.06 MB |
-| **otp json** [map() :: iodata()] | 277.6 | 3.60 ms | 3.40 ms | 4.71 ms | 5.40 MB |
-| **simdjsone** [proplist() :: iodata()] | 258.6 | 3.87 ms | 3.81 ms | 5.82 ms | 37.7 KB |
-| **jason** [map() :: iodata()] | 240.0 | 4.17 ms | 3.91 ms | 6.22 ms | 4.96 MB |
-| **simdjsone** [map() :: iodata()] | 218.6 | 4.57 ms | 4.66 ms | 5.31 ms | 1.06 MB |
-| **jason** [map() :: binary()] | 129.6 | 7.72 ms | 7.71 ms | 8.34 ms | 4.96 MB |
+| **torque** [proplist() :: iodata()] | **1228.7** | **0.81 ms** | **0.80 ms** | 1.00 ms | **64 B** |
+| **torque** [proplist() :: binary()] | 1226.6 | 0.82 ms | **0.80 ms** | **0.99 ms** | 88 B |
+| **torque** [map() :: binary()] | 1098.9 | 0.91 ms | 0.89 ms | 1.17 ms | 88 B |
+| **torque** [map() :: iodata()] | 1077.4 | 0.93 ms | 0.91 ms | 1.12 ms | **64 B** |
+| **glazer** [map() :: binary()] | 981.9 | 1.02 ms | 1.00 ms | 1.28 ms | **64 B** |
+| **jiffy** [proplist() :: iodata()] | 536.5 | 1.86 ms | 1.82 ms | 2.98 ms | 37.7 KB |
+| **jiffy** [map() :: iodata()] | 439.8 | 2.27 ms | 2.26 ms | 2.48 ms | 1.06 MB |
+| **otp json** [map() :: iodata()] | 267.3 | 3.74 ms | 4.08 ms | 6.51 ms | 5.40 MB |
+| **jason** [map() :: iodata()] | 260.6 | 3.84 ms | 3.58 ms | 6.07 ms | 4.96 MB |
+| **simdjsone** [proplist() :: iodata()] | 255.6 | 3.91 ms | 3.78 ms | 6.60 ms | 37.7 KB |
+| **simdjsone** [map() :: iodata()] | 214.7 | 4.66 ms | 4.64 ms | 6.61 ms | 1.06 MB |
+| **jason** [map() :: binary()] | 136.6 | 7.32 ms | 7.10 ms | 9.02 ms | 4.96 MB |
 
 ### Parse (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse(unique_keys) | **570.0K** | **1.75 μs** | 1.33 μs | 5.79 μs |
-| **torque** parse | 545.2K | 1.83 μs | 1.33 μs | 6.08 μs |
-| **simdjsone** parse | 360.1K | 2.78 μs | **1.17 μs** | **5.63 μs** |
+| **torque** parse(unique_keys) | **572.1K** | **1.75 μs** | 1.33 μs | **5.75 μs** |
+| **torque** parse | 549.5K | 1.82 μs | 1.33 μs | 6.08 μs |
+| **simdjsone** parse | 320.4K | 3.12 μs | **1.21 μs** | 5.96 μs |
 
-### Get (5 fields) (1.2 KB OpenRTB)
+### Extract 5 fields from raw JSON (1.2 KB OpenRTB)
 
-| Library | ips | mean | median | p99 | memory |
-|---|---|---|---|---|---|
-| **glazer** find (decoded) | **2.83M** | **353 ns** | **333 ns** | **459 ns** | 424 B |
-| **torque** get_many_nil (unique_keys) | 2.43M | 411 ns | 375 ns | 500 ns | **240 B** |
-| **torque** get_many (unique_keys) | 2.36M | 423 ns | 375 ns | 500 ns | 360 B |
-| **torque** get_many_nil | 2.13M | 469 ns | 458 ns | 584 ns | **240 B** |
-| **torque** get_many | 2.04M | 491 ns | 458 ns | 625 ns | 360 B |
-| **simdjsone** get | 1.76M | 568 ns | 458 ns | 1000 ns | 384 B |
-| **torque** get (unique_keys) | 1.56M | 641 ns | 584 ns | 792 ns | 384 B |
-| **torque** get | 1.41M | 709 ns | 667 ns | 916 ns | 384 B |
+End-to-end cost of pulling 5 fields out of a JSON blob: `parse` + `get`
+(torque, simdjsone) vs `decode` + `find` (glazer has no lazy handle, so it must
+fully decode first). This is the apples-to-apples version of "get" — torque's
+selective extraction skips materializing the whole document.
 
-`glazer find` runs over a fully decoded term (decode cost excluded, as parse
-cost is excluded for `torque`/`simdjsone`); glazer has no parse-to-handle API,
-so it is absent from the parse benchmark.
+| Library | ips | mean | median | p99 |
+|---|---|---|---|---|
+| **torque** parse(unique_keys) + get_many | **443.3K** | **2.26 μs** | 1.71 μs | 6.67 μs |
+| **torque** parse + get_many | 425.3K | 2.35 μs | 1.79 μs | **6.04 μs** |
+| **torque** parse + get x5 | 419.9K | 2.38 μs | 2.00 μs | 6.92 μs |
+| **simdjsone** parse + get x5 | 371.7K | 2.69 μs | **1.67 μs** | 7.00 μs |
+| **glazer** decode + find x5 | 317.0K | 3.15 μs | 2.83 μs | 7.71 μs |
 
 Run benchmarks locally:
 
@@ -257,7 +255,7 @@ MIX_ENV=bench mix run bench/torque_bench.exs
 
 ## Limitations
 
-- **Nesting depth**: JSON documents nested deeper than 128 levels return `{:error, :nesting_too_deep}` from `decode/1`, `get/2`, `get_many/2`, and `encode/1` rather than crashing the VM. Real-world documents are never this deep; the limit exists to prevent stack overflow in the NIF (the dirty CPU scheduler, used for inputs over 20 KB, has a small stack).
+- **Nesting depth**: JSON documents nested deeper than 128 levels return `{:error, :nesting_too_deep}` from `decode/1`, `parse/1`, `get/2`, `get_many/2`, and `encode/1` rather than crashing the VM. Real-world documents are never this deep; the limit exists to prevent stack overflow in the NIF (the dirty CPU scheduler, used for inputs over 20 KB, has a small stack).
 
 ## License
 

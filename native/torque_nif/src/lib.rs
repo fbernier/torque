@@ -2,8 +2,8 @@ mod atoms;
 mod decoder;
 mod encoder;
 mod escape;
+pub(crate) mod native_decode;
 pub(crate) mod nif_util;
-pub(crate) mod serde_decode;
 mod types;
 
 pub struct ParsedDocument {

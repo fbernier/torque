@@ -457,10 +457,14 @@ defmodule Torque.PropertyTest do
       assert {:ok, _} = Torque.decode(json)
     end
 
-    test "get returns error at depth 129" do
+    test "parse returns error at depth 129" do
       json = Enum.reduce(1..129, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
-      {:ok, doc} = Torque.parse(json)
-      assert {:error, :nesting_too_deep} = Torque.get(doc, "")
+      assert {:error, :nesting_too_deep} = Torque.parse(json)
+    end
+
+    test "parse succeeds at depth 128" do
+      json = Enum.reduce(1..128, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
+      assert {:ok, _} = Torque.parse(json)
     end
 
     test "encode returns error at depth 129" do
@@ -484,6 +488,11 @@ defmodule Torque.PropertyTest do
     test "decode rejects 100k unclosed arrays without crashing" do
       json = String.duplicate("[", 100_000)
       assert {:error, :nesting_too_deep} = Torque.decode(json)
+    end
+
+    test "parse rejects 100k unclosed arrays without crashing" do
+      json = String.duplicate("[", 100_000)
+      assert {:error, :nesting_too_deep} = Torque.parse(json)
     end
   end
 
@@ -616,19 +625,6 @@ defmodule Torque.PropertyTest do
 
       {:ok, doc2} = Torque.parse(~s({"a":[1,2,3]}))
       assert {:error, :no_such_field} = Torque.get(doc2, "/a/0/x")
-    end
-  end
-
-  # ---- get/3 raises on nesting_too_deep ----
-
-  describe "get/3 raises on nesting_too_deep" do
-    test "513-deep parse + get with default raises ArgumentError" do
-      json = Enum.reduce(1..513, ~s("leaf"), fn _, acc -> ~s({"x":#{acc}}) end)
-      {:ok, doc} = Torque.parse(json)
-
-      assert_raise ArgumentError, ~r/get error: nesting_too_deep/, fn ->
-        Torque.get(doc, "", :default)
-      end
     end
   end
 end

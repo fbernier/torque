@@ -2,6 +2,11 @@
 resolver = "2"
 members = ["native/torque_nif"]
 
+# Use the vendored, Torque-patched sonic-rs (native push-based visitor exposed +
+# DOM recursion-depth limit). See native/sonic-rs/Cargo.toml.
+[patch.crates-io]
+sonic-rs = { path = "native/sonic-rs" }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
