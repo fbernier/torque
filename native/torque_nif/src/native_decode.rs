@@ -15,6 +15,7 @@ use rustler::sys::{
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
+use std::mem::MaybeUninit;
 
 use crate::atoms;
 use crate::nif_util::make_tuple2;
@@ -66,17 +67,25 @@ impl<'a> TermBuilder<'a> {
 }
 
 /// Build a map term from interleaved `[k0, v0, k1, v1, ...]` children.
+/// De-interleaves into separate key/value arrays for `enif_make_map_from_arrays`.
 #[inline]
 fn build_map(env: Env, kv: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
     let pairs = kv.len() / 2;
     if pairs <= STACK_SIZE {
-        let mut keys: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
-        let mut vals: [ERL_NIF_TERM; STACK_SIZE] = [0; STACK_SIZE];
+        let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
+        let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
         for i in 0..pairs {
-            keys[i] = kv[2 * i];
-            vals[i] = kv[2 * i + 1];
+            keys[i].write(kv[2 * i]);
+            vals[i].write(kv[2 * i + 1]);
         }
-        make_map(env, &keys[..pairs], &vals[..pairs])
+        // SAFETY: keys[..pairs]/vals[..pairs] were just written.
+        unsafe {
+            make_map(
+                env,
+                std::slice::from_raw_parts(keys.as_ptr() as *const ERL_NIF_TERM, pairs),
+                std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, pairs),
+            )
+        }
     } else {
         let mut keys = Vec::with_capacity(pairs);
         let mut vals = Vec::with_capacity(pairs);
@@ -225,7 +234,7 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
             base: bytes.as_ptr(),
             len: bytes.len(),
         },
-        values: Vec::with_capacity(16),
+        values: Vec::with_capacity(64),
         frames: Vec::with_capacity(16),
         too_deep: false,
     };
