@@ -5,6 +5,9 @@
 #     instead of going through the slower serde path
 #   * a recursion-depth limit added to the DOM parser so deeply nested input
 #     returns an error instead of overflowing the stack and crashing the VM
+#   * a `JsonVisitor::visit_overflow_int` hook: integer-shaped tokens that
+#     overflow i64/u64 are routed to it with the raw digits (default falls
+#     back to f64), so Torque can build exact Erlang bignums during decode
 # Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0)
 
 # Standalone manifest so this is not pulled into the torque workspace.

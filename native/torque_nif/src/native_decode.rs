@@ -123,6 +123,72 @@ fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_T
     }
 }
 
+// Erlang External Term Format tags for arbitrary-precision integers.
+const ETF_VERSION: u8 = 131;
+const SMALL_BIG_EXT: u8 = 110;
+/// Magnitude bytes for SMALL_BIG_EXT fit in a one-byte length, so 255 base-256
+/// bytes (~614 decimal digits) is the stack fast path; larger falls back.
+const MAG_CAP: usize = 255;
+
+/// Build an exact Erlang bignum term from a decimal integer token.
+///
+/// Converts the digits to a little-endian base-256 magnitude on the stack and
+/// hands ERTS the SMALL_BIG_EXT bytes directly (`binary_to_term_trusted`, no
+/// SAFE scan) — no `num-bigint` allocation, no `to_bytes_le` pass, no heap
+/// buffer. Tokens beyond `MAG_CAP` bytes defer to `num-bigint` so correctness
+/// stays unbounded. Returns `None` only if the digits don't parse.
+#[inline]
+fn bignum_term(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
+    let (neg, digits) = match raw.as_bytes().split_first() {
+        Some((b'-', rest)) => (1u8, rest),
+        _ => (0u8, raw.as_bytes()),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut mag = [0u8; MAG_CAP];
+    let mut len = 0usize;
+    for &d in digits {
+        let mut carry = match d {
+            b'0'..=b'9' => (d - b'0') as u32,
+            _ => return None,
+        };
+        for limb in mag[..len].iter_mut() {
+            let v = *limb as u32 * 10 + carry;
+            *limb = v as u8;
+            carry = v >> 8;
+        }
+        while carry > 0 {
+            if len >= MAG_CAP {
+                return bignum_term_large(env, raw);
+            }
+            mag[len] = carry as u8;
+            carry >>= 8;
+            len += 1;
+        }
+    }
+
+    // ETF: [131, SMALL_BIG_EXT, len, sign, <len LE magnitude bytes>]
+    let mut etf = [0u8; 4 + MAG_CAP];
+    etf[0] = ETF_VERSION;
+    etf[1] = SMALL_BIG_EXT;
+    etf[2] = len as u8;
+    etf[3] = neg;
+    etf[4..4 + len].copy_from_slice(&mag[..len]);
+
+    // SAFETY: self-constructed SMALL_BIG_EXT — no atoms/resources, so the
+    // trusted (unsafe, no-SAFE-scan) decode cannot create anything unsafe.
+    unsafe { env.binary_to_term_trusted(&etf[..4 + len]) }.map(|(t, _)| t.as_c_arg())
+}
+
+/// Cold path for integers too large for the stack buffer (~600+ digits).
+#[cold]
+#[inline(never)]
+fn bignum_term_large(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
+    rustler::BigInt::parse_bytes(raw.as_bytes(), 10).map(|big| big.encode(env).as_c_arg())
+}
+
 impl<'de, 'a> JsonVisitor<'de> for TermBuilder<'a> {
     #[inline]
     fn visit_dom_start(&mut self) -> bool {
@@ -167,6 +233,16 @@ impl<'de, 'a> JsonVisitor<'de> for TermBuilder<'a> {
     #[inline]
     fn visit_f64(&mut self, val: f64) -> bool {
         let t = unsafe { enif_make_double(self.env.as_c_arg(), val) };
+        self.push(t);
+        true
+    }
+
+    /// Integer literal beyond i64/u64 range: build an exact Erlang bignum from
+    /// the raw digits instead of degrading to a lossy f64.
+    #[inline]
+    fn visit_overflow_int(&mut self, raw: &str, as_f64: f64) -> bool {
+        let t = bignum_term(self.env, raw)
+            .unwrap_or_else(|| unsafe { enif_make_double(self.env.as_c_arg(), as_f64) });
         self.push(t);
         true
     }
