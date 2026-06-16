@@ -127,6 +127,8 @@ json = Torque.encode_to_iodata(%{id: "abc"})
 
 For objects with duplicate keys, the last value wins (unless `unique_keys: true` is passed to `parse/2`).
 
+Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) via `decode/1`, rather than degrading to lossy floats. The `parse/2` + `get/2` path returns them as floats, since the parsed document cannot hold a bignum.
+
 ### Elixir to JSON
 
 | Elixir | JSON |
