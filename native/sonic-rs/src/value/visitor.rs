@@ -30,6 +30,16 @@ pub trait JsonVisitor<'de> {
         false
     }
 
+    /// An integer-shaped token (no `.`, `e`, or `E`) whose magnitude exceeds
+    /// the i64/u64 range, so `sonic-number` parsed it as `f64`. `raw` is the
+    /// original token bytes (including any leading `-`); `as_f64` is the lossy
+    /// float fallback. The default preserves historical behavior by yielding
+    /// the float; visitors that want exact bignums override this.
+    #[allow(dead_code)]
+    fn visit_overflow_int(&mut self, _raw: &str, as_f64: f64) -> bool {
+        self.visit_f64(as_f64)
+    }
+
     #[allow(dead_code)]
     fn visit_raw_number(&mut self, _val: &str) -> bool {
         false

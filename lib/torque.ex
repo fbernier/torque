@@ -50,6 +50,9 @@ defmodule Torque do
   become binaries, numbers become integers or floats, booleans become
   `true`/`false`, and `null` becomes `nil`.
 
+  Integers outside the signed/unsigned 64-bit range decode as exact
+  arbitrary-precision integers (Erlang bignums) rather than lossy floats.
+
   Automatically uses a dirty CPU scheduler for inputs larger than 20 KB.
 
   ## Examples

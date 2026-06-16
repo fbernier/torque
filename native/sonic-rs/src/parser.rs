@@ -86,6 +86,13 @@ pub(crate) fn as_str(data: &[u8]) -> &str {
     unsafe { from_utf8_unchecked(data) }
 }
 
+/// A numeric token with no fraction or exponent is an integer literal; when
+/// such a token only reaches the `f64` path it overflowed i64/u64.
+#[inline(always)]
+fn is_integer_token(slice: &[u8]) -> bool {
+    !slice.iter().any(|&b| matches!(b, b'.' | b'e' | b'E'))
+}
+
 #[inline(always)]
 fn get_escaped_branchless_u32(prev_escaped: &mut u32, backslash: u32) -> u32 {
     const EVEN_BITS: u32 = 0x5555_5555;
@@ -357,8 +364,16 @@ where
             let slice = self.read.slice_unchecked(start, self.read.index());
             check_visit!(self, vis.visit_raw_number(as_str(slice)))
         } else {
+            let start = self.read.index() - 1;
             let ok = match self.parse_number(first)? {
-                ParserNumber::Float(f) => vis.visit_f64(f),
+                ParserNumber::Float(f) => {
+                    let slice = self.read.slice_unchecked(start, self.read.index());
+                    if is_integer_token(slice) {
+                        vis.visit_overflow_int(as_str(slice), f)
+                    } else {
+                        vis.visit_f64(f)
+                    }
+                }
                 ParserNumber::Unsigned(f) => vis.visit_u64(f),
                 ParserNumber::Signed(f) => vis.visit_i64(f),
             };
@@ -377,8 +392,16 @@ where
             let slice = self.read.slice_unchecked(start, self.read.index());
             check_visit!(self, vis.visit_borrowed_raw_number(as_str(slice)))
         } else {
+            let start = self.read.index() - 1;
             let ok = match self.parse_number(first)? {
-                ParserNumber::Float(f) => vis.visit_f64(f),
+                ParserNumber::Float(f) => {
+                    let slice = self.read.slice_unchecked(start, self.read.index());
+                    if is_integer_token(slice) {
+                        vis.visit_overflow_int(as_str(slice), f)
+                    } else {
+                        vis.visit_f64(f)
+                    }
+                }
                 ParserNumber::Unsigned(f) => vis.visit_u64(f),
                 ParserNumber::Signed(f) => vis.visit_i64(f),
             };
