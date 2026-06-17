@@ -53,13 +53,16 @@ jobs:
       # PGO pass 1: build torque instrumented and run a representative workload
       # to emit profile data. RUSTFLAGS replaces (not appends to) the crate's
       # .cargo/config.toml, so target-cpu=native is carried through here.
+      # --force is required: mix keys compile staleness off file mtimes, not the
+      # RUSTFLAGS env var, so without it a cached build is reused and cargo is
+      # never invoked (instrumented .so is never built -> no .profraw).
       - name: Build instrumented torque & collect PGO profile
         env:
           RUSTFLAGS: "-C target-cpu=native -Cprofile-generate=${{ github.workspace }}/pgo-data"
           LLVM_PROFILE_FILE: "${{ github.workspace }}/pgo-data/torque-%p-%m.profraw"
         run: |
           mkdir -p pgo-data
-          mix compile
+          mix compile --force
           mix run bench/pgo_workload.exs
 
       - name: Merge PGO profile data
@@ -80,13 +83,16 @@ jobs:
           ls -la pgo-data
 
       # PGO pass 2: rebuild torque with the collected profile, then benchmark.
-      # The changed RUSTFLAGS forces cargo to recompile against merged.profdata.
+      # --force is mandatory here: mix does not treat a changed RUSTFLAGS as a
+      # reason to recompile, so a plain `mix compile` is a no-op and the
+      # benchmark would run the *instrumented* binary from pass 1 (slow, ~20%
+      # off). --force re-invokes cargo, which rebuilds against merged.profdata.
       - name: Run benchmarks (PGO build)
         env:
           RUSTFLAGS: "-C target-cpu=native -Cprofile-use=${{ github.workspace }}/pgo-data/merged.profdata"
           BENCH_OUTPUT: json
         run: |
-          mix compile
+          mix compile --force
           mix run bench/torque_bench.exs
 
       - name: Store trend data
