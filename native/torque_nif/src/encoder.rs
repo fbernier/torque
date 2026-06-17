@@ -7,10 +7,28 @@ use rustler::sys::{
     ErlNifCharEncoding, ErlNifEnv, ERL_NIF_TERM,
 };
 use rustler::{schedule, Env, MapIterator, NewBinary, Term, TermType};
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
 
 const BYTES_PER_REDUCTION: usize = 20;
 const REDUCTION_COUNT: usize = 4000;
+
+/// Below this output size the work is sub-microsecond, so the
+/// enif_consume_timeslice call costs more than the scheduler accounting is
+/// worth. The BEAM's fixed per-NIF-call reduction charge already covers it.
+const TIMESLICE_MIN_BYTES: usize = 4096;
+
+/// Cap on the retained thread-local scratch buffer, so a one-off huge document
+/// doesn't pin a large allocation on a scheduler thread indefinitely.
+const BUF_RETAIN_CAP: usize = 1 << 20;
+
+thread_local! {
+    /// Reused across encode calls on each scheduler thread. Avoids a
+    /// malloc/free per call, which is the dominant per-call cost for small
+    /// payloads. NIFs run to completion without preemption and the encoder
+    /// never re-enters this NIF, so the borrow is never nested.
+    static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
+}
 
 /// Compute a timeslice percentage (1–100) proportional to bytes processed.
 #[inline]
@@ -27,6 +45,30 @@ enum EncodeError {
     MalformedProplist,
     DepthExceeded,
     InvalidUtf8,
+}
+
+#[inline]
+fn error_reason(e: EncodeError) -> ERL_NIF_TERM {
+    match e {
+        EncodeError::DepthExceeded => atoms::nesting_too_deep().as_c_arg(),
+        EncodeError::UnsupportedType => atoms::unsupported_type().as_c_arg(),
+        EncodeError::NonFiniteFloat => atoms::non_finite_float().as_c_arg(),
+        EncodeError::InvalidKey => atoms::invalid_key().as_c_arg(),
+        EncodeError::MalformedProplist => atoms::malformed_proplist().as_c_arg(),
+        EncodeError::InvalidUtf8 => atoms::invalid_utf8().as_c_arg(),
+    }
+}
+
+/// Hand the finished scratch buffer to a freshly allocated Erlang binary,
+/// reporting the work to the scheduler only when it's large enough to matter.
+#[inline]
+fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8]) -> Term<'a> {
+    if buf.len() >= TIMESLICE_MIN_BYTES {
+        schedule::consume_timeslice(env, timeslice_percent(buf.len()));
+    }
+    let mut binary = NewBinary::new(env, buf.len());
+    binary.as_mut_slice().copy_from_slice(buf);
+    binary.into()
 }
 
 /// Read an atom's name into a stack buffer without heap allocation.
@@ -62,55 +104,46 @@ unsafe fn atom_to_stack_buf(
 
 #[rustler::nif]
 fn encode<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let env_raw = env.as_c_arg();
-    match encode_term(env, env_raw, term, &mut buf, MAX_DEPTH) {
-        Ok(()) => {
-            schedule::consume_timeslice(env, timeslice_percent(buf.len()));
-            let mut binary = NewBinary::new(env, buf.len());
-            binary.as_mut_slice().copy_from_slice(&buf);
-            let bin_term: Term = binary.into();
-            make_tuple2(env, atoms::ok().as_c_arg(), bin_term.as_c_arg())
+    ENCODE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let result = match encode_term(env, env_raw, term, &mut buf, MAX_DEPTH) {
+            Ok(()) => {
+                let bin_term = buf_to_binary(env, &buf);
+                make_tuple2(env, atoms::ok().as_c_arg(), bin_term.as_c_arg())
+            }
+            Err(e) => make_tuple2(env, atoms::error().as_c_arg(), error_reason(e)),
+        };
+        if buf.capacity() > BUF_RETAIN_CAP {
+            buf.shrink_to(BUF_RETAIN_CAP);
         }
-        Err(e) => {
-            let reason = match e {
-                EncodeError::DepthExceeded => atoms::nesting_too_deep().as_c_arg(),
-                EncodeError::UnsupportedType => atoms::unsupported_type().as_c_arg(),
-                EncodeError::NonFiniteFloat => atoms::non_finite_float().as_c_arg(),
-                EncodeError::InvalidKey => atoms::invalid_key().as_c_arg(),
-                EncodeError::MalformedProplist => atoms::malformed_proplist().as_c_arg(),
-                EncodeError::InvalidUtf8 => atoms::invalid_utf8().as_c_arg(),
-            };
-            make_tuple2(env, atoms::error().as_c_arg(), reason)
-        }
-    }
+        result
+    })
 }
 
 /// Returns the raw binary on success, raises on error.
 /// Skips the {:ok, binary} tuple wrapping for maximum throughput.
 #[rustler::nif]
 fn encode_iodata<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let env_raw = env.as_c_arg();
-    match encode_term(env, env_raw, term, &mut buf, MAX_DEPTH) {
-        Ok(()) => {
-            schedule::consume_timeslice(env, timeslice_percent(buf.len()));
-            let mut binary = NewBinary::new(env, buf.len());
-            binary.as_mut_slice().copy_from_slice(&buf);
-            binary.into()
+    ENCODE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let result = match encode_term(env, env_raw, term, &mut buf, MAX_DEPTH) {
+            Ok(()) => buf_to_binary(env, &buf),
+            Err(e) => unsafe {
+                Term::new(
+                    env,
+                    rustler::sys::enif_raise_exception(env_raw, error_reason(e)),
+                )
+            },
+        };
+        if buf.capacity() > BUF_RETAIN_CAP {
+            buf.shrink_to(BUF_RETAIN_CAP);
         }
-        Err(e) => unsafe {
-            let reason = match e {
-                EncodeError::DepthExceeded => atoms::nesting_too_deep().as_c_arg(),
-                EncodeError::UnsupportedType => atoms::unsupported_type().as_c_arg(),
-                EncodeError::NonFiniteFloat => atoms::non_finite_float().as_c_arg(),
-                EncodeError::InvalidKey => atoms::invalid_key().as_c_arg(),
-                EncodeError::MalformedProplist => atoms::malformed_proplist().as_c_arg(),
-                EncodeError::InvalidUtf8 => atoms::invalid_utf8().as_c_arg(),
-            };
-            Term::new(env, rustler::sys::enif_raise_exception(env_raw, reason))
-        },
-    }
+        result
+    })
 }
 
 #[inline]
