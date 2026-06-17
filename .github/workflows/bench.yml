@@ -26,6 +26,8 @@ jobs:
           elixir-version: "1.18"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - name: Cache Mix deps
         uses: actions/cache@v4
@@ -48,15 +50,47 @@ jobs:
       - name: Fix simdjsone Makefile priv dir bug
         run: sed -i 's|$(BASEDIR)/priv|$(PRIV_DIR)|g' deps/simdjsone/c_src/Makefile
 
-      - name: Compile
-        run: mix compile
-
-      - name: Run benchmarks
-        run: mix run bench/torque_bench.exs
+      # PGO pass 1: build torque instrumented and run a representative workload
+      # to emit profile data. RUSTFLAGS replaces (not appends to) the crate's
+      # .cargo/config.toml, so target-cpu=native is carried through here.
+      - name: Build instrumented torque & collect PGO profile
         env:
+          RUSTFLAGS: "-C target-cpu=native -Cprofile-generate=${{ github.workspace }}/pgo-data"
+          LLVM_PROFILE_FILE: "${{ github.workspace }}/pgo-data/torque-%p-%m.profraw"
+        run: |
+          mkdir -p pgo-data
+          mix compile
+          mix run bench/pgo_workload.exs
+
+      - name: Merge PGO profile data
+        run: |
+          shopt -s nullglob
+          raw=(pgo-data/*.profraw)
+          if [ ${#raw[@]} -eq 0 ]; then
+            echo "::error::no .profraw files produced by the PGO workload"
+            exit 1
+          fi
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          profdata="$(rustc --print sysroot)/lib/rustlib/${host}/bin/llvm-profdata"
+          if [ ! -x "$profdata" ]; then
+            echo "::error::llvm-profdata not found at $profdata (is the llvm-tools-preview component installed?)"
+            exit 1
+          fi
+          "$profdata" merge -o pgo-data/merged.profdata "${raw[@]}"
+          ls -la pgo-data
+
+      # PGO pass 2: rebuild torque with the collected profile, then benchmark.
+      # The changed RUSTFLAGS forces cargo to recompile against merged.profdata.
+      - name: Run benchmarks (PGO build)
+        env:
+          RUSTFLAGS: "-C target-cpu=native -Cprofile-use=${{ github.workspace }}/pgo-data/merged.profdata"
           BENCH_OUTPUT: json
+        run: |
+          mix compile
+          mix run bench/torque_bench.exs
 
       - name: Store trend data
+        if: github.ref == 'refs/heads/main'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Torque Benchmarks
@@ -70,6 +104,7 @@ jobs:
           fail-on-alert: false
 
       - name: Deploy comparison data and custom page
+        if: github.ref == 'refs/heads/main'
         run: |
           git fetch origin gh-pages
           git worktree add /tmp/gh-pages -B gh-pages origin/gh-pages

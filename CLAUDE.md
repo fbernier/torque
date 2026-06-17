@@ -21,6 +21,41 @@ MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks (requires simdjso
 
 `TORQUE_BUILD=true` is required for local development to force compilation from Rust source instead of downloading precompiled binaries. Without it, `RustlerPrecompiled` will try to fetch binaries from GitHub releases.
 
+## Profile-Guided Optimisation (PGO)
+
+```bash
+./scripts/pgo-build.sh   # instrument -> run workload -> merge -> rebuild optimised
+```
+
+Produces an optimised `priv/native/torque_nif.so` (typically 5-15% faster on
+JSON-heavy work than plain `-O3`). The script builds an instrumented NIF, runs
+`bench/pgo_workload.exs` to collect branch/call-frequency data, merges the raw
+`*.profraw` counters with `llvm-profdata`, then rebuilds with `-Cprofile-use`.
+Like any `TORQUE_BUILD` build it overwrites `priv/native/torque_nif.so`, so
+re-run `mix compile` (without PGO) to get back to a plain build.
+
+Notes:
+- rustc is LLVM-based, so PGO uses the same `llvm-profdata merge` step as a
+  Clang PGO build. The merge tool's LLVM major version **must** match rustc's
+  (`rustc -vV`); the script auto-detects a matching one (rustup
+  `llvm-tools-preview`, Homebrew `llvm@<major>`, or PATH) — override with
+  `LLVM_PROFDATA=...` if detection misses.
+- Setting `RUSTFLAGS` replaces `native/torque_nif/.cargo/config.toml`'s
+  rustflags rather than merging, so the script re-states `-C target-cpu=native`.
+  Keep `BASE_RUSTFLAGS` in `scripts/pgo-build.sh` in sync with that config.
+- Point the script at a different workload with `WORKLOAD=path/to.exs`.
+
+The release workflow (`release.yml`) applies the same profile → rebuild step to
+the targets it builds on a native runner (`aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu`): it builds an instrumented NIF, runs
+`bench/pgo_workload.exs` through the BEAM to collect a same-arch profile, then
+rebuilds with `-Cprofile-use`. The cross-compiled targets (`x86_64-apple-darwin`
+built on the arm runner, and `aarch64-unknown-linux-gnu` via `cross`) build
+plain `-O3`, because PGO needs to *run* the instrumented binary and there's no
+native runner for them. Trigger `release.yml` via `workflow_dispatch` to
+build-and-profile every target without publishing (create/upload are gated on a
+tag).
+
 ## Releasing
 
 ```bash
