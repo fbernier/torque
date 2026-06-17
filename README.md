@@ -168,71 +168,73 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 
 ## Benchmarks
 
-Apple M2 Pro, OTP 29, Elixir 1.20:
+Apple M2 Pro, OTP 29, Elixir 1.20. Both libraries are profile-guided
+optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
+**Glazer PGO** (via `OPTIMIZE=1`).
 
 ### Decode (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** | **392.8K** | **2.55 μs** | **2.46 μs** | **4.25 μs** | 1.56 KB |
-| **glazer** | 298.9K | 3.35 μs | 3.00 μs | 8.92 μs | 1.56 KB |
-| **jiffy** | 208.8K | 4.79 μs | 4.33 μs | 10.13 μs | **1.55 KB** |
-| **simdjsone** | 181.6K | 5.51 μs | 5.29 μs | 9.88 μs | 1.59 KB |
-| **otp json** | 125.2K | 7.99 μs | 7.71 μs | 13.08 μs | 7.73 KB |
-| **jason** | 92.6K | 10.80 μs | 10.13 μs | 22.33 μs | 9.54 KB |
+| **torque** | **404.0K** | **2.48 μs** | **2.29 μs** | **5.75 μs** | 1.56 KB |
+| **glazer** | 378.7K | 2.64 μs | 2.38 μs | 7.08 μs | 1.56 KB |
+| **jiffy** | 201.3K | 4.97 μs | 4.25 μs | 13.21 μs | **1.55 KB** |
+| **simdjsone** | 180.8K | 5.53 μs | 5.21 μs | 12.50 μs | 1.59 KB |
+| **otp json** | 140.6K | 7.11 μs | 6.71 μs | 15.38 μs | 7.73 KB |
+| **jason** | 109.4K | 9.14 μs | 8.50 μs | 18.83 μs | 9.54 KB |
 
 ### Decode (750 KB Twitter)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** | **655.1** | **1.53 ms** | **1.32 ms** | **2.16 ms** | **1.57 KB** |
-| **glazer** | 590.8 | 1.69 ms | 1.53 ms | 2.56 ms | 1.58 KB |
-| **simdjsone** | 392.5 | 2.55 ms | 2.10 ms | 4.53 ms | 1.59 KB |
-| **jiffy** | 286.3 | 3.49 ms | 3.59 ms | 3.92 ms | 2.30 MB |
-| **otp json** | 165.2 | 6.05 ms | 5.42 ms | 16.57 ms | 2.48 MB |
-| **jason** | 142.1 | 7.04 ms | 7.01 ms | 8.15 ms | 3.54 MB |
+| **torque** | **648.3** | **1.54 ms** | **1.34 ms** | **2.12 ms** | **1.57 KB** |
+| **glazer** | 587.5 | 1.70 ms | 1.56 ms | 2.24 ms | 1.58 KB |
+| **simdjsone** | 437.9 | 2.28 ms | 1.95 ms | 3.37 ms | 1.59 KB |
+| **jiffy** | 278.5 | 3.59 ms | 3.69 ms | 4.00 ms | 2.30 MB |
+| **otp json** | 201.3 | 4.97 ms | 5.02 ms | 5.68 ms | 2.48 MB |
+| **jason** | 140.3 | 7.13 ms | 7.13 ms | 7.65 ms | 3.54 MB |
 
 ### Encode (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: iodata()] | **1280K** | **0.78 μs** | **0.71 μs** | **0.88 μs** | **64 B** |
-| **torque** [proplist() :: binary()] | 1190K | 0.84 μs | 0.75 μs | 1.63 μs | 88 B |
-| **glazer** [map() :: binary()] | 1090K | 0.92 μs | 0.83 μs | 1.13 μs | **64 B** |
-| **otp json** [map() :: iodata()] | 1080K | 0.92 μs | 0.79 μs | 2.04 μs | 3928 B |
-| **torque** [map() :: iodata()] | 1050K | 0.95 μs | 0.88 μs | 1.13 μs | **64 B** |
-| **torque** [map() :: binary()] | 1040K | 0.96 μs | 0.88 μs | 1.13 μs | 88 B |
-| **jiffy** [proplist() :: iodata()] | 730K | 1.37 μs | 1.13 μs | 2.33 μs | 120 B |
-| **jiffy** [map() :: iodata()] | 620K | 1.62 μs | 1.42 μs | 2.04 μs | 824 B |
-| **jason** [map() :: iodata()] | 610K | 1.63 μs | 1.50 μs | 2.88 μs | 3848 B |
-| **simdjsone** [proplist() :: iodata()] | 440K | 2.25 μs | 2.04 μs | 2.88 μs | 184 B |
-| **jason** [map() :: binary()] | 380K | 2.66 μs | 2.38 μs | 6.29 μs | 3912 B |
-| **simdjsone** [map() :: iodata()] | 370K | 2.69 μs | 2.42 μs | 4.79 μs | 888 B |
+| **torque** [proplist() :: iodata()] | **1360K** | **0.74 μs** | **0.67 μs** | **0.92 μs** | **64 B** |
+| **torque** [proplist() :: binary()] | 1340K | 0.75 μs | **0.67 μs** | **0.92 μs** | 88 B |
+| **glazer** [map() :: binary()] | 1230K | 0.81 μs | 0.75 μs | 1.00 μs | **64 B** |
+| **otp json** [map() :: iodata()] | 1190K | 0.84 μs | 0.79 μs | 1.21 μs | 3928 B |
+| **torque** [map() :: iodata()] | 1160K | 0.86 μs | 0.79 μs | 1.04 μs | **64 B** |
+| **torque** [map() :: binary()] | 1160K | 0.86 μs | 0.79 μs | 1.04 μs | 88 B |
+| **jiffy** [proplist() :: iodata()] | 720K | 1.39 μs | 1.17 μs | 1.79 μs | 120 B |
+| **jiffy** [map() :: iodata()] | 610K | 1.65 μs | 1.42 μs | 3.58 μs | 824 B |
+| **jason** [map() :: iodata()] | 600K | 1.68 μs | 1.50 μs | 4.21 μs | 3848 B |
+| **simdjsone** [proplist() :: iodata()] | 450K | 2.22 μs | 2.04 μs | 2.71 μs | 184 B |
+| **jason** [map() :: binary()] | 390K | 2.59 μs | 2.38 μs | 6.42 μs | 3912 B |
+| **simdjsone** [map() :: iodata()] | 380K | 2.62 μs | 2.42 μs | 3.33 μs | 888 B |
 
 ### Encode (750 KB Twitter)
 
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: iodata()] | **1228.7** | **0.81 ms** | **0.80 ms** | 1.00 ms | **64 B** |
-| **torque** [proplist() :: binary()] | 1226.6 | 0.82 ms | **0.80 ms** | **0.99 ms** | 88 B |
-| **torque** [map() :: binary()] | 1098.9 | 0.91 ms | 0.89 ms | 1.17 ms | 88 B |
-| **torque** [map() :: iodata()] | 1077.4 | 0.93 ms | 0.91 ms | 1.12 ms | **64 B** |
-| **glazer** [map() :: binary()] | 981.9 | 1.02 ms | 1.00 ms | 1.28 ms | **64 B** |
-| **jiffy** [proplist() :: iodata()] | 536.5 | 1.86 ms | 1.82 ms | 2.98 ms | 37.7 KB |
-| **jiffy** [map() :: iodata()] | 439.8 | 2.27 ms | 2.26 ms | 2.48 ms | 1.06 MB |
-| **otp json** [map() :: iodata()] | 267.3 | 3.74 ms | 4.08 ms | 6.51 ms | 5.40 MB |
-| **jason** [map() :: iodata()] | 260.6 | 3.84 ms | 3.58 ms | 6.07 ms | 4.96 MB |
-| **simdjsone** [proplist() :: iodata()] | 255.6 | 3.91 ms | 3.78 ms | 6.60 ms | 37.7 KB |
-| **simdjsone** [map() :: iodata()] | 214.7 | 4.66 ms | 4.64 ms | 6.61 ms | 1.06 MB |
-| **jason** [map() :: binary()] | 136.6 | 7.32 ms | 7.10 ms | 9.02 ms | 4.96 MB |
+| **torque** [proplist() :: binary()] | **1424.6** | **0.70 ms** | **0.68 ms** | **0.84 ms** | 88 B |
+| **torque** [proplist() :: iodata()] | 1416.7 | 0.71 ms | **0.68 ms** | 1.11 ms | **64 B** |
+| **torque** [map() :: binary()] | 1211.6 | 0.83 ms | 0.81 ms | 1.00 ms | 88 B |
+| **torque** [map() :: iodata()] | 1208.4 | 0.83 ms | 0.81 ms | 0.99 ms | **64 B** |
+| **glazer** [map() :: binary()] | 1082.5 | 0.92 ms | 0.91 ms | 1.06 ms | **64 B** |
+| **jiffy** [proplist() :: iodata()] | 537.1 | 1.86 ms | 1.84 ms | 2.11 ms | 37.7 KB |
+| **jiffy** [map() :: iodata()] | 409.0 | 2.45 ms | 2.33 ms | 2.99 ms | 1.06 MB |
+| **simdjsone** [proplist() :: iodata()] | 259.1 | 3.86 ms | 3.81 ms | 5.68 ms | 37.7 KB |
+| **jason** [map() :: iodata()] | 258.9 | 3.86 ms | 3.62 ms | 5.88 ms | 4.96 MB |
+| **otp json** [map() :: iodata()] | 252.7 | 3.96 ms | 4.14 ms | 6.63 ms | 5.40 MB |
+| **simdjsone** [map() :: iodata()] | 229.7 | 4.35 ms | 4.34 ms | 4.67 ms | 1.06 MB |
+| **jason** [map() :: binary()] | 130.4 | 7.67 ms | 7.70 ms | 8.35 ms | 4.96 MB |
 
 ### Parse (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse(unique_keys) | **572.1K** | **1.75 μs** | 1.33 μs | **5.75 μs** |
-| **torque** parse | 549.5K | 1.82 μs | 1.33 μs | 6.08 μs |
-| **simdjsone** parse | 320.4K | 3.12 μs | **1.21 μs** | 5.96 μs |
+| **torque** parse(unique_keys) | **572.6K** | **1.75 μs** | 1.46 μs | **4.83 μs** |
+| **torque** parse | 510.3K | 1.96 μs | 1.46 μs | 6.29 μs |
+| **simdjsone** parse | 304.0K | 3.29 μs | **1.21 μs** | 5.33 μs |
 
 ### Extract 5 fields from raw JSON (1.2 KB OpenRTB)
 
@@ -243,11 +245,11 @@ selective extraction skips materializing the whole document.
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse(unique_keys) + get_many | **443.3K** | **2.26 μs** | 1.71 μs | 6.67 μs |
-| **torque** parse + get_many | 425.3K | 2.35 μs | 1.79 μs | **6.04 μs** |
-| **torque** parse + get x5 | 419.9K | 2.38 μs | 2.00 μs | 6.92 μs |
-| **simdjsone** parse + get x5 | 371.7K | 2.69 μs | **1.67 μs** | 7.00 μs |
-| **glazer** decode + find x5 | 317.0K | 3.15 μs | 2.83 μs | 7.71 μs |
+| **torque** parse + get_many | **476.1K** | **2.10 μs** | 1.75 μs | **4.75 μs** |
+| **torque** parse + get x5 | 434.6K | 2.30 μs | 1.92 μs | 5.96 μs |
+| **torque** parse(unique_keys) + get_many | 417.8K | 2.39 μs | 1.75 μs | 8.08 μs |
+| **simdjsone** parse + get x5 | 415.8K | 2.41 μs | **1.67 μs** | 6.50 μs |
+| **glazer** decode + find x5 | 317.7K | 3.15 μs | 2.79 μs | 8.54 μs |
 
 Run benchmarks locally:
 
