@@ -82,6 +82,25 @@ jobs:
           "$profdata" merge -o pgo-data/merged.profdata "${raw[@]}"
           ls -la pgo-data
 
+      # PGO the comparison library too, so the benchmark is PGO-vs-PGO instead
+      # of PGO-torque-vs-plain-glazer. glazer's `make OPTIMIZE=1` target drives
+      # PGO from bin/pgo-profile.es, which the hex package doesn't ship, so we
+      # drive its c_src Makefile's PGO=generate/use directly with the same
+      # payloads the torque pass uses (bench/glazer_pgo_workload.exs). The
+      # runtime loads deps/glazer/priv/glazer.so (the _build app priv dir is a
+      # symlink to it), so rebuilding there is what the benchmark picks up.
+      # CI's g++ is GCC: it writes .gcda and reads them back from the profile
+      # dir on -fprofile-use with no separate merge step. A later
+      # `mix compile --force` only forces torque, not the glazer dep, so this
+      # optimised .so survives into the benchmark step.
+      - name: Build instrumented glazer & collect PGO profile
+        run: |
+          make -C deps/glazer/c_src PGO=generate clean all
+          mix run bench/glazer_pgo_workload.exs
+
+      - name: Rebuild glazer with PGO profile
+        run: make -C deps/glazer/c_src PGO=use all
+
       # PGO pass 2: rebuild torque with the collected profile, then benchmark.
       # --force is mandatory here: mix does not treat a changed RUSTFLAGS as a
       # reason to recompile, so a plain `mix compile` is a no-op and the
