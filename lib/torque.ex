@@ -9,6 +9,12 @@ defmodule Torque do
       by JSON Pointer (RFC 6901) paths without materializing the full
       Elixir term tree. Ideal when only a subset of fields is needed.
 
+    * **Compiled pointers** — when the same fixed set of paths is extracted
+      from every document, `compile_pointers/2` pre-parses the paths once and
+      `parse_get_many_nil/2` fuses the parse and extraction into a single NIF
+      call. Skips all per-request path parsing — roughly 1.5× faster end-to-end
+      than `parse/2` + `get_many_nil/2`.
+
     * **Full decode** — `decode/1` converts an entire JSON binary into
       Elixir terms in one pass.
 
@@ -40,6 +46,13 @@ defmodule Torque do
   """
 
   @timeslice_bytes 20_480
+
+  @typedoc """
+  An opaque handle to a set of pre-compiled JSON Pointer paths, returned by
+  `compile_pointers/2`. Pass it to `parse_get_many_nil/2` or `get_many_nil/2`
+  in place of a path list to skip per-call path parsing.
+  """
+  @opaque pointers :: reference()
 
   # --- Decoding ---
 
@@ -289,16 +302,100 @@ defmodule Torque do
   Faster than `get_many/2` when you don't need to distinguish between
   missing fields and null values, as it avoids allocating wrapper tuples.
 
+  Accepts either a list of JSON Pointer path strings or a `t:pointers/0` handle
+  built by `compile_pointers/2`. The compiled form skips all per-call path
+  parsing and is the recommended option for a fixed, repeatedly-queried path
+  set.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":null}))
       iex> Torque.get_many_nil(doc, ["/a", "/b", "/c"])
       [1, nil, nil]
+
+      iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":null}))
+      iex> ptrs = Torque.compile_pointers(["/a", "/b", "/c"])
+      iex> Torque.get_many_nil(doc, ptrs)
+      [1, nil, nil]
   """
   @doc group: :parse_get
-  @spec get_many_nil(reference(), [binary()]) :: [term()]
+  @spec get_many_nil(reference(), [binary()] | pointers()) :: [term()]
   def get_many_nil(doc, paths) when is_reference(doc) and is_list(paths) do
     Torque.Native.get_many_nil(doc, paths)
+  end
+
+  def get_many_nil(doc, pointers) when is_reference(doc) and is_reference(pointers) do
+    Torque.Native.get_many_nil_compiled(doc, pointers)
+  end
+
+  @doc """
+  Pre-compiles a list of JSON Pointer paths into a reusable handle.
+
+  Workloads that parse many documents and extract the *same* fixed set of fields
+  re-split and unescape those pointer strings on every call — wasted work, since
+  they never change. `compile_pointers/2` does it once and returns an opaque
+  `t:pointers/0` handle that `parse_get_many_nil/2` and `get_many_nil/2` accept
+  in place of a path list, eliminating all per-call path parsing (≈2× faster
+  extraction on a typical field set).
+
+  Compile once at startup (e.g. into a module attribute or `:persistent_term`)
+  and reuse the handle for every document.
+
+  ## Options
+
+    * `:unique_keys` — when `true`, object key lookups use a forward scan that
+      stops at the first match (faster). Defaults to `false` (reverse scan,
+      last-value-wins for duplicate keys), matching `parse/2`. Safe to enable
+      when keys are known to be unique.
+
+  Extraction results are returned in the same order as `paths`.
+
+  ## Examples
+
+      iex> ptrs = Torque.compile_pointers(["/a", "/b/0"], unique_keys: true)
+      iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":[2,3]}))
+      iex> Torque.get_many_nil(doc, ptrs)
+      [1, 2]
+  """
+  @doc group: :parse_get
+  @spec compile_pointers([binary()], keyword()) :: pointers()
+  def compile_pointers(paths, opts \\ []) when is_list(paths) do
+    Torque.Native.compile_paths(paths, Keyword.get(opts, :unique_keys, false))
+  end
+
+  @doc """
+  Parses a JSON binary and extracts pre-compiled pointers in a single NIF call.
+
+  Fuses `parse/2` and `get_many_nil/2` for the common parse-once-extract-once
+  case: it parses the document, extracts each compiled pointer, and returns the
+  values — without materializing a reusable document handle or crossing the NIF
+  boundary twice. Missing fields and JSON `null` both become `nil`. The lookup
+  strategy (`:unique_keys`) is taken from the `t:pointers/0` handle.
+
+  Returns `{:ok, values}` (in the same order as the paths given to
+  `compile_pointers/2`) or `{:error, reason}` if the JSON is malformed.
+  Automatically uses a dirty CPU scheduler for inputs larger than 20 KB.
+
+  ## Examples
+
+      iex> ptrs = Torque.compile_pointers(["/id", "/site/domain", "/missing"])
+      iex> Torque.parse_get_many_nil(~s({"id":"x","site":{"domain":"e.com"}}), ptrs)
+      {:ok, ["x", "e.com", nil]}
+
+      iex> ptrs = Torque.compile_pointers(["/a"])
+      iex> match?({:error, _}, Torque.parse_get_many_nil("not json", ptrs))
+      true
+  """
+  @doc group: :parse_get
+  @spec parse_get_many_nil(binary(), pointers()) ::
+          {:ok, [term()]} | {:error, binary() | :nesting_too_deep}
+  def parse_get_many_nil(json, pointers)
+      when is_binary(json) and is_reference(pointers) and byte_size(json) > @timeslice_bytes do
+    Torque.Native.parse_get_many_nil_dirty(json, pointers)
+  end
+
+  def parse_get_many_nil(json, pointers) when is_binary(json) and is_reference(pointers) do
+    Torque.Native.parse_get_many_nil(json, pointers)
   end
 
   @doc """

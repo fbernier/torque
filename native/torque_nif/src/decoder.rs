@@ -297,6 +297,158 @@ fn decode_dirty<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     native_decode::decode_to_term(env, input_term, json.as_slice())
 }
 
+// --- Pre-compiled pointers + fused parse/extract ---
+//
+// The common parse-once-extract-once workload uses a *fixed* set of JSON
+// Pointer paths known at startup. Compiling those paths once (segment split,
+// `~`-unescape, index-vs-key classification) lets the per-request call skip all
+// per-path string work — roughly halving extraction time — and fusing the parse
+// and the extraction into one NIF call avoids materializing a document handle.
+use crate::{CompiledPaths, PathSeg};
+
+/// Pre-split a single JSON Pointer into segments. A numeric segment is stored as
+/// `Num`, keeping both the parsed index and the literal key so the lookup can
+/// pick the right interpretation per node (array index vs. object key) —
+/// matching the runtime behaviour of `pointer_lookup`.
+fn compile_one(path: &str) -> Vec<PathSeg> {
+    let mut segs = Vec::new();
+    if path.len() <= 1 {
+        return segs;
+    }
+    for segment in path[1..].split('/') {
+        let b = segment.as_bytes();
+        let key = if segment.contains('~') {
+            segment.replace("~1", "/").replace("~0", "~")
+        } else {
+            segment.to_string()
+        };
+        if !b.is_empty() && b[0].is_ascii_digit() {
+            if let Ok(idx) = segment.parse::<usize>() {
+                segs.push(PathSeg::Num { idx, key });
+                continue;
+            }
+        }
+        segs.push(PathSeg::Key(key));
+    }
+    segs
+}
+
+#[rustler::nif]
+fn compile_paths<'a>(env: Env<'a>, paths: ListIterator<'a>, unique_keys: bool) -> Term<'a> {
+    let mut out = Vec::new();
+    for pt in paths {
+        let p: &str = pt.decode().unwrap_or("");
+        out.push(compile_one(p));
+    }
+    ResourceArc::new(CompiledPaths {
+        paths: out,
+        unique_keys,
+    })
+    .encode(env)
+}
+
+/// Extract all compiled paths from an already-traversed `value` into a result
+/// list term, substituting nil for missing fields and depth-exceeded values.
+#[inline]
+fn extract_compiled<'a>(
+    env: Env<'a>,
+    value: &sonic_rs::Value,
+    compiled: &CompiledPaths,
+) -> Term<'a> {
+    let nil_raw = atoms::nil().as_c_arg();
+    let n = compiled.paths.len();
+    let mut stack: [ERL_NIF_TERM; GET_MANY_STACK] = [0; GET_MANY_STACK];
+    let mut heap: Option<Vec<ERL_NIF_TERM>> = if n > GET_MANY_STACK {
+        Some(Vec::with_capacity(n))
+    } else {
+        None
+    };
+    for (i, segs) in compiled.paths.iter().enumerate() {
+        let r = match pointer_lookup_compiled(value, segs, compiled.unique_keys) {
+            Some(v) => value_to_term(env, v, MAX_DEPTH)
+                .map(|t| t.as_c_arg())
+                .unwrap_or(nil_raw),
+            None => nil_raw,
+        };
+        match &mut heap {
+            Some(v) => v.push(r),
+            None => stack[i] = r,
+        }
+    }
+    let terms = match &heap {
+        Some(v) => v.as_slice(),
+        None => &stack[..n],
+    };
+    unsafe {
+        Term::new(
+            env,
+            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), n as u32),
+        )
+    }
+}
+
+#[inline]
+fn do_parse_get_many_nil<'a>(env: Env<'a>, bytes: &[u8], compiled: &CompiledPaths) -> Term<'a> {
+    match sonic_rs::from_slice::<sonic_rs::Value>(bytes) {
+        Ok(value) => {
+            let list = extract_compiled(env, &value, compiled);
+            make_tuple2(env, atoms::ok().as_c_arg(), list.as_c_arg())
+        }
+        Err(e) => parse_error_term(env, format!("{}", e)),
+    }
+}
+
+#[rustler::nif]
+fn parse_get_many_nil<'a>(
+    env: Env<'a>,
+    json: Binary,
+    compiled: ResourceArc<CompiledPaths>,
+) -> Term<'a> {
+    let result = do_parse_get_many_nil(env, json.as_slice(), &compiled);
+    schedule::consume_timeslice(env, timeslice_percent(json.len()));
+    result
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn parse_get_many_nil_dirty<'a>(
+    env: Env<'a>,
+    json: Binary,
+    compiled: ResourceArc<CompiledPaths>,
+) -> Term<'a> {
+    do_parse_get_many_nil(env, json.as_slice(), &compiled)
+}
+
+#[inline]
+fn pointer_lookup_compiled<'v>(
+    value: &'v sonic_rs::Value,
+    segs: &[PathSeg],
+    unique_keys: bool,
+) -> Option<&'v sonic_rs::Value> {
+    let mut current = value;
+    for seg in segs {
+        current = match seg {
+            PathSeg::Key(k) => object_get(current, k, unique_keys)?,
+            PathSeg::Num { idx, key } => {
+                if current.is_array() {
+                    current.get(*idx)?
+                } else {
+                    object_get(current, key, unique_keys)?
+                }
+            }
+        };
+    }
+    Some(current)
+}
+
+#[rustler::nif]
+fn get_many_nil_compiled<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    compiled: ResourceArc<CompiledPaths>,
+) -> Term<'a> {
+    extract_compiled(env, &doc.value, &compiled)
+}
+
 #[rustler::nif]
 fn get_many_nil<'a>(
     env: Env<'a>,

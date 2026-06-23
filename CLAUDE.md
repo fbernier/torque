@@ -72,7 +72,9 @@ Torque is a high-performance JSON library for Elixir using Rustler NIFs backed b
 
 1. **Parse + Get** — `parse/1` returns an opaque reference to a parsed document (`sonic_rs::Value`). `get/2,3` extracts fields by JSON Pointer (RFC 6901) path via `value_to_term`. `get_many/2` extracts multiple fields in a single NIF call. Ideal when only a subset of fields is needed.
 
-2. **Full decode** — `decode/1` builds Erlang terms directly during the SIMD parse by implementing sonic-rs's native `JsonVisitor` (`native_decode.rs`): single pass, no intermediate `Value`, zero-copy sub-binaries for unescaped strings.
+2. **Compiled pointers** — for a *fixed* set of paths extracted from every document, `compile_pointers/2` pre-parses the pointer strings once into a `CompiledPaths` resource (`PathSeg::Key` / `PathSeg::Num{idx,key}`, with `~`-unescaping and array-index-vs-object-key resolution done up front). `parse_get_many_nil/2` then fuses the DOM parse and extraction into one NIF call (no document handle, no second boundary crossing), returning `{:ok, values}` with `nil` for missing/`null`. The handle carries the `unique_keys` lookup strategy. ~1.5× faster end-to-end than `parse/2` + `get_many_nil/2` on a typical field set; `get_many_nil/2` also accepts a compiled handle to query an already-parsed doc. Note: a lazy single-pass approach (sonic-rs `get_many` over a `PointerTree`) was measured ~6× *slower* here — per-call `PointerTree` (HashMap + `FastStr`) construction dominates — so the DOM is the right structure for this small-doc / many-short-paths workload.
+
+3. **Full decode** — `decode/1` builds Erlang terms directly during the SIMD parse by implementing sonic-rs's native `JsonVisitor` (`native_decode.rs`): single pass, no intermediate `Value`, zero-copy sub-binaries for unescaped strings.
 
 ### Encoding
 
@@ -98,8 +100,8 @@ Inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to
 
 - `lib/torque.ex` — public API with `@doc`, typespecs, dirty scheduler dispatch
 - `lib/torque/native.ex` — RustlerPrecompiled NIF stubs (set `TORQUE_BUILD=true` to compile from source)
-- `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` resource
-- `native/torque_nif/src/decoder.rs` — parse, get, get_many, decode NIFs
+- `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` + `CompiledPaths` (`PathSeg`) resources
+- `native/torque_nif/src/decoder.rs` — parse, get, get_many, get_many_nil, decode NIFs; compiled-pointer + fused `parse_get_many_nil` path
 - `native/torque_nif/src/native_decode.rs` — fused decoder; builds terms during the SIMD parse via sonic-rs's `JsonVisitor`
 - `native/torque_nif/src/encoder.rs` — direct term-walking JSON encoder
 - `native/torque_nif/src/types.rs` — sonic_rs Value → Erlang term conversion (used by get/get_many)
