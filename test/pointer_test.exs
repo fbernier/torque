@@ -342,4 +342,98 @@ defmodule Torque.PointerTest do
       assert decoded == decoded2
     end
   end
+
+  describe "compile_pointers/2 + get_many_nil/2" do
+    @ptr_paths [
+      "/id",
+      "/site/domain",
+      "/device/geo/lat",
+      "/imp/0/banner/w",
+      "/nonexistent"
+    ]
+
+    test "matches get_many_nil with raw paths", %{doc: doc} do
+      ptrs = Torque.compile_pointers(@ptr_paths)
+      assert Torque.get_many_nil(doc, ptrs) == Torque.get_many_nil(doc, @ptr_paths)
+    end
+
+    test "extracts scalars, arrays, and nil for missing", %{doc: doc} do
+      ptrs = Torque.compile_pointers(@ptr_paths)
+      assert ["req-123", "example.com", 40.7128, 300, nil] = Torque.get_many_nil(doc, ptrs)
+    end
+
+    test "unique_keys handle matches default for unique-keyed input", %{doc: doc} do
+      uniq = Torque.compile_pointers(@ptr_paths, unique_keys: true)
+      default = Torque.compile_pointers(@ptr_paths)
+      assert Torque.get_many_nil(doc, uniq) == Torque.get_many_nil(doc, default)
+    end
+
+    test "empty pointer list" do
+      {:ok, doc} = Torque.parse(~s({"a":1}))
+      assert [] = Torque.get_many_nil(doc, Torque.compile_pointers([]))
+    end
+
+    test "root path returns whole document" do
+      {:ok, doc} = Torque.parse(~s({"a":1}))
+      ptrs = Torque.compile_pointers([""])
+      assert [%{"a" => 1}] = Torque.get_many_nil(doc, ptrs)
+    end
+
+    test "numeric segment dispatches on node type via compiled handle" do
+      {:ok, obj_doc} = Torque.parse(~s({"0":"from-object"}))
+      {:ok, arr_doc} = Torque.parse(~s(["from-array"]))
+      ptrs = Torque.compile_pointers(["/0"])
+      assert ["from-object"] = Torque.get_many_nil(obj_doc, ptrs)
+      assert ["from-array"] = Torque.get_many_nil(arr_doc, ptrs)
+    end
+
+    test "tilde escapes are unescaped at compile time" do
+      {:ok, doc} = Torque.parse(~s({"a/b":1,"c~d":2}))
+      ptrs = Torque.compile_pointers(["/a~1b", "/c~0d"])
+      assert [1, 2] = Torque.get_many_nil(doc, ptrs)
+    end
+  end
+
+  describe "parse_get_many_nil/2" do
+    @fused_paths [
+      "/id",
+      "/site/domain",
+      "/device/geo/lat",
+      "/imp/0/banner/w",
+      "/nonexistent"
+    ]
+
+    test "fused parse + extract matches parse + get_many_nil" do
+      ptrs = Torque.compile_pointers(@fused_paths)
+      {:ok, fused} = Torque.parse_get_many_nil(@sample_json, ptrs)
+      {:ok, doc} = Torque.parse(@sample_json)
+      assert fused == Torque.get_many_nil(doc, @fused_paths)
+    end
+
+    test "returns {:ok, values} with nil for missing and null" do
+      ptrs = Torque.compile_pointers(["/id", "/site/domain", "/missing", "/null"])
+      json = ~s({"id":"x","site":{"domain":"e.com"},"null":null})
+      assert {:ok, ["x", "e.com", nil, nil]} = Torque.parse_get_many_nil(json, ptrs)
+    end
+
+    test "honors unique_keys from the handle" do
+      ptrs = Torque.compile_pointers(["/a", "/b"], unique_keys: true)
+      assert {:ok, [1, 2]} = Torque.parse_get_many_nil(~s({"a":1,"b":2}), ptrs)
+    end
+
+    test "returns error tuple for malformed json" do
+      ptrs = Torque.compile_pointers(["/a"])
+      assert {:error, _} = Torque.parse_get_many_nil("not json", ptrs)
+      assert {:error, _} = Torque.parse_get_many_nil("", ptrs)
+    end
+
+    test "dirty scheduler for large payload" do
+      large_map = Map.new(1..600, fn i -> {"key_#{i}", String.duplicate("v", 40)} end)
+      json = Jason.encode!(large_map)
+      assert byte_size(json) > 20_480
+      ptrs = Torque.compile_pointers(["/key_1", "/key_600", "/missing"])
+      assert {:ok, [v1, v600, nil]} = Torque.parse_get_many_nil(json, ptrs)
+      assert is_binary(v1) and is_binary(v600)
+    end
+  end
 end

@@ -10,6 +10,7 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
 - Ultra-low memory encoder (64 B per encode vs ~4 KB for OTP `json`/jason)
 - Parse-then-get API for selective field extraction via JSON Pointer (RFC 6901)
 - Batch field extraction (`get_many/2`) with single NIF call
+- Pre-compiled pointers with fused parse + extract (`parse_get_many_nil/2`)
 - Automatic dirty CPU scheduler dispatch for inputs larger than 20 KB
 - jiffy-compatible `{proplist}` encoding
 
@@ -78,6 +79,24 @@ for faster field lookups (uses sonic-rs internal indexing instead of linear scan
 {:ok, doc} = Torque.parse(json, unique_keys: true)
 ```
 
+### Compiled Pointers
+
+When the same fixed set of paths is extracted from every document, compile the
+pointers once and reuse the handle. `parse_get_many_nil/2` then fuses the parse
+and extraction into a single NIF call, skipping all per-request path parsing —
+roughly 1.5× faster end-to-end than `parse/2` + `get_many_nil/2`.
+
+```elixir
+# Once, at startup (e.g. a module attribute or :persistent_term):
+pointers = Torque.compile_pointers(["/id", "/site/domain", "/imp/0/banner/w"], unique_keys: true)
+
+# Per document — parse + extract in one call:
+{:ok, ["req-1", "example.com", 300]} = Torque.parse_get_many_nil(json, pointers)
+```
+
+Missing fields and JSON `null` both become `nil`. The handle also works with an
+already-parsed document via `Torque.get_many_nil(doc, pointers)`.
+
 ### Encoding
 
 ```elixir
@@ -99,17 +118,19 @@ json = Torque.encode_to_iodata(%{id: "abc"})
 
 | Function | Description |
 |----------|-------------|
+| `Torque.compile_pointers(paths, opts)` | Pre-compile a fixed path set into a reusable handle |
 | `Torque.decode(binary)` | Decode JSON to Elixir terms |
 | `Torque.decode!(binary)` | Decode JSON, raising on error |
-| `Torque.parse(binary, opts)` | Parse JSON into opaque document reference |
+| `Torque.encode(term)` | Encode term to JSON binary |
+| `Torque.encode!(term)` | Encode term, raising on error |
+| `Torque.encode_to_iodata(term)` | Encode term, returns binary directly (fastest) |
 | `Torque.get(doc, path)` | Extract field by JSON Pointer path |
 | `Torque.get(doc, path, default)` | Extract field with default for missing paths |
 | `Torque.get_many(doc, paths)` | Extract multiple fields in one NIF call |
 | `Torque.get_many_nil(doc, paths)` | Extract multiple fields, `nil` for missing |
 | `Torque.length(doc, path)` | Return length of array at path |
-| `Torque.encode(term)` | Encode term to JSON binary |
-| `Torque.encode!(term)` | Encode term, raising on error |
-| `Torque.encode_to_iodata(term)` | Encode term, returns binary directly (fastest) |
+| `Torque.parse(binary, opts)` | Parse JSON into opaque document reference |
+| `Torque.parse_get_many_nil(binary, pointers)` | Fused parse + extract of compiled pointers in one NIF call |
 
 ## Type Conversion
 
@@ -151,9 +172,9 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 
 | Atom | Returned by | Meaning |
 |------|-------------|---------|
-| `:nesting_too_deep` | `decode/1`, `parse/1`, `get/2`, `get_many/2` | Document exceeds 128 nesting levels |
+| `:nesting_too_deep` | `decode/1`, `parse/1`, `get/2`, `get_many/2`, `parse_get_many_nil/2` | Document exceeds 128 nesting levels |
 
-`parse/1` and `decode/1` also return `{:error, binary}` with a message from sonic-rs for malformed JSON.
+`parse/1`, `decode/1`, and `parse_get_many_nil/2` also return `{:error, binary}` with a message from sonic-rs for malformed JSON.
 
 ### Encode
 
