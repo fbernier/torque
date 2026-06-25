@@ -1,10 +1,11 @@
 # PGO training workload for the torque NIF.
 #
-# Not a benchmark — it exercises every hot path (decode, encode, parse, get)
-# over representative small and large payloads so the Profile-Guided
-# Optimisation build (scripts/pgo-build.sh, and the release CI) can collect
-# realistic branch and call-frequency data. Run via that tooling with an
-# instrumented NIF; running it directly does nothing useful.
+# Not a benchmark — it exercises every hot path (decode, encode, parse, get,
+# and the fused compiled-pointer extraction) over representative small and
+# large payloads so the Profile-Guided Optimisation build (scripts/pgo-build.sh,
+# and the release CI) can collect realistic branch and call-frequency data. Run
+# via that tooling with an instrumented NIF; running it directly does nothing
+# useful.
 #
 # It deliberately has NO external dependencies (JSON is built as strings rather
 # than via an encoder), so it runs in a bare mix environment — important for CI
@@ -46,6 +47,11 @@ fields = ~w(/id /site/domain /site/page /site/publisher/id /site/cat
             /device/devicetype /device/ua /device/ip /device/geo/country
             /device/geo/lat /device/connectiontype /user/id /imp /regs/coppa)
 
+# Compiled-pointer handles are built once at startup in real use, so compile
+# them outside the loop and exercise only the per-request extraction below.
+compiled = Torque.compile_pointers(fields)
+compiled_uk = Torque.compile_pointers(fields, unique_keys: true)
+
 IO.puts("PGO workload: small=#{byte_size(small_json)}B large=#{byte_size(large_json)}B")
 
 decode = fn ->
@@ -71,8 +77,19 @@ parse_get = fn ->
   Torque.get_many(doc_uk, fields)
 end
 
+compiled_get = fn ->
+  # Fused parse+extract on both schedulers (small = normal, large = dirty CPU).
+  {:ok, _} = Torque.parse_get_many_nil(small_json, compiled)
+  {:ok, _} = Torque.parse_get_many_nil(large_json, compiled)
+  {:ok, _} = Torque.parse_get_many_nil(small_json, compiled_uk)
+  # Compiled-pointer extraction against an already-parsed handle.
+  {:ok, doc} = Torque.parse(small_json)
+  Torque.get_many_nil(doc, compiled)
+end
+
 Enum.each(1..5_000, fn _ -> decode.() end)
 Enum.each(1..5_000, fn _ -> encode.() end)
 Enum.each(1..10_000, fn _ -> parse_get.() end)
+Enum.each(1..10_000, fn _ -> compiled_get.() end)
 
 IO.puts("PGO workload complete")
