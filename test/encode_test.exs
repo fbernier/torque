@@ -60,6 +60,22 @@ defmodule Torque.EncodeTest do
       assert {:ok, "18446744073709551615"} = Torque.encode(18_446_744_073_709_551_615)
     end
 
+    test "positive bignum (beyond u64)" do
+      assert {:ok, "123456789012345678901234567890"} =
+               Torque.encode(123_456_789_012_345_678_901_234_567_890)
+    end
+
+    test "negative bignum (beyond i64)" do
+      assert {:ok, "-123456789012345678901234567890"} =
+               Torque.encode(-123_456_789_012_345_678_901_234_567_890)
+    end
+
+    test "bignum round-trips through decode" do
+      n = 10 ** 100 + 7
+      assert {:ok, json} = Torque.encode(n)
+      assert {:ok, ^n} = Torque.decode(json)
+    end
+
     test "float" do
       assert {:ok, json} = Torque.encode(3.14)
       assert_in_delta 3.14, String.to_float(json), 0.001
