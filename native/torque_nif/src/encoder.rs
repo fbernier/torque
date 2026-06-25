@@ -291,6 +291,15 @@ fn encode_integer(
         buf.extend_from_slice(itoa_buf.format(u).as_bytes());
         return Ok(());
     }
+    // Arbitrary-precision integer (Erlang bignum) — the term is an integer
+    // (encode_term only routes integers here) but doesn't fit i64/u64, so
+    // emit its exact decimal form. num-bigint's Display is plain base-10 with
+    // a leading '-' for negatives, which is already a valid JSON number.
+    if let Ok(big) = term.decode::<rustler::BigInt>() {
+        use std::io::Write;
+        let _ = write!(buf, "{}", big);
+        return Ok(());
+    }
     Err(EncodeError::UnsupportedType)
 }
 
