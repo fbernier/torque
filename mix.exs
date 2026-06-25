@@ -46,7 +46,6 @@ defmodule Torque.MixProject do
       {:jiffy, "~> 2.0", only: :bench},
       {:rustler, ">= 0.0.0", optional: true},
       {:rustler_precompiled, "~> 0.8"},
-      {:simdjsone, "~> 0.5.0", only: :bench},
       {:stream_data, "~> 1.1", only: :test}
     ]
   end

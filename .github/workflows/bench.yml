@@ -47,9 +47,6 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      - name: Fix simdjsone Makefile priv dir bug
-        run: sed -i 's|$(BASEDIR)/priv|$(PRIV_DIR)|g' deps/simdjsone/c_src/Makefile
-
       # PGO pass 1: build torque instrumented and run a representative workload
       # to emit profile data. RUSTFLAGS replaces (not appends to) the crate's
       # .cargo/config.toml, so target-cpu=native is carried through here.
