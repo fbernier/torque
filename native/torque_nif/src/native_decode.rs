@@ -15,6 +15,7 @@ use rustler::sys::{
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
 
 use crate::atoms;
@@ -23,23 +24,46 @@ use crate::types::MAX_DEPTH;
 
 const STACK_SIZE: usize = 64;
 
+/// Cap on the retained thread-local value stack (in terms, 8 bytes each ≈ 1 MB),
+/// so a one-off huge document doesn't pin a large allocation on a scheduler
+/// thread indefinitely. Mirrors the encoder's `BUF_RETAIN_CAP`.
+const VALUES_RETAIN_CAP: usize = 1 << 17;
+
+struct DecodeBufs {
+    values: Vec<ERL_NIF_TERM>,
+    frames: Vec<usize>,
+}
+
+thread_local! {
+    /// Reused across decode calls on each scheduler thread, avoiding two heap
+    /// allocations (the value and frame stacks) per call — the dominant
+    /// per-call cost for small payloads. NIFs run to completion without
+    /// preemption and decode never re-enters this NIF, so the borrow is never
+    /// nested.
+    static DECODE_BUFS: RefCell<DecodeBufs> = RefCell::new(DecodeBufs {
+        values: Vec::with_capacity(64),
+        frames: Vec::with_capacity(16),
+    });
+}
+
 struct InputRef {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
 }
 
-struct TermBuilder<'a> {
+struct TermBuilder<'a, 'b> {
     env: Env<'a>,
     input: InputRef,
     /// Postfix value stack: completed terms plus the open containers' children.
-    values: Vec<ERL_NIF_TERM>,
+    /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
+    values: &'b mut Vec<ERL_NIF_TERM>,
     /// `values` index where each currently-open container's children begin.
-    frames: Vec<usize>,
+    frames: &'b mut Vec<usize>,
     too_deep: bool,
 }
 
-impl<'a> TermBuilder<'a> {
+impl<'a, 'b> TermBuilder<'a, 'b> {
     #[inline]
     fn push(&mut self, term: ERL_NIF_TERM) {
         self.values.push(term);
@@ -189,7 +213,7 @@ fn bignum_term_large(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     rustler::BigInt::parse_bytes(raw.as_bytes(), 10).map(|big| big.encode(env).as_c_arg())
 }
 
-impl<'de, 'a> JsonVisitor<'de> for TermBuilder<'a> {
+impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     #[inline]
     fn visit_dom_start(&mut self) -> bool {
         true
@@ -303,41 +327,52 @@ impl<'de, 'a> JsonVisitor<'de> for TermBuilder<'a> {
 }
 
 pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
-    let mut builder = TermBuilder {
-        env,
-        input: InputRef {
-            term: input_term,
-            base: bytes.as_ptr(),
-            len: bytes.len(),
-        },
-        values: Vec::with_capacity(64),
-        frames: Vec::with_capacity(16),
-        too_deep: false,
-    };
+    DECODE_BUFS.with(|cell| {
+        let mut bufs = cell.borrow_mut();
+        let DecodeBufs { values, frames } = &mut *bufs;
+        values.clear();
+        frames.clear();
+        let mut builder = TermBuilder {
+            env,
+            input: InputRef {
+                term: input_term,
+                base: bytes.as_ptr(),
+                len: bytes.len(),
+            },
+            values,
+            frames,
+            too_deep: false,
+        };
 
-    match sonic_rs::parse_into_visitor(bytes, &mut builder) {
-        Ok(()) => match builder.values.first() {
-            Some(&root) => make_tuple2(env, atoms::ok().as_c_arg(), root),
-            None => make_tuple2(
-                env,
-                atoms::error().as_c_arg(),
-                "empty document".encode(env).as_c_arg(),
-            ),
-        },
-        Err(e) => {
-            if builder.too_deep {
-                make_tuple2(
+        let result = match sonic_rs::parse_into_visitor(bytes, &mut builder) {
+            Ok(()) => match builder.values.first() {
+                Some(&root) => make_tuple2(env, atoms::ok().as_c_arg(), root),
+                None => make_tuple2(
                     env,
                     atoms::error().as_c_arg(),
-                    atoms::nesting_too_deep().as_c_arg(),
-                )
-            } else {
-                make_tuple2(
-                    env,
-                    atoms::error().as_c_arg(),
-                    format!("{}", e).encode(env).as_c_arg(),
-                )
+                    "empty document".encode(env).as_c_arg(),
+                ),
+            },
+            Err(e) => {
+                if builder.too_deep {
+                    make_tuple2(
+                        env,
+                        atoms::error().as_c_arg(),
+                        atoms::nesting_too_deep().as_c_arg(),
+                    )
+                } else {
+                    make_tuple2(
+                        env,
+                        atoms::error().as_c_arg(),
+                        format!("{}", e).encode(env).as_c_arg(),
+                    )
+                }
             }
+        };
+
+        if builder.values.capacity() > VALUES_RETAIN_CAP {
+            builder.values.shrink_to(VALUES_RETAIN_CAP);
         }
-    }
+        result
+    })
 }
