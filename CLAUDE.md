@@ -16,7 +16,7 @@ mix dialyzer                       # static type analysis
 cargo fmt                          # format Rust code (run from repo root)
 cargo fmt --check                  # check Rust formatting
 cargo clippy -- -D warnings        # Rust linter
-MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks (requires jiffy)
+MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks
 ```
 
 `TORQUE_BUILD=true` is required for local development to force compilation from Rust source instead of downloading precompiled binaries. Without it, `RustlerPrecompiled` will try to fetch binaries from GitHub releases.
