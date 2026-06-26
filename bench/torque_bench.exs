@@ -1,4 +1,4 @@
-# Benchmark: Torque vs glazer, simdjsone, jiffy, Jason, OTP JSON
+# Benchmark: Torque vs glazer, jiffy, Jason, OTP JSON
 #
 # Run with: MIX_ENV=bench mix run bench/torque_bench.exs
 # CI JSON output: BENCH_OUTPUT=json MIX_ENV=bench mix run bench/torque_bench.exs
@@ -310,7 +310,6 @@ Benchee.run(
     "jason decode" => fn -> Jason.decode!(sample_json) end,
     "jiffy decode" => fn -> :jiffy.decode(sample_json, [:return_maps]) end,
     "otp json decode" => fn -> :json.decode(sample_json) end,
-    "simdjsone decode" => fn -> :simdjson.decode(sample_json) end,
     "torque decode" => fn -> Torque.decode!(sample_json) end
   },
   warmup: 2,
@@ -332,7 +331,6 @@ Benchee.run(
     "jason decode" => fn -> Jason.decode!(large_json) end,
     "jiffy decode" => fn -> :jiffy.decode(large_json, [:return_maps]) end,
     "otp json decode" => fn -> :json.decode(large_json) end,
-    "simdjsone decode" => fn -> :simdjson.decode(large_json) end,
     "torque decode" => fn -> Torque.decode!(large_json) end
   },
   warmup: 2,
@@ -358,8 +356,6 @@ Benchee.run(
     end,
     "otp json [map() :: iodata()]" => fn -> :json.encode(bid_response) end,
     "glazer [map() :: binary()]" => fn -> :glazer_json.encode(bid_response) end,
-    "simdjsone [map() :: iodata()]" => fn -> :simdjson.encode(bid_response) end,
-    "simdjsone [proplist() :: iodata()]" => fn -> :simdjson.encode(bid_response_proplist) end,
     "torque [map() :: binary()]" => fn -> Torque.encode!(bid_response) end,
     "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(bid_response) end,
     "torque [proplist() :: binary()]" => fn -> Torque.encode!(bid_response_proplist) end,
@@ -386,8 +382,6 @@ Benchee.run(
     "jiffy [proplist() :: iodata()]" => fn -> :jiffy.encode(large_decoded_proplist) end,
     "otp json [map() :: iodata()]" => fn -> :json.encode(large_decoded_json) end,
     "glazer [map() :: binary()]" => fn -> :glazer_json.encode(large_decoded_json) end,
-    "simdjsone [map() :: iodata()]" => fn -> :simdjson.encode(large_decoded_json) end,
-    "simdjsone [proplist() :: iodata()]" => fn -> :simdjson.encode(large_decoded_proplist) end,
     "torque [map() :: binary()]" => fn -> Torque.encode!(large_decoded_json) end,
     "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(large_decoded_json) end,
     "torque [proplist() :: binary()]" => fn -> Torque.encode!(large_decoded_proplist) end,
@@ -414,17 +408,14 @@ glazer_paths =
 BenchGroup.set("Parse — 1.2 KB OpenRTB")
 IO.puts("\n=== PARSE BENCHMARK ===\n")
 
-# NOTE: simdjsone segfaults when Benchee measures memory (GC triggers a
-# use-after-free in the NIF resource destructor), so memory_time is 0 here.
 Benchee.run(
   %{
-    "simdjsone parse" => fn -> :simdjson.parse(sample_json) end,
     "torque parse" => fn -> Torque.parse(sample_json) end,
     "torque parse(unique_keys)" => fn -> Torque.parse(sample_json, unique_keys: true) end
   },
   warmup: 2,
   time: 5,
-  memory_time: 0,
+  memory_time: 2,
   percentiles: [50, 95, 99],
   formatters:
     [
@@ -436,19 +427,13 @@ BenchGroup.set("Extract 5 fields — 1.2 KB OpenRTB")
 IO.puts("\n=== EXTRACT 5 FIELDS BENCHMARK ===\n")
 
 # End-to-end from raw JSON: each library does its full setup plus 5 extractions,
-# so the comparison is apples-to-apples — torque/simdjsone parse + get, glazer
-# decode + find (it has no lazy handle). memory_time is 0 because simdjsone's
-# parse resource is freed during Benchee's memory runs and its destructor
-# use-after-frees (segfault).
+# so the comparison is apples-to-apples — torque parse + get vs glazer decode +
+# find (it has no lazy handle, so it must fully decode first).
 Benchee.run(
   %{
     "glazer decode + find x5" => fn ->
       d = :glazer_json.decode(sample_json)
       for p <- glazer_paths, do: :glazer.find(d, p)
-    end,
-    "simdjsone parse + get x5" => fn ->
-      r = :simdjson.parse(sample_json)
-      for f <- fields, do: :simdjson.get(r, f)
     end,
     "torque parse + get x5" => fn ->
       {:ok, doc} = Torque.parse(sample_json)
@@ -465,7 +450,7 @@ Benchee.run(
   },
   warmup: 2,
   time: 5,
-  memory_time: 0,
+  memory_time: 2,
   percentiles: [50, 95, 99],
   formatters:
     [

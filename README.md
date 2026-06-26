@@ -200,7 +200,6 @@ optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 | **torque** | **413.3K** | **2.42 μs** | **2.29 μs** | **4.04 μs** | 1.56 KB |
 | **glazer** | 401.8K | 2.49 μs | 2.38 μs | 4.58 μs | 1.56 KB |
 | **jiffy** | 202.5K | 4.94 μs | 4.50 μs | 9.75 μs | **1.55 KB** |
-| **simdjsone** | 178.2K | 5.61 μs | 5.25 μs | 12.63 μs | 1.59 KB |
 | **otp json** | 147.4K | 6.78 μs | 6.58 μs | 10.58 μs | 7.73 KB |
 | **jason** | 113.2K | 8.83 μs | 8.46 μs | 13.96 μs | 9.54 KB |
 
@@ -210,7 +209,6 @@ optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 |---|---|---|---|---|---|
 | **torque** | **660.7** | **1.51 ms** | **1.33 ms** | 2.21 ms | **1.57 KB** |
 | **glazer** | 659.6 | 1.52 ms | 1.43 ms | **1.94 ms** | 1.58 KB |
-| **simdjsone** | 413.6 | 2.42 ms | 1.93 ms | 3.75 ms | 1.59 KB |
 | **jiffy** | 301.4 | 3.32 ms | 3.39 ms | 3.96 ms | 2.30 MB |
 | **otp json** | 205.3 | 4.87 ms | 4.80 ms | 7.52 ms | 2.48 MB |
 | **jason** | 151.7 | 6.59 ms | 6.58 ms | 6.97 ms | 3.52 MB |
@@ -228,9 +226,7 @@ optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 | **jiffy** [proplist() :: iodata()] | 640K | 1.57 μs | 1.33 μs | 1.83 μs | 120 B |
 | **jason** [map() :: iodata()] | 620K | 1.62 μs | 1.54 μs | 2.63 μs | 3848 B |
 | **jiffy** [map() :: iodata()] | 520K | 1.91 μs | 1.75 μs | 2.25 μs | 824 B |
-| **simdjsone** [proplist() :: iodata()] | 410K | 2.42 μs | 2.29 μs | 3.00 μs | 184 B |
 | **jason** [map() :: binary()] | 380K | 2.63 μs | 2.38 μs | 6.42 μs | 3912 B |
-| **simdjsone** [map() :: iodata()] | 340K | 2.94 μs | 2.75 μs | 4.38 μs | 888 B |
 
 ### Encode (750 KB Twitter)
 
@@ -243,10 +239,8 @@ optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 | **glazer** [map() :: binary()] | 1033.3 | 0.97 ms | 0.96 ms | 1.08 ms | **64 B** |
 | **jiffy** [proplist() :: iodata()] | 469.5 | 2.13 ms | 2.10 ms | 2.51 ms | 37.7 KB |
 | **jiffy** [map() :: iodata()] | 347.6 | 2.88 ms | 2.96 ms | 3.90 ms | 1.06 MB |
-| **simdjsone** [proplist() :: iodata()] | 254.7 | 3.93 ms | 3.87 ms | 5.44 ms | 37.7 KB |
 | **otp json** [map() :: iodata()] | 251.8 | 3.97 ms | 4.13 ms | 6.44 ms | 5.40 MB |
 | **jason** [map() :: iodata()] | 233.5 | 4.28 ms | 4.03 ms | 6.50 ms | 4.96 MB |
-| **simdjsone** [map() :: iodata()] | 215.1 | 4.65 ms | 4.76 ms | 5.22 ms | 1.06 MB |
 | **jason** [map() :: binary()] | 127.9 | 7.82 ms | 7.84 ms | 8.43 ms | 4.96 MB |
 
 ### Parse (1.2 KB OpenRTB)
@@ -255,12 +249,11 @@ optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 |---|---|---|---|---|
 | **torque** parse(unique_keys) | **542.0K** | **1.84 μs** | 1.46 μs | **5.63 μs** |
 | **torque** parse | 522.8K | 1.91 μs | 1.46 μs | 6.00 μs |
-| **simdjsone** parse | 306.3K | 3.27 μs | **1.21 μs** | 5.83 μs |
 
 ### Extract 5 fields from raw JSON (1.2 KB OpenRTB)
 
 End-to-end cost of pulling 5 fields out of a JSON blob: `parse` + `get`
-(torque, simdjsone) vs `decode` + `find` (glazer has no lazy handle, so it must
+(torque) vs `decode` + `find` (glazer has no lazy handle, so it must
 fully decode first). This is the apples-to-apples version of "get" — torque's
 selective extraction skips materializing the whole document.
 
@@ -269,7 +262,6 @@ selective extraction skips materializing the whole document.
 | **torque** parse + get_many | **436.6K** | **2.29 μs** | **1.79 μs** | **6.21 μs** |
 | **torque** parse(unique_keys) + get_many | 429.5K | 2.33 μs | **1.79 μs** | 6.67 μs |
 | **torque** parse + get x5 | 409.8K | 2.44 μs | 2.00 μs | 6.67 μs |
-| **simdjsone** parse + get x5 | 374.9K | 2.67 μs | **1.79 μs** | 7.21 μs |
 | **glazer** decode + find x5 | 344.9K | 2.90 μs | 2.75 μs | 6.71 μs |
 
 Run benchmarks locally:
