@@ -6,7 +6,7 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
 
 ## Features
 
-- SIMD-accelerated decoding (AVX2/SSE4.2 on x86, NEON on ARM)
+- SIMD-accelerated decoding (AVX2 on x86, NEON on ARM)
 - Ultra-low memory encoder (64 B per encode vs ~4 KB for OTP `json`/jason)
 - Parse-then-get API for selective field extraction via JSON Pointer (RFC 6901)
 - Batch field extraction (`get_many/2`) with single NIF call
@@ -21,7 +21,7 @@ Add to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:torque, "~> 0.2.3"}
+    {:torque, "~> 0.2.4"}
   ]
 end
 ```

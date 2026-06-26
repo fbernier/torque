@@ -45,7 +45,7 @@ defmodule BenchGroup do
   end
 end
 
-# Sample JSON payload (~1.3KB)
+# Sample JSON payload (~1.2KB)
 sample_json =
   Jason.encode!(%{
     "id" => "req-#{:rand.uniform(1_000_000)}",

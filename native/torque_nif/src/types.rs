@@ -10,7 +10,7 @@ use crate::atoms;
 
 const STACK_SIZE: usize = 64;
 
-/// Maximum JSON nesting depth accepted by `value_to_term`, the serde decoder,
+/// Maximum JSON nesting depth accepted by `value_to_term`, the native decoder,
 /// and the encoder. Inputs nested deeper than this return
 /// `{:error, :nesting_too_deep}` rather than overflowing the stack and crashing
 /// the VM. Sized for the small dirty-CPU-scheduler stack, which inputs >20 KB

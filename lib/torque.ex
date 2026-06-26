@@ -200,7 +200,7 @@ defmodule Torque do
       {:ok, 1}
   """
   @doc group: :parse_get
-  @spec parse(binary(), keyword()) :: {:ok, reference()} | {:error, binary()}
+  @spec parse(binary(), keyword()) :: {:ok, reference()} | {:error, binary() | :nesting_too_deep}
   def parse(json, opts \\ [])
 
   def parse(json, []) when is_binary(json) and byte_size(json) > @timeslice_bytes do
