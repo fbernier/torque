@@ -1,9 +1,8 @@
 //! Fused single-pass decoder built on sonic-rs's native push-based parser.
 //!
-//! Unlike `serde_decode` (which drives sonic-rs's much slower serde
-//! `Deserializer`), this implements sonic-rs's `JsonVisitor` directly, building
-//! Erlang terms during the SIMD parse — no serde plumbing, no intermediate
-//! `Value` tree, and zero-copy sub-binaries for unescaped strings.
+//! This implements sonic-rs's `JsonVisitor` directly, building Erlang terms
+//! during the SIMD parse — no intermediate `Value` tree, and zero-copy
+//! sub-binaries for unescaped strings.
 //!
 //! Terms are assembled with a postfix value stack: scalars push a term; a
 //! container-end pops its children, builds the list/map term, and pushes the
@@ -135,7 +134,7 @@ fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_T
         {
             map
         } else {
-            // Duplicate keys: last value wins (matches value_to_term/serde_decode).
+            // Duplicate keys: last value wins (matches value_to_term).
             map = enif_make_new_map(env.as_c_arg());
             for i in 0..keys.len() {
                 let mut new_map: ERL_NIF_TERM = 0;
