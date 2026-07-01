@@ -3,8 +3,8 @@ use crate::nif_util::make_tuple2;
 use crate::types::MAX_DEPTH;
 use rustler::sys::{
     c_int, c_uint, enif_get_atom, enif_get_atom_length, enif_get_double, enif_get_int64,
-    enif_get_list_cell, enif_get_tuple, enif_get_uint64, enif_inspect_binary, ErlNifBinary,
-    ErlNifCharEncoding, ErlNifEnv, ERL_NIF_TERM,
+    enif_get_list_cell, enif_get_tuple, enif_get_uint64, enif_inspect_binary, enif_is_empty_list,
+    ErlNifBinary, ErlNifCharEncoding, ErlNifEnv, ERL_NIF_TERM,
 };
 use rustler::{schedule, Env, MapIterator, NewBinary, Term, TermType};
 use std::cell::RefCell;
@@ -100,6 +100,39 @@ unsafe fn atom_to_stack_buf(
         ErlNifCharEncoding::ERL_NIF_LATIN1,
     );
     Ok(&buf[..len as usize])
+}
+
+/// Append an atom's name to `buf` as an escaped JSON string body (no quotes).
+///
+/// `enif_get_atom` yields Latin-1 bytes; bytes >= 0x80 are transcoded to
+/// two-byte UTF-8 sequences so the emitted JSON stays valid UTF-8.
+#[inline]
+fn write_atom_name(
+    env_raw: *mut ErlNifEnv,
+    term_raw: ERL_NIF_TERM,
+    buf: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let mut atom_buf = [0u8; 256];
+    let name = unsafe { atom_to_stack_buf(env_raw, term_raw, &mut atom_buf)? };
+    if name.is_ascii() {
+        crate::escape::escape_to_vec(name, buf);
+    } else {
+        // Latin-1 name is at most 255 bytes, so 2x fits on the stack.
+        let mut utf8 = [0u8; 512];
+        let mut n = 0usize;
+        for &b in name {
+            if b < 0x80 {
+                utf8[n] = b;
+                n += 1;
+            } else {
+                utf8[n] = 0xC0 | (b >> 6);
+                utf8[n + 1] = 0x80 | (b & 0x3F);
+                n += 2;
+            }
+        }
+        crate::escape::escape_to_vec(&utf8[..n], buf);
+    }
+    Ok(())
 }
 
 #[rustler::nif]
@@ -201,9 +234,7 @@ fn encode_map_key(
     buf.push(b'"');
     match key.get_type() {
         TermType::Atom => {
-            let mut atom_buf = [0u8; 256];
-            let name = unsafe { atom_to_stack_buf(env_raw, key.as_c_arg(), &mut atom_buf)? };
-            crate::escape::escape_to_vec(name, buf);
+            write_atom_name(env_raw, key.as_c_arg(), buf)?;
         }
         TermType::Binary => {
             let mut bin = MaybeUninit::<ErlNifBinary>::uninit();
@@ -246,6 +277,10 @@ fn encode_list(
         let item = unsafe { Term::new(env, head) };
         encode_term(env, env_raw, item, buf, depth - 1)?;
         current = tail;
+    }
+    // Improper list: the loop ends on a non-cons tail, which must be [].
+    if unsafe { enif_is_empty_list(env_raw, current) } == 0 {
+        return Err(EncodeError::UnsupportedType);
     }
     buf.push(b']');
     Ok(())
@@ -328,10 +363,8 @@ fn encode_atom(env_raw: *mut ErlNifEnv, term: Term, buf: &mut Vec<u8>) -> Result
     } else if raw == atoms::nil().as_c_arg() {
         buf.extend_from_slice(b"null");
     } else {
-        let mut atom_buf = [0u8; 256];
-        let name = unsafe { atom_to_stack_buf(env_raw, raw, &mut atom_buf)? };
         buf.push(b'"');
-        crate::escape::escape_to_vec(name, buf);
+        write_atom_name(env_raw, raw, buf)?;
         buf.push(b'"');
     }
     Ok(())
@@ -404,6 +437,10 @@ fn encode_proplist(
         buf.push(b':');
         encode_term(env, env_raw, val, buf, depth - 1)?;
         current = tail;
+    }
+    // Improper list: the loop ends on a non-cons tail, which must be [].
+    if unsafe { enif_is_empty_list(env_raw, current) } == 0 {
+        return Err(EncodeError::MalformedProplist);
     }
     buf.push(b'}');
     Ok(())

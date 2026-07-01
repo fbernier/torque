@@ -1,7 +1,7 @@
 // SIMD-accelerated JSON string escaping with optional UTF-8 validation.
 //
 // Entry points:
-//   `escape_to_vec(bytes, buf)` — escape only (for Latin-1 atom names)
+//   `escape_to_vec(bytes, buf)` — escape only (for known-valid UTF-8, e.g. atom names)
 //   `validate_and_escape_to_vec(bytes, buf)` — fused UTF-8 validation + escape
 //
 // Platform dispatch:
@@ -126,8 +126,8 @@ unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<us
 
 /// Append the JSON-escaped form of `bytes` to `buf`.
 ///
-/// `bytes` must already be validated as UTF-8 (or Latin-1 for atom names);
-/// this function only escapes JSON special characters, it does not re-validate.
+/// `bytes` must already be valid UTF-8; this function only escapes JSON
+/// special characters, it does not validate.
 pub(crate) fn escape_to_vec(bytes: &[u8], buf: &mut Vec<u8>) {
     if bytes.is_empty() {
         return;

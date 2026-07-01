@@ -117,6 +117,33 @@ defmodule Torque.EncodeTest do
       assert %{"status" => "active"} = Jason.decode!(json)
     end
 
+    test "non-ASCII Latin-1 atom encodes as valid UTF-8" do
+      assert {:ok, json} = Torque.encode(:café)
+      assert String.valid?(json)
+      assert {:ok, "café"} = Torque.decode(json)
+    end
+
+    test "non-ASCII Latin-1 atom map key encodes as valid UTF-8" do
+      assert {:ok, json} = Torque.encode(%{café: 1})
+      assert String.valid?(json)
+      assert %{"café" => 1} = Jason.decode!(json)
+    end
+
+    test "non-ASCII Latin-1 atom in proplist key encodes as valid UTF-8" do
+      assert {:ok, json} = Torque.encode({[{:café, 1}]})
+      assert String.valid?(json)
+      assert %{"café" => 1} = Jason.decode!(json)
+    end
+
+    test "improper list returns error" do
+      assert {:error, :unsupported_type} = Torque.encode([1 | 2])
+      assert {:error, :unsupported_type} = Torque.encode(%{"a" => [1 | 2]})
+    end
+
+    test "improper proplist returns malformed_proplist" do
+      assert {:error, :malformed_proplist} = Torque.encode({[{:a, 1} | :b]})
+    end
+
     test "invalid UTF-8 binary returns error" do
       assert {:error, :invalid_utf8} = Torque.encode(<<0x80>>)
     end
