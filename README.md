@@ -11,7 +11,7 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
 - Parse-then-get API for selective field extraction via JSON Pointer (RFC 6901)
 - Batch field extraction (`get_many/2`) with single NIF call
 - Pre-compiled pointers with fused parse + extract (`parse_get_many_nil/2`)
-- Automatic dirty CPU scheduler dispatch for inputs larger than 20 KB
+- Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than 20 KB (opt-in `dirty: true` for encode)
 - jiffy-compatible `{proplist}` encoding
 
 ## Installation
@@ -114,6 +114,15 @@ json = Torque.encode_to_iodata(%{id: "abc"})
 {:ok, json} = Torque.encode({[{:id, "abc"}, {:price, 1.5}]})
 ```
 
+Unlike decoding, encoding cannot cheaply predict its output size, so dirty
+scheduler dispatch is opt-in. Pass `dirty: true` (accepted by `encode/2`,
+`encode!/2`, and `encode_to_iodata/2`) when terms are expected to encode to
+large output (more than roughly 20 KB):
+
+```elixir
+{:ok, json} = Torque.encode(big_term, dirty: true)
+```
+
 ## API
 
 | Function | Description |
@@ -121,9 +130,9 @@ json = Torque.encode_to_iodata(%{id: "abc"})
 | `Torque.compile_pointers(paths, opts)` | Pre-compile a fixed path set into a reusable handle |
 | `Torque.decode(binary)` | Decode JSON to Elixir terms |
 | `Torque.decode!(binary)` | Decode JSON, raising on error |
-| `Torque.encode(term)` | Encode term to JSON binary |
-| `Torque.encode!(term)` | Encode term, raising on error |
-| `Torque.encode_to_iodata(term)` | Encode term, returns binary directly (fastest) |
+| `Torque.encode(term, opts)` | Encode term to JSON binary |
+| `Torque.encode!(term, opts)` | Encode term, raising on error |
+| `Torque.encode_to_iodata(term, opts)` | Encode term, returns binary directly (fastest) |
 | `Torque.get(doc, path)` | Extract field by JSON Pointer path |
 | `Torque.get(doc, path, default)` | Extract field with default for missing paths |
 | `Torque.get_many(doc, paths)` | Extract multiple fields in one NIF call |

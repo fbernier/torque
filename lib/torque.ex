@@ -26,8 +26,11 @@ defmodule Torque do
 
   ## Scheduler awareness
 
-  Inputs larger than 20 KB are automatically dispatched to a dirty CPU
-  scheduler to avoid blocking normal BEAM schedulers.
+  Decoding and parsing automatically dispatch inputs larger than 20 KB to a
+  dirty CPU scheduler to avoid blocking normal BEAM schedulers. Encoding
+  cannot cheaply predict its output size up front, so dirty dispatch is
+  opt-in there: pass `dirty: true` to `encode/2`, `encode!/2`, or
+  `encode_to_iodata/2` when terms are expected to produce large output.
 
   ## Type conversion
 
@@ -121,6 +124,14 @@ defmodule Torque do
     * Other atoms (encoded as JSON strings)
     * `{keyword_list}` tuples (jiffy-style proplist objects)
 
+  ## Options
+
+    * `:dirty` — when `true`, runs the encode on a dirty CPU scheduler.
+      Unlike `decode/1`, which dispatches on input byte size, encoding
+      cannot cheaply predict its output size up front, so large encodes
+      are opt-in. Enable when terms are expected to produce large output
+      (more than roughly 20 KB). Defaults to `false`.
+
   ## Examples
 
       iex> Torque.encode(%{id: "abc", price: 1.5})
@@ -128,15 +139,30 @@ defmodule Torque do
 
       iex> Torque.encode({[{:id, "abc"}]})
       {:ok, ~s({"id":"abc"})}
+
+      iex> Torque.encode(%{id: "abc"}, dirty: true)
+      {:ok, ~s({"id":"abc"})}
   """
   @doc group: :encode
-  @spec encode(term()) :: {:ok, binary()} | {:error, binary() | :nesting_too_deep}
-  def encode(term) do
+  @spec encode(term(), keyword()) :: {:ok, binary()} | {:error, binary() | :nesting_too_deep}
+  def encode(term, opts \\ [])
+
+  def encode(term, []) do
     Torque.Native.encode(term)
+  end
+
+  def encode(term, opts) do
+    if Keyword.get(opts, :dirty, false) do
+      Torque.Native.encode_dirty(term)
+    else
+      Torque.Native.encode(term)
+    end
   end
 
   @doc """
   Encodes an Elixir term into a JSON binary, raising on error.
+
+  Accepts the same options as `encode/2`.
 
   ## Examples
 
@@ -144,9 +170,9 @@ defmodule Torque do
       ~s({"ok":true})
   """
   @doc group: :encode
-  @spec encode!(term()) :: binary()
-  def encode!(term) do
-    case encode(term) do
+  @spec encode!(term(), keyword()) :: binary()
+  def encode!(term, opts \\ []) do
+    case encode(term, opts) do
       {:ok, json} -> json
       {:error, reason} -> raise ArgumentError, "encode error: #{reason}"
     end
@@ -159,15 +185,29 @@ defmodule Torque do
   Raises on error. This is the fastest encoding path when the result
   is passed directly to I/O (e.g. as an HTTP response body).
 
+  Accepts the same options as `encode/2`.
+
   ## Examples
 
       iex> Torque.encode_to_iodata(%{ok: true})
       ~s({"ok":true})
   """
   @doc group: :encode
-  @spec encode_to_iodata(term()) :: binary()
-  def encode_to_iodata(term) do
+  @spec encode_to_iodata(term(), keyword()) :: binary()
+  def encode_to_iodata(term, opts \\ [])
+
+  def encode_to_iodata(term, []) do
     Torque.Native.encode_iodata(term)
+  catch
+    :error, value -> raise ArgumentError, "encode error: #{inspect(value)}"
+  end
+
+  def encode_to_iodata(term, opts) do
+    if Keyword.get(opts, :dirty, false) do
+      Torque.Native.encode_iodata_dirty(term)
+    else
+      Torque.Native.encode_iodata(term)
+    end
   catch
     :error, value -> raise ArgumentError, "encode error: #{inspect(value)}"
   end

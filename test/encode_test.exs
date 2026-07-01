@@ -153,6 +153,39 @@ defmodule Torque.EncodeTest do
     end
   end
 
+  describe "encode/2 with dirty: true" do
+    test "matches default scheduler output" do
+      input = %{"a" => [1, 2, 3], "b" => "hello", "c" => %{d: 1.5}}
+      assert Torque.encode(input, dirty: true) == Torque.encode(input)
+    end
+
+    test "large payload round-trips" do
+      large = Map.new(1..2000, fn i -> {"key_#{i}", String.duplicate("v", 40)} end)
+      assert {:ok, json} = Torque.encode(large, dirty: true)
+      assert byte_size(json) > 20_480
+      assert {:ok, decoded} = Torque.decode(json)
+      assert decoded == large
+    end
+
+    test "errors propagate" do
+      assert {:error, :unsupported_type} = Torque.encode(self(), dirty: true)
+    end
+
+    test "encode!/2 accepts dirty option" do
+      assert Torque.encode!(%{a: 1}, dirty: true) == Torque.encode!(%{a: 1})
+    end
+
+    test "encode_to_iodata/2 accepts dirty option" do
+      assert Torque.encode_to_iodata(%{a: 1}, dirty: true) == Torque.encode_to_iodata(%{a: 1})
+    end
+
+    test "encode_to_iodata/2 with dirty option raises on error" do
+      assert_raise ArgumentError, ~r/unsupported_type/, fn ->
+        Torque.encode_to_iodata(self(), dirty: true)
+      end
+    end
+  end
+
   describe "encode!/1" do
     test "valid term" do
       assert is_binary(Torque.encode!(%{a: 1}))
