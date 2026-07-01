@@ -66,15 +66,17 @@ The script reads the version from `mix.exs`, creates a git tag, waits for the re
 
 ### Version bumping
 
-The version lives in **two places that must match**: `@version` in `mix.exs`
-and `version` in `native/torque_nif/Cargo.toml` (`release.sh` refuses to tag
-on a mismatch). To bump:
+The version lives in **three places**: `@version` in `mix.exs`, `version` in
+`native/torque_nif/Cargo.toml` (these two must match — `release.sh` refuses
+to tag on a mismatch), and the `{:torque, "~> x.y.z"}` install snippet in
+`README.md`. To bump:
 
-1. Edit `@version` in `mix.exs` and `version` in `native/torque_nif/Cargo.toml`.
+1. Edit `@version` in `mix.exs`, `version` in `native/torque_nif/Cargo.toml`,
+   and the dep snippet in `README.md`.
 2. Run `TORQUE_BUILD=true mix compile` once so `Cargo.lock` picks up the crate
    version.
-3. Commit all three files (`mix.exs`, `Cargo.toml`, `Cargo.lock`) before
-   running `./scripts/release.sh`.
+3. Commit all four files (`mix.exs`, `Cargo.toml`, `Cargo.lock`, `README.md`)
+   before running `./scripts/release.sh`.
 
 ## Architecture
 
