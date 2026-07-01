@@ -333,6 +333,30 @@ defmodule Torque.PointerTest do
     end
   end
 
+  describe "large subtree extraction" do
+    # Exercises the node-count timeslice accounting paths (>512 terms built).
+    test "get of a large root returns the full document" do
+      large = Map.new(1..2000, fn i -> {"k#{i}", i} end)
+      {:ok, doc} = Torque.parse(Jason.encode!(large))
+      assert {:ok, ^large} = Torque.get(doc, "")
+    end
+
+    test "get_many_nil of large arrays returns full lists" do
+      items = Enum.to_list(1..5000)
+      {:ok, doc} = Torque.parse(Jason.encode!(%{"arr" => items}))
+      assert [^items] = Torque.get_many_nil(doc, ["/arr"])
+    end
+
+    test "compiled pointer extraction of a large subtree" do
+      items = Enum.to_list(1..5000)
+      json = Jason.encode!(%{"arr" => items})
+      ptrs = Torque.compile_pointers(["/arr"])
+      {:ok, doc} = Torque.parse(json)
+      assert [^items] = Torque.get_many_nil(doc, ptrs)
+      assert {:ok, [^items]} = Torque.parse_get_many_nil(json, ptrs)
+    end
+  end
+
   describe "roundtrip" do
     test "decode then encode preserves data" do
       json = ~s({"a":1,"b":"hello","c":[1,2,3],"d":true,"e":null})
