@@ -1,22 +1,13 @@
 use crate::atoms;
 use crate::native_decode;
-use crate::nif_util::make_tuple2;
+use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
 use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
-use rustler::{schedule, Binary, Encoder, Env, ListIterator, ResourceArc, Term};
+use rustler::{schedule, Binary, Encoder, Env, ListIterator, NifResult, ResourceArc, Term};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
 const GET_MANY_STACK: usize = 64;
-const BYTES_PER_REDUCTION: usize = 20;
-const REDUCTION_COUNT: usize = 4000;
-
-/// Compute a timeslice percentage (1–100) proportional to bytes processed.
-#[inline]
-fn timeslice_percent(bytes: usize) -> i32 {
-    let reds = bytes / BYTES_PER_REDUCTION;
-    ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
-}
 
 /// Below this many built terms the enif_consume_timeslice call costs more than
 /// the accounting is worth — mirrors the encoder's TIMESLICE_MIN_BYTES guard,
@@ -38,6 +29,65 @@ fn consume_timeslice_nodes(env: Env, nodes: usize) {
     if nodes >= TIMESLICE_MIN_NODES {
         let reds = nodes / NODES_PER_REDUCTION;
         schedule::consume_timeslice(env, ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100));
+    }
+}
+
+/// Stack-first accumulator for per-path result terms: fills a fixed array,
+/// spilling to a heap Vec only past `GET_MANY_STACK` entries — or immediately,
+/// with exact capacity, when a larger size is known up front via `with_hint`.
+struct TermAcc {
+    stack: [ERL_NIF_TERM; GET_MANY_STACK],
+    count: usize,
+    heap: Option<Vec<ERL_NIF_TERM>>,
+}
+
+impl TermAcc {
+    #[inline]
+    fn new() -> Self {
+        Self::with_hint(0)
+    }
+
+    #[inline]
+    fn with_hint(n: usize) -> Self {
+        TermAcc {
+            stack: [0; GET_MANY_STACK],
+            count: 0,
+            heap: if n > GET_MANY_STACK {
+                Some(Vec::with_capacity(n))
+            } else {
+                None
+            },
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, term: ERL_NIF_TERM) {
+        if self.count < GET_MANY_STACK && self.heap.is_none() {
+            self.stack[self.count] = term;
+        } else {
+            self.heap
+                .get_or_insert_with(|| {
+                    let mut v = Vec::with_capacity(GET_MANY_STACK * 2);
+                    v.extend_from_slice(&self.stack[..self.count]);
+                    v
+                })
+                .push(term);
+        }
+        self.count += 1;
+    }
+
+    #[inline]
+    fn into_list<'a>(self, env: Env<'a>) -> Term<'a> {
+        let terms = match &self.heap {
+            Some(v) => v.as_slice(),
+            None => &self.stack[..self.count],
+        };
+        unsafe {
+            Term::new(
+                env,
+                enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), self.count as u32),
+            )
+        }
     }
 }
 
@@ -241,7 +291,7 @@ fn get_many<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
-) -> Term<'a> {
+) -> NifResult<Term<'a>> {
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
         err: atoms::error().as_c_arg(),
@@ -249,59 +299,16 @@ fn get_many<'a>(
         ntd: atoms::nesting_too_deep().as_c_arg(),
     };
     let mut nodes = 0usize;
-
-    // Collect into stack array when possible
-    let mut stack: [ERL_NIF_TERM; GET_MANY_STACK] = [0; GET_MANY_STACK];
-    let mut count = 0;
-    let mut heap: Option<Vec<ERL_NIF_TERM>> = None;
+    let mut acc = TermAcc::new();
 
     for path_term in paths {
-        let path: &str = match path_term.decode() {
-            Ok(p) => p,
-            Err(_) => {
-                let r = make_tuple2(env, result_atoms.err, result_atoms.nsf).as_c_arg();
-                if count < GET_MANY_STACK && heap.is_none() {
-                    stack[count] = r;
-                } else {
-                    heap.get_or_insert_with(|| {
-                        let mut v = Vec::with_capacity(GET_MANY_STACK * 2);
-                        v.extend_from_slice(&stack[..count]);
-                        v
-                    })
-                    .push(r);
-                }
-                count += 1;
-                continue;
-            }
-        };
-
-        let r = get_one_result(env, &doc, path, &result_atoms, &mut nodes);
-        if count < GET_MANY_STACK && heap.is_none() {
-            stack[count] = r;
-        } else {
-            heap.get_or_insert_with(|| {
-                let mut v = Vec::with_capacity(GET_MANY_STACK * 2);
-                v.extend_from_slice(&stack[..count]);
-                v
-            })
-            .push(r);
-        }
-        count += 1;
+        // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
+        let path: &str = path_term.decode()?;
+        acc.push(get_one_result(env, &doc, path, &result_atoms, &mut nodes));
     }
 
     consume_timeslice_nodes(env, nodes);
-
-    let terms = match &heap {
-        Some(v) => v.as_slice(),
-        None => &stack[..count],
-    };
-
-    unsafe {
-        Term::new(
-            env,
-            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), count as u32),
-        )
-    }
+    Ok(acc.into_list(env))
 }
 
 #[rustler::nif]
@@ -371,17 +378,23 @@ fn compile_one(path: &str) -> Vec<PathSeg> {
 }
 
 #[rustler::nif]
-fn compile_paths<'a>(env: Env<'a>, paths: ListIterator<'a>, unique_keys: bool) -> Term<'a> {
+fn compile_paths<'a>(
+    env: Env<'a>,
+    paths: ListIterator<'a>,
+    unique_keys: bool,
+) -> NifResult<Term<'a>> {
     let mut out = Vec::new();
     for pt in paths {
-        let p: &str = pt.decode().unwrap_or("");
+        // Non-binary (or non-UTF-8) entries are caller bugs: badarg. Silently
+        // compiling them (e.g. as "") would return the whole document.
+        let p: &str = pt.decode()?;
         out.push(compile_one(p));
     }
-    ResourceArc::new(CompiledPaths {
+    Ok(ResourceArc::new(CompiledPaths {
         paths: out,
         unique_keys,
     })
-    .encode(env)
+    .encode(env))
 }
 
 /// Extract all compiled paths from an already-traversed `value` into a result
@@ -394,35 +407,17 @@ fn extract_compiled<'a>(
     nodes: &mut usize,
 ) -> Term<'a> {
     let nil_raw = atoms::nil().as_c_arg();
-    let n = compiled.paths.len();
-    let mut stack: [ERL_NIF_TERM; GET_MANY_STACK] = [0; GET_MANY_STACK];
-    let mut heap: Option<Vec<ERL_NIF_TERM>> = if n > GET_MANY_STACK {
-        Some(Vec::with_capacity(n))
-    } else {
-        None
-    };
-    for (i, segs) in compiled.paths.iter().enumerate() {
+    let mut acc = TermAcc::with_hint(compiled.paths.len());
+    for segs in compiled.paths.iter() {
         let r = match pointer_lookup_compiled(value, segs, compiled.unique_keys) {
             Some(v) => value_to_term(env, v, MAX_DEPTH, nodes)
                 .map(|t| t.as_c_arg())
                 .unwrap_or(nil_raw),
             None => nil_raw,
         };
-        match &mut heap {
-            Some(v) => v.push(r),
-            None => stack[i] = r,
-        }
+        acc.push(r);
     }
-    let terms = match &heap {
-        Some(v) => v.as_slice(),
-        None => &stack[..n],
-    };
-    unsafe {
-        Term::new(
-            env,
-            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), n as u32),
-        )
-    }
+    acc.into_list(env)
 }
 
 #[inline]
@@ -504,33 +499,14 @@ fn get_many_nil<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
-) -> Term<'a> {
+) -> NifResult<Term<'a>> {
     let nil_raw = atoms::nil().as_c_arg();
     let mut nodes = 0usize;
-
-    let mut stack: [ERL_NIF_TERM; GET_MANY_STACK] = [0; GET_MANY_STACK];
-    let mut count = 0;
-    let mut heap: Option<Vec<ERL_NIF_TERM>> = None;
+    let mut acc = TermAcc::new();
 
     for path_term in paths {
-        let path: &str = match path_term.decode() {
-            Ok(p) => p,
-            Err(_) => {
-                if count < GET_MANY_STACK && heap.is_none() {
-                    stack[count] = nil_raw;
-                } else {
-                    heap.get_or_insert_with(|| {
-                        let mut v = Vec::with_capacity(GET_MANY_STACK * 2);
-                        v.extend_from_slice(&stack[..count]);
-                        v
-                    })
-                    .push(nil_raw);
-                }
-                count += 1;
-                continue;
-            }
-        };
-
+        // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
+        let path: &str = path_term.decode()?;
         let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
             Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
                 Some(term) => term.as_c_arg(),
@@ -538,30 +514,9 @@ fn get_many_nil<'a>(
             },
             None => nil_raw,
         };
-        if count < GET_MANY_STACK && heap.is_none() {
-            stack[count] = r;
-        } else {
-            heap.get_or_insert_with(|| {
-                let mut v = Vec::with_capacity(GET_MANY_STACK * 2);
-                v.extend_from_slice(&stack[..count]);
-                v
-            })
-            .push(r);
-        }
-        count += 1;
+        acc.push(r);
     }
 
     consume_timeslice_nodes(env, nodes);
-
-    let terms = match &heap {
-        Some(v) => v.as_slice(),
-        None => &stack[..count],
-    };
-
-    unsafe {
-        Term::new(
-            env,
-            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), count as u32),
-        )
-    }
+    Ok(acc.into_list(env))
 }

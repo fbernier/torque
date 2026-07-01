@@ -9,6 +9,14 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
+# The NIF crate version must track mix.exs (see CLAUDE.md "Releasing").
+CRATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' native/torque_nif/Cargo.toml | head -n1)
+if [ "$CRATE_VERSION" != "$VERSION" ]; then
+  echo "error: version mismatch — mix.exs is ${VERSION} but native/torque_nif/Cargo.toml is ${CRATE_VERSION}"
+  echo "bump native/torque_nif/Cargo.toml, run TORQUE_BUILD=true mix compile to refresh Cargo.lock, commit both"
+  exit 1
+fi
+
 echo "==> Releasing torque ${TAG}"
 
 # Check for uncommitted changes

@@ -64,6 +64,18 @@ tag).
 
 The script reads the version from `mix.exs`, creates a git tag, waits for the release workflow to build precompiled NIFs for all targets, then generates checksums. After it completes, commit the checksum file and run `mix hex.publish`.
 
+### Version bumping
+
+The version lives in **two places that must match**: `@version` in `mix.exs`
+and `version` in `native/torque_nif/Cargo.toml` (`release.sh` refuses to tag
+on a mismatch). To bump:
+
+1. Edit `@version` in `mix.exs` and `version` in `native/torque_nif/Cargo.toml`.
+2. Run `TORQUE_BUILD=true mix compile` once so `Cargo.lock` picks up the crate
+   version.
+3. Commit all three files (`mix.exs`, `Cargo.toml`, `Cargo.lock`) before
+   running `./scripts/release.sh`.
+
 ## Architecture
 
 Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON). sonic-rs is **vendored** under `native/sonic-rs/` with a minimal patch (see that crate's `Cargo.toml`): its native push-based `JsonVisitor` is made public, and its DOM parser is capped at 128 nesting levels so deeply nested input returns an error instead of overflowing the stack.
