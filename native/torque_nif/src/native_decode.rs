@@ -1,8 +1,9 @@
 //! Fused single-pass decoder built on sonic-rs's native push-based parser.
 //!
 //! This implements sonic-rs's `JsonVisitor` directly, building Erlang terms
-//! during the SIMD parse — no intermediate `Value` tree, and zero-copy
-//! sub-binaries for unescaped strings.
+//! during the SIMD parse — no intermediate `Value` tree, zero-copy
+//! sub-binaries for unescaped strings, and one shared term per repeated
+//! object key (see `KeyCache`).
 //!
 //! Terms are assembled with a postfix value stack: scalars push a term; a
 //! container-end pops its children, builds the list/map term, and pushes the
@@ -28,9 +29,82 @@ const STACK_SIZE: usize = 64;
 /// thread indefinitely. Mirrors the encoder's `BUF_RETAIN_CAP`.
 const VALUES_RETAIN_CAP: usize = 1 << 17;
 
+const KEY_CACHE_SLOTS: usize = 256;
+/// Longest key eligible for caching; bounds the byte-compare on lookup.
+const KEY_CACHE_MAX_LEN: usize = 64;
+/// Miss/hit balance above which the cache is bypassed for the rest of the
+/// call (see `KeyCache::debit`).
+const KEY_CACHE_BYPASS_AT: i32 = 256;
+
+#[derive(Clone, Copy)]
+struct KeyEntry {
+    ptr: *const u8,
+    term: ERL_NIF_TERM,
+    /// First 8 key bytes, zero-padded. For keys of ≤ 8 bytes this is the whole
+    /// content, so prefix + len equality needs no byte compare on a hit.
+    prefix: u64,
+    len: u32,
+    epoch: u32,
+}
+
+/// Direct-mapped, per-call memo of object-key terms. Typical JSON repeats the
+/// same few keys across every element of an array, and each occurrence used to
+/// build a fresh term; a hit reuses the earlier one instead. Entries are keyed
+/// by pointers into the input buffer (stable for the whole call) and
+/// invalidated between calls by an epoch counter, since terms are only valid
+/// within the env of the call that made them.
+///
+/// Cached keys are built as *copied* heap binaries rather than sub-binaries.
+/// On OTP 28+ this matches what `enif_make_sub_binary` does anyway (slices
+/// ≤ 64 bytes are copied on-heap); on older OTPs it avoids real sub-binaries
+/// that would pin the whole input binary via the decoded map's keys. The copy
+/// is once per distinct key per call — amortized by the cache.
+struct KeyCache {
+    entries: [KeyEntry; KEY_CACHE_SLOTS],
+    epoch: u32,
+    /// Per-call adaptivity: a miss adds 1, a hit subtracts 8. Documents shaped
+    /// as unique-key dictionaries never hit, so once the balance exceeds
+    /// `KEY_CACHE_BYPASS_AT` the cache is bypassed for the rest of the call
+    /// rather than charging a lookup per key that can never pay off. The
+    /// threshold is high enough that a record array whose objects have up to
+    /// ~256 distinct keys still warms the cache before tripping it.
+    debit: i32,
+}
+
+impl KeyCache {
+    fn new() -> Self {
+        KeyCache {
+            entries: [KeyEntry {
+                ptr: std::ptr::null(),
+                term: 0,
+                prefix: 0,
+                len: 0,
+                epoch: 0,
+            }; KEY_CACHE_SLOTS],
+            epoch: 0,
+            debit: 0,
+        }
+    }
+
+    /// Invalidate all entries for a new decode call. On the (rare) epoch
+    /// wraparound, hard-clear so stale entries can't alias the new epoch.
+    #[inline]
+    fn next_epoch(&mut self) {
+        self.debit = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            for e in self.entries.iter_mut() {
+                e.epoch = 0;
+            }
+            self.epoch = 1;
+        }
+    }
+}
+
 struct DecodeBufs {
     values: Vec<ERL_NIF_TERM>,
     frames: Vec<usize>,
+    keys: KeyCache,
 }
 
 thread_local! {
@@ -42,6 +116,7 @@ thread_local! {
     static DECODE_BUFS: RefCell<DecodeBufs> = RefCell::new(DecodeBufs {
         values: Vec::with_capacity(64),
         frames: Vec::with_capacity(16),
+        keys: KeyCache::new(),
     });
 }
 
@@ -59,6 +134,7 @@ struct TermBuilder<'a, 'b> {
     values: &'b mut Vec<ERL_NIF_TERM>,
     /// `values` index where each currently-open container's children begin.
     frames: &'b mut Vec<usize>,
+    keys: &'b mut KeyCache,
     too_deep: bool,
 }
 
@@ -86,6 +162,62 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         binary.as_mut_slice().copy_from_slice(s.as_bytes());
         let term: Term = binary.into();
         term.as_c_arg()
+    }
+
+    /// Term for an object key, memoized in the per-call key cache.
+    ///
+    /// Only borrowed keys qualify: an escaped key's bytes live in the parser's
+    /// scratch buffer, which later strings overwrite, so its pointer can't be
+    /// used as a cache identity. Those (rare) keys fall back to `str_term`.
+    /// The `len.max(8)` bound keeps the unaligned prefix load in-bounds; a key
+    /// inside the final 8 bytes of the document (impossible in valid JSON,
+    /// which needs at least `":x}` after it) just falls back.
+    #[inline]
+    fn key_term(&mut self, s: &str) -> ERL_NIF_TERM {
+        let ptr = s.as_ptr();
+        let len = s.len();
+        if self.keys.debit > KEY_CACHE_BYPASS_AT
+            || len == 0
+            || len > KEY_CACHE_MAX_LEN
+            || ptr < self.input.base
+        {
+            return self.str_term(s);
+        }
+        let offset = unsafe { ptr.offset_from(self.input.base) } as usize;
+        if offset + len.max(8) > self.input.len {
+            return self.str_term(s);
+        }
+        let mut prefix = unsafe { (ptr as *const u64).read_unaligned() };
+        if len < 8 {
+            prefix &= (1u64 << (len * 8)) - 1;
+        }
+        let h = (prefix ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
+        if entry.epoch == self.keys.epoch
+            && entry.prefix == prefix
+            && entry.len == len as u32
+            && (len <= 8
+                || unsafe {
+                    std::slice::from_raw_parts(entry.ptr.add(8), len - 8)
+                        == std::slice::from_raw_parts(ptr.add(8), len - 8)
+                })
+        {
+            self.keys.debit -= 8;
+            return entry.term;
+        }
+        self.keys.debit += 1;
+        // len <= KEY_CACHE_MAX_LEN (64), so this is an on-heap binary, not refc.
+        let mut binary = NewBinary::new(self.env, len);
+        binary.as_mut_slice().copy_from_slice(s.as_bytes());
+        let term = Term::from(binary).as_c_arg();
+        *entry = KeyEntry {
+            ptr,
+            term,
+            prefix,
+            len: len as u32,
+            epoch: self.keys.epoch,
+        };
+        term
     }
 }
 
@@ -278,6 +410,13 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     }
 
     #[inline]
+    fn visit_key(&mut self, key: &str) -> bool {
+        let t = self.key_term(key);
+        self.push(t);
+        true
+    }
+
+    #[inline]
     fn visit_array_start(&mut self, _hint: usize) -> bool {
         if self.frames.len() >= MAX_DEPTH as usize {
             self.too_deep = true;
@@ -328,9 +467,14 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
     DECODE_BUFS.with(|cell| {
         let mut bufs = cell.borrow_mut();
-        let DecodeBufs { values, frames } = &mut *bufs;
+        let DecodeBufs {
+            values,
+            frames,
+            keys,
+        } = &mut *bufs;
         values.clear();
         frames.clear();
+        keys.next_epoch();
         let mut builder = TermBuilder {
             env,
             input: InputRef {
@@ -340,6 +484,7 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
             },
             values,
             frames,
+            keys,
             too_deep: false,
         };
 

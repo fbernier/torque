@@ -8,6 +8,9 @@
 #   * a `JsonVisitor::visit_overflow_int` hook: integer-shaped tokens that
 #     overflow i64/u64 are routed to it with the raw digits (default falls
 #     back to f64), so Torque can build exact Erlang bignums during decode
+#   * object keys in the visitor parse (`parse_object2`) are delivered via
+#     `visit_key` instead of `visit_str` (defaults forward to the str hooks),
+#     so Torque can reuse the term for a key repeated across sibling objects
 # Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0)
 
 # Standalone manifest so this is not pulled into the torque workspace.
