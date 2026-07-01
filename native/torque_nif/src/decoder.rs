@@ -18,6 +18,29 @@ fn timeslice_percent(bytes: usize) -> i32 {
     ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
 }
 
+/// Below this many built terms the enif_consume_timeslice call costs more than
+/// the accounting is worth — mirrors the encoder's TIMESLICE_MIN_BYTES guard,
+/// so scalar extractions pay only this one branch.
+const TIMESLICE_MIN_NODES: usize = 512;
+/// Terms built per BEAM reduction. Calibrated for parity with the byte-based
+/// accounting used by parse/decode/encode (20 bytes per reduction): typical
+/// JSON runs ~5-10 source bytes per built term, so extracting a subtree
+/// charges roughly what decoding the same content would. Long strings count
+/// as one term, so string-heavy content charges less; both schemes are coarse
+/// work proxies, not wall-clock estimates.
+const NODES_PER_REDUCTION: usize = 4;
+
+/// Report term-building work from the get family to the scheduler. The
+/// pointer lookup itself is sub-microsecond, but `value_to_term` cost is
+/// proportional to the extracted subtree, which only the node counter sees.
+#[inline]
+fn consume_timeslice_nodes(env: Env, nodes: usize) {
+    if nodes >= TIMESLICE_MIN_NODES {
+        let reds = nodes / NODES_PER_REDUCTION;
+        schedule::consume_timeslice(env, ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100));
+    }
+}
+
 /// Looks up `key` in an object.
 ///
 /// When `unique_keys` is true, uses sonic-rs's internal index (fast).
@@ -176,13 +199,24 @@ fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'
     let err_raw = atoms::error().as_c_arg();
     let nsf_raw = atoms::no_such_field().as_c_arg();
     let ntd_raw = atoms::nesting_too_deep().as_c_arg();
-    match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH) {
+    let mut nodes = 0usize;
+    let result = match pointer_lookup(&doc.value, path, doc.unique_keys) {
+        Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
             Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
             None => make_tuple2(env, err_raw, ntd_raw),
         },
         None => make_tuple2(env, err_raw, nsf_raw),
-    }
+    };
+    consume_timeslice_nodes(env, nodes);
+    result
+}
+
+/// Cached raw atoms for the per-path result tuples in `get_many`.
+struct ResultAtoms {
+    ok: ERL_NIF_TERM,
+    err: ERL_NIF_TERM,
+    nsf: ERL_NIF_TERM,
+    ntd: ERL_NIF_TERM,
 }
 
 #[inline]
@@ -190,17 +224,15 @@ fn get_one_result(
     env: Env,
     doc: &ParsedDocument,
     path: &str,
-    ok_raw: ERL_NIF_TERM,
-    err_raw: ERL_NIF_TERM,
-    nsf_raw: ERL_NIF_TERM,
-    ntd_raw: ERL_NIF_TERM,
+    atoms: &ResultAtoms,
+    nodes: &mut usize,
 ) -> ERL_NIF_TERM {
     match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH) {
-            Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()).as_c_arg(),
-            None => make_tuple2(env, err_raw, ntd_raw).as_c_arg(),
+        Some(value) => match value_to_term(env, value, MAX_DEPTH, nodes) {
+            Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
+            None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
         },
-        None => make_tuple2(env, err_raw, nsf_raw).as_c_arg(),
+        None => make_tuple2(env, atoms.err, atoms.nsf).as_c_arg(),
     }
 }
 
@@ -210,10 +242,13 @@ fn get_many<'a>(
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
 ) -> Term<'a> {
-    let ok_raw = atoms::ok().as_c_arg();
-    let err_raw = atoms::error().as_c_arg();
-    let nsf_raw = atoms::no_such_field().as_c_arg();
-    let ntd_raw = atoms::nesting_too_deep().as_c_arg();
+    let result_atoms = ResultAtoms {
+        ok: atoms::ok().as_c_arg(),
+        err: atoms::error().as_c_arg(),
+        nsf: atoms::no_such_field().as_c_arg(),
+        ntd: atoms::nesting_too_deep().as_c_arg(),
+    };
+    let mut nodes = 0usize;
 
     // Collect into stack array when possible
     let mut stack: [ERL_NIF_TERM; GET_MANY_STACK] = [0; GET_MANY_STACK];
@@ -224,7 +259,7 @@ fn get_many<'a>(
         let path: &str = match path_term.decode() {
             Ok(p) => p,
             Err(_) => {
-                let r = make_tuple2(env, err_raw, nsf_raw).as_c_arg();
+                let r = make_tuple2(env, result_atoms.err, result_atoms.nsf).as_c_arg();
                 if count < GET_MANY_STACK && heap.is_none() {
                     stack[count] = r;
                 } else {
@@ -240,7 +275,7 @@ fn get_many<'a>(
             }
         };
 
-        let r = get_one_result(env, &doc, path, ok_raw, err_raw, nsf_raw, ntd_raw);
+        let r = get_one_result(env, &doc, path, &result_atoms, &mut nodes);
         if count < GET_MANY_STACK && heap.is_none() {
             stack[count] = r;
         } else {
@@ -253,6 +288,8 @@ fn get_many<'a>(
         }
         count += 1;
     }
+
+    consume_timeslice_nodes(env, nodes);
 
     let terms = match &heap {
         Some(v) => v.as_slice(),
@@ -354,6 +391,7 @@ fn extract_compiled<'a>(
     env: Env<'a>,
     value: &sonic_rs::Value,
     compiled: &CompiledPaths,
+    nodes: &mut usize,
 ) -> Term<'a> {
     let nil_raw = atoms::nil().as_c_arg();
     let n = compiled.paths.len();
@@ -365,7 +403,7 @@ fn extract_compiled<'a>(
     };
     for (i, segs) in compiled.paths.iter().enumerate() {
         let r = match pointer_lookup_compiled(value, segs, compiled.unique_keys) {
-            Some(v) => value_to_term(env, v, MAX_DEPTH)
+            Some(v) => value_to_term(env, v, MAX_DEPTH, nodes)
                 .map(|t| t.as_c_arg())
                 .unwrap_or(nil_raw),
             None => nil_raw,
@@ -388,10 +426,15 @@ fn extract_compiled<'a>(
 }
 
 #[inline]
-fn do_parse_get_many_nil<'a>(env: Env<'a>, bytes: &[u8], compiled: &CompiledPaths) -> Term<'a> {
+fn do_parse_get_many_nil<'a>(
+    env: Env<'a>,
+    bytes: &[u8],
+    compiled: &CompiledPaths,
+    nodes: &mut usize,
+) -> Term<'a> {
     match sonic_rs::from_slice::<sonic_rs::Value>(bytes) {
         Ok(value) => {
-            let list = extract_compiled(env, &value, compiled);
+            let list = extract_compiled(env, &value, compiled, nodes);
             make_tuple2(env, atoms::ok().as_c_arg(), list.as_c_arg())
         }
         Err(e) => parse_error_term(env, format!("{}", e)),
@@ -404,8 +447,11 @@ fn parse_get_many_nil<'a>(
     json: Binary,
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
-    let result = do_parse_get_many_nil(env, json.as_slice(), &compiled);
+    let mut nodes = 0usize;
+    let result = do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes);
+    // Timeslice fractions accumulate: bytes cover the parse, nodes the extraction.
     schedule::consume_timeslice(env, timeslice_percent(json.len()));
+    consume_timeslice_nodes(env, nodes);
     result
 }
 
@@ -415,7 +461,8 @@ fn parse_get_many_nil_dirty<'a>(
     json: Binary,
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
-    do_parse_get_many_nil(env, json.as_slice(), &compiled)
+    let mut nodes = 0usize;
+    do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes)
 }
 
 #[inline]
@@ -446,7 +493,10 @@ fn get_many_nil_compiled<'a>(
     doc: ResourceArc<ParsedDocument>,
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
-    extract_compiled(env, &doc.value, &compiled)
+    let mut nodes = 0usize;
+    let result = extract_compiled(env, &doc.value, &compiled, &mut nodes);
+    consume_timeslice_nodes(env, nodes);
+    result
 }
 
 #[rustler::nif]
@@ -456,6 +506,7 @@ fn get_many_nil<'a>(
     paths: ListIterator<'a>,
 ) -> Term<'a> {
     let nil_raw = atoms::nil().as_c_arg();
+    let mut nodes = 0usize;
 
     let mut stack: [ERL_NIF_TERM; GET_MANY_STACK] = [0; GET_MANY_STACK];
     let mut count = 0;
@@ -481,7 +532,7 @@ fn get_many_nil<'a>(
         };
 
         let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
-            Some(value) => match value_to_term(env, value, MAX_DEPTH) {
+            Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
                 Some(term) => term.as_c_arg(),
                 None => nil_raw,
             },
@@ -499,6 +550,8 @@ fn get_many_nil<'a>(
         }
         count += 1;
     }
+
+    consume_timeslice_nodes(env, nodes);
 
     let terms = match &heap {
         Some(v) => v.as_slice(),

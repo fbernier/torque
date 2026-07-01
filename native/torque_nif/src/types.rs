@@ -29,8 +29,19 @@ fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {
 ///
 /// `depth` is the remaining nesting budget; returns `None` when it reaches zero
 /// on an object or array, signalling that the document is too deeply nested.
+///
+/// `nodes` approximates the number of terms built, counted once per container
+/// child (object children count double for their keys), so scalar conversions
+/// cost nothing. Callers on normal schedulers use it for post-hoc timeslice
+/// accounting — conversion work is proportional to the extracted subtree, not
+/// to the pointer traversal that found it.
 #[inline]
-pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> Option<Term<'a>> {
+pub fn value_to_term<'a>(
+    env: Env<'a>,
+    value: &sonic_rs::Value,
+    depth: u32,
+    nodes: &mut usize,
+) -> Option<Term<'a>> {
     match value.get_type() {
         JsonType::Null => Some(atoms::nil().to_term(env)),
         JsonType::Boolean => Some(if value.as_bool().unwrap() {
@@ -57,11 +68,12 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
             let arr: &sonic_rs::Array = value.as_array().unwrap();
             let count = arr.len();
             let child_depth = depth - 1;
+            *nodes += count;
             if count <= STACK_SIZE {
                 let mut terms: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
                     [MaybeUninit::uninit(); STACK_SIZE];
                 for (i, v) in arr.iter().enumerate() {
-                    terms[i].write(value_to_term(env, v, child_depth)?.as_c_arg());
+                    terms[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 unsafe {
                     Some(Term::new(
@@ -76,7 +88,7 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
             } else {
                 let mut terms: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 for v in arr.iter() {
-                    terms.push(value_to_term(env, v, child_depth)?.as_c_arg());
+                    terms.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 unsafe {
                     Some(Term::new(
@@ -93,6 +105,7 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
             let obj: &sonic_rs::Object = value.as_object().unwrap();
             let count = obj.len();
             let child_depth = depth - 1;
+            *nodes += 2 * count;
             if count <= STACK_SIZE {
                 let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
                     [MaybeUninit::uninit(); STACK_SIZE];
@@ -100,7 +113,7 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
                     [MaybeUninit::uninit(); STACK_SIZE];
                 for (i, (k, v)) in obj.iter().enumerate() {
                     keys[i].write(make_binary_term(env, k).as_c_arg());
-                    vals[i].write(value_to_term(env, v, child_depth)?.as_c_arg());
+                    vals[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 let mut map: ERL_NIF_TERM = 0;
                 unsafe {
@@ -114,7 +127,7 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
                     {
                         Some(Term::new(env, map))
                     } else {
-                        build_map_dedup(env, obj, child_depth)
+                        build_map_dedup(env, obj, child_depth, nodes)
                     }
                 }
             } else {
@@ -122,7 +135,7 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
                 let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 for (k, v) in obj.iter() {
                     keys.push(make_binary_term(env, k).as_c_arg());
-                    vals.push(value_to_term(env, v, child_depth)?.as_c_arg());
+                    vals.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 let mut map: ERL_NIF_TERM = 0;
                 unsafe {
@@ -136,7 +149,7 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
                     {
                         Some(Term::new(env, map))
                     } else {
-                        build_map_dedup(env, obj, child_depth)
+                        build_map_dedup(env, obj, child_depth, nodes)
                     }
                 }
             }
@@ -148,12 +161,17 @@ pub fn value_to_term<'a>(env: Env<'a>, value: &sonic_rs::Value, depth: u32) -> O
 /// last value for each duplicate key wins, matching common JSON parser behaviour.
 /// Marked `#[cold]` so the optimiser keeps the duplicate-free fast path hot.
 #[cold]
-fn build_map_dedup<'a>(env: Env<'a>, obj: &sonic_rs::Object, depth: u32) -> Option<Term<'a>> {
+fn build_map_dedup<'a>(
+    env: Env<'a>,
+    obj: &sonic_rs::Object,
+    depth: u32,
+    nodes: &mut usize,
+) -> Option<Term<'a>> {
     unsafe {
         let mut map = enif_make_new_map(env.as_c_arg());
         for (k, v) in obj.iter() {
             let key = make_binary_term(env, k).as_c_arg();
-            let val = value_to_term(env, v, depth)?.as_c_arg();
+            let val = value_to_term(env, v, depth, nodes)?.as_c_arg();
             let mut new_map: ERL_NIF_TERM = 0;
             enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
             map = new_map;
