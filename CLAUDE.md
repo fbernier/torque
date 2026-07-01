@@ -76,7 +76,8 @@ to tag on a mismatch), and the `{:torque, "~> x.y.z"}` install snippet in
 2. Run `TORQUE_BUILD=true mix compile` once so `Cargo.lock` picks up the crate
    version.
 3. Commit all four files (`mix.exs`, `Cargo.toml`, `Cargo.lock`, `README.md`)
-   before running `./scripts/release.sh`.
+   together as a single `Bump version to x.y.z` commit (see faaa403) before
+   running `./scripts/release.sh`.
 
 ## Architecture
 
