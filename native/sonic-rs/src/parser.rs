@@ -303,6 +303,35 @@ where
         }
     }
 
+    // Torque patch: object-key variant of `parse_string_owned`, dispatching to
+    // `visit_key` so visitors can tell keys from string values (e.g. to reuse
+    // the term for a key repeated across sibling objects). The `use_raw` +
+    // escaped-key case keeps `visit_raw_str`, matching the value path.
+    #[inline(always)]
+    fn parse_string_owned_key<V>(&mut self, vis: &mut V, strbuf: &mut Vec<u8>) -> Result<()>
+    where
+        V: JsonVisitor<'de>,
+    {
+        if !self.cfg.use_raw {
+            let rs = self.parse_str_impl(strbuf)?;
+            return check_visit!(self, vis.visit_key(rs.as_ref()));
+        }
+
+        let start = self.read.index();
+        match self.parse_str_impl(strbuf)? {
+            Reference::Borrowed(s) => check_visit!(self, vis.visit_key(s)),
+            Reference::Copied(s) => unsafe {
+                // only record raw when has escaped chars
+                let end = self.read.index();
+                let raw = as_str(&self.read.as_u8_slice()[start - 1..end]);
+                let alloc = vis.allocator().unwrap();
+                let s = &*(alloc.alloc_str(s) as *mut str);
+                let raw = RawStr::new_in(alloc, raw);
+                check_visit!(self, vis.visit_raw_str(s, raw))
+            },
+        }
+    }
+
     fn check_string_eof_inpadding(&self) -> Result<usize> {
         let json = self.read.as_u8_slice();
         let cur = self.read.index();
@@ -638,7 +667,7 @@ where
 
         // loop for each object key and value
         loop {
-            self.parse_string_owned(vis, strbuf)?;
+            self.parse_string_owned_key(vis, strbuf)?;
             self.parse_object_clo()?;
             self.parse_value2(vis, strbuf)?;
             count += 1;

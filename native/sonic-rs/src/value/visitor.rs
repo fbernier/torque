@@ -74,14 +74,17 @@ pub trait JsonVisitor<'de> {
         false
     }
 
+    // Torque patch: the visitor-driven parse (`parse_dom2`) delivers object
+    // keys through `visit_key`, so the defaults forward to the string hooks
+    // for visitors that don't care about the distinction.
     #[allow(dead_code)]
-    fn visit_key(&mut self, _key: &str) -> bool {
-        false
+    fn visit_key(&mut self, key: &str) -> bool {
+        self.visit_str(key)
     }
 
     #[allow(dead_code)]
-    fn visit_borrowed_key(&mut self, _key: &'de str) -> bool {
-        false
+    fn visit_borrowed_key(&mut self, key: &'de str) -> bool {
+        self.visit_borrowed_str(key)
     }
 
     fn visit_raw_str(&mut self, _value: &str, _raw: RawStr) -> bool {
