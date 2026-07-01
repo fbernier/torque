@@ -6,7 +6,7 @@
 //
 // Platform dispatch:
 //   aarch64 → NEON (vmaxvq_u8 / UMAXV, mandatory on AArch64)
-//   x86_64  → SSE2 (pmovmskb + tzcnt, baseline on x86-64)
+//   x86_64  → AVX2 (32-byte lanes, runtime-detected), else SSE2 (baseline)
 //   other   → scalar fallback
 
 type QuoteEntry = (u8, [u8; 8]); // (output_len, escape_bytes)
@@ -182,6 +182,50 @@ unsafe fn escape_neon(src: *const u8, len: usize, dst: *mut u8) -> usize {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> usize {
+    use std::arch::x86_64::*;
+
+    let thresh = _mm256_set1_epi8(0x20u8 as i8);
+    let zero = _mm256_setzero_si256();
+    let dq = _mm256_set1_epi8(b'"' as i8);
+    let bs = _mm256_set1_epi8(b'\\' as i8);
+    let mut in_pos = 0usize;
+    let mut out_pos = 0usize;
+
+    while in_pos + 32 <= len {
+        let v = _mm256_loadu_si256(src.add(in_pos) as *const __m256i);
+
+        let ctrl = _mm256_cmpgt_epi8(_mm256_subs_epu8(thresh, v), zero);
+        let needs = _mm256_or_si256(
+            _mm256_or_si256(ctrl, _mm256_cmpeq_epi8(v, dq)),
+            _mm256_cmpeq_epi8(v, bs),
+        );
+        let mask = _mm256_movemask_epi8(needs) as u32;
+
+        if mask == 0 {
+            _mm256_storeu_si256(dst.add(out_pos) as *mut __m256i, v);
+            in_pos += 32;
+            out_pos += 32;
+        } else {
+            let first = mask.trailing_zeros() as usize;
+
+            std::ptr::copy_nonoverlapping(src.add(in_pos), dst.add(out_pos), first);
+            out_pos += first;
+
+            let b = *src.add(in_pos + first);
+            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            std::ptr::copy_nonoverlapping(esc_bytes.as_ptr(), dst.add(out_pos), esc_len as usize);
+            out_pos += esc_len as usize;
+            in_pos += first + 1;
+        }
+    }
+
+    // SSE2 handles the <32-byte tail (one 16-byte chunk + scalar).
+    out_pos + escape_sse2(src.add(in_pos), len - in_pos, dst.add(out_pos))
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> usize {
     use std::arch::x86_64::*;
@@ -261,7 +305,12 @@ unsafe fn escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> usize {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        escape_sse2(src, len, dst)
+        // Cached by std_detect after the first call (one relaxed load).
+        if is_x86_feature_detected!("avx2") {
+            escape_avx2(src, len, dst)
+        } else {
+            escape_sse2(src, len, dst)
+        }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -361,6 +410,83 @@ unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Resu
     }
 
     Ok(out_pos + validate_escape_scalar(src.add(in_pos), len - in_pos, dst.add(out_pos))?)
+}
+
+// ---------------------------------------------------------------------------
+// x86-64 AVX2 — validating
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+    use std::arch::x86_64::*;
+
+    let thresh = _mm256_set1_epi8(0x20u8 as i8);
+    let zero = _mm256_setzero_si256();
+    let dq = _mm256_set1_epi8(b'"' as i8);
+    let bs = _mm256_set1_epi8(b'\\' as i8);
+    let mut in_pos = 0usize;
+    let mut out_pos = 0usize;
+
+    while in_pos + 32 <= len {
+        let v = _mm256_loadu_si256(src.add(in_pos) as *const __m256i);
+
+        // Non-ASCII byte detected — process chunk byte-by-byte then resume SIMD.
+        if _mm256_movemask_epi8(v) != 0 {
+            let chunk_limit = in_pos + 32;
+            while in_pos < chunk_limit {
+                let b = *src.add(in_pos);
+                if b >= 0x80 {
+                    let width = validate_utf8_seq(src, in_pos, len)?;
+                    std::ptr::copy_nonoverlapping(src.add(in_pos), dst.add(out_pos), width);
+                    out_pos += width;
+                    in_pos += width;
+                } else if NEEDS_ESCAPE[b as usize] {
+                    let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+                    std::ptr::copy_nonoverlapping(
+                        esc_bytes.as_ptr(),
+                        dst.add(out_pos),
+                        esc_len as usize,
+                    );
+                    out_pos += esc_len as usize;
+                    in_pos += 1;
+                } else {
+                    *dst.add(out_pos) = b;
+                    out_pos += 1;
+                    in_pos += 1;
+                }
+            }
+            continue;
+        }
+
+        // All ASCII — check for escapes.
+        let ctrl = _mm256_cmpgt_epi8(_mm256_subs_epu8(thresh, v), zero);
+        let needs = _mm256_or_si256(
+            _mm256_or_si256(ctrl, _mm256_cmpeq_epi8(v, dq)),
+            _mm256_cmpeq_epi8(v, bs),
+        );
+        let mask = _mm256_movemask_epi8(needs) as u32;
+
+        if mask == 0 {
+            _mm256_storeu_si256(dst.add(out_pos) as *mut __m256i, v);
+            in_pos += 32;
+            out_pos += 32;
+        } else {
+            let first = mask.trailing_zeros() as usize;
+
+            std::ptr::copy_nonoverlapping(src.add(in_pos), dst.add(out_pos), first);
+            out_pos += first;
+
+            let b = *src.add(in_pos + first);
+            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            std::ptr::copy_nonoverlapping(esc_bytes.as_ptr(), dst.add(out_pos), esc_len as usize);
+            out_pos += esc_len as usize;
+            in_pos += first + 1;
+        }
+    }
+
+    // SSE2 handles the <32-byte tail (one 16-byte chunk + scalar).
+    Ok(out_pos + validate_escape_sse2(src.add(in_pos), len - in_pos, dst.add(out_pos))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +624,12 @@ unsafe fn validate_escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> 
     }
     #[cfg(target_arch = "x86_64")]
     {
-        validate_escape_sse2(src, len, dst)
+        // Cached by std_detect after the first call (one relaxed load).
+        if is_x86_feature_detected!("avx2") {
+            validate_escape_avx2(src, len, dst)
+        } else {
+            validate_escape_sse2(src, len, dst)
+        }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
