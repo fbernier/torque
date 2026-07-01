@@ -2,6 +2,13 @@
 #
 # Run with: MIX_ENV=bench mix run bench/torque_bench.exs
 # CI JSON output: BENCH_OUTPUT=json MIX_ENV=bench mix run bench/torque_bench.exs
+#
+# glazer is benchmarked with UTF-8 validation enabled — `validate_utf8` on
+# decode, `force_utf8` on encode (both default OFF in glazer, needs >= 0.5.15)
+# — so every library in the comparison provides the guarantee Torque always
+# does: JSON strings are valid UTF-8. Keep these options in sync with
+# bench/glazer_pgo_workload.exs so glazer's PGO profile matches the
+# benchmarked configuration.
 
 # CI formatter for github-action-benchmark (customBiggerIsBetter)
 if System.get_env("BENCH_OUTPUT") == "json" do
@@ -306,7 +313,7 @@ IO.puts("=== DECODE BENCHMARK ===\n")
 
 Benchee.run(
   %{
-    "glazer decode" => fn -> :glazer_json.decode(sample_json) end,
+    "glazer decode" => fn -> :glazer_json.decode(sample_json, [:validate_utf8]) end,
     "jason decode" => fn -> Jason.decode!(sample_json) end,
     "jiffy decode" => fn -> :jiffy.decode(sample_json, [:return_maps]) end,
     "otp json decode" => fn -> :json.decode(sample_json) end,
@@ -327,7 +334,7 @@ IO.puts("\n=== LARGE JSON DECODE BENCHMARK ===\n")
 
 Benchee.run(
   %{
-    "glazer decode" => fn -> :glazer_json.decode(large_json) end,
+    "glazer decode" => fn -> :glazer_json.decode(large_json, [:validate_utf8]) end,
     "jason decode" => fn -> Jason.decode!(large_json) end,
     "jiffy decode" => fn -> :jiffy.decode(large_json, [:return_maps]) end,
     "otp json decode" => fn -> :json.decode(large_json) end,
@@ -355,7 +362,7 @@ Benchee.run(
       :jiffy.encode(bid_response_proplist, [:force_utf8])
     end,
     "otp json [map() :: iodata()]" => fn -> :json.encode(bid_response) end,
-    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(bid_response) end,
+    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(bid_response, [:force_utf8]) end,
     "torque [map() :: binary()]" => fn -> Torque.encode!(bid_response) end,
     "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(bid_response) end,
     "torque [proplist() :: binary()]" => fn -> Torque.encode!(bid_response_proplist) end,
@@ -381,7 +388,9 @@ Benchee.run(
     "jiffy [map() :: iodata()]" => fn -> :jiffy.encode(large_decoded_json) end,
     "jiffy [proplist() :: iodata()]" => fn -> :jiffy.encode(large_decoded_proplist) end,
     "otp json [map() :: iodata()]" => fn -> :json.encode(large_decoded_json) end,
-    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(large_decoded_json) end,
+    "glazer [map() :: binary()]" => fn ->
+      :glazer_json.encode(large_decoded_json, [:force_utf8])
+    end,
     "torque [map() :: binary()]" => fn -> Torque.encode!(large_decoded_json) end,
     "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(large_decoded_json) end,
     "torque [proplist() :: binary()]" => fn -> Torque.encode!(large_decoded_proplist) end,
@@ -432,7 +441,7 @@ IO.puts("\n=== EXTRACT 5 FIELDS BENCHMARK ===\n")
 Benchee.run(
   %{
     "glazer decode + find x5" => fn ->
-      d = :glazer_json.decode(sample_json)
+      d = :glazer_json.decode(sample_json, [:validate_utf8])
       for p <- glazer_paths, do: :glazer.find(d, p)
     end,
     "torque parse + get x5" => fn ->

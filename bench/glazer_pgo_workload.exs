@@ -6,6 +6,10 @@
 # benchmark uses — keeping the glazer-vs-torque comparison apples-to-apples
 # (both libraries profiled against equivalent decode/encode/find workloads).
 #
+# Uses the same UTF-8 validation options as bench/torque_bench.exs
+# (`validate_utf8` decode, `force_utf8` encode) so the profile matches the
+# benchmarked configuration — keep them in sync.
+#
 # Run with an instrumented glazer.so loaded: MIX_ENV=bench mix run this file.
 
 small_json =
@@ -40,17 +44,17 @@ paths =
 IO.puts("glazer PGO workload: small=#{byte_size(small_json)}B large=#{byte_size(large_json)}B")
 
 decode = fn ->
-  :glazer_json.decode(small_json)
-  :glazer_json.decode(large_json)
+  :glazer_json.decode(small_json, [:validate_utf8])
+  :glazer_json.decode(large_json, [:validate_utf8])
 end
 
 encode = fn ->
-  :glazer_json.encode(small_term)
-  :glazer_json.encode(large_term)
+  :glazer_json.encode(small_term, [:force_utf8])
+  :glazer_json.encode(large_term, [:force_utf8])
 end
 
 find = fn ->
-  d = :glazer_json.decode(small_json)
+  d = :glazer_json.decode(small_json, [:validate_utf8])
   Enum.each(paths, &:glazer.find(d, &1))
 end
 

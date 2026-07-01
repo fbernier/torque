@@ -202,6 +202,11 @@ Apple M2 Pro, OTP 29, Elixir 1.20. Both libraries are profile-guided
 optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 **Glazer PGO** (via `OPTIMIZE=1`).
 
+glazer is benchmarked with UTF-8 validation enabled (`validate_utf8` on
+decode, `force_utf8` on encode — both off by default in glazer) so every
+library provides the same guarantee Torque always does: JSON strings are
+valid UTF-8.
+
 ### Decode (1.2 KB OpenRTB)
 
 | Library | ips | mean | median | p99 | memory |
