@@ -82,7 +82,7 @@ Torque is a high-performance JSON library for Elixir using Rustler NIFs backed b
 
 ### Scheduler Awareness
 
-Inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
+Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
 
 ### Type Conversion
 

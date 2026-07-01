@@ -61,9 +61,10 @@ fn error_reason(e: EncodeError) -> ERL_NIF_TERM {
 
 /// Hand the finished scratch buffer to a freshly allocated Erlang binary,
 /// reporting the work to the scheduler only when it's large enough to matter.
+/// Timeslice accounting is skipped on dirty schedulers, where it's meaningless.
 #[inline]
-fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8]) -> Term<'a> {
-    if buf.len() >= TIMESLICE_MIN_BYTES {
+fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8], report_timeslice: bool) -> Term<'a> {
+    if report_timeslice && buf.len() >= TIMESLICE_MIN_BYTES {
         schedule::consume_timeslice(env, timeslice_percent(buf.len()));
     }
     let mut binary = NewBinary::new(env, buf.len());
@@ -135,15 +136,15 @@ fn write_atom_name(
     Ok(())
 }
 
-#[rustler::nif]
-fn encode<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
+#[inline]
+fn encode_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) -> Term<'a> {
     let env_raw = env.as_c_arg();
     ENCODE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
         let result = match encode_term(env, env_raw, term, &mut buf, MAX_DEPTH) {
             Ok(()) => {
-                let bin_term = buf_to_binary(env, &buf);
+                let bin_term = buf_to_binary(env, &buf, report_timeslice);
                 make_tuple2(env, atoms::ok().as_c_arg(), bin_term.as_c_arg())
             }
             Err(e) => make_tuple2(env, atoms::error().as_c_arg(), error_reason(e)),
@@ -155,16 +156,28 @@ fn encode<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
     })
 }
 
+#[rustler::nif]
+fn encode<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
+    encode_impl(env, term, true)
+}
+
+/// Opt-in dirty variant: output size can't be predicted from the input term
+/// without a full traversal, so large encodes are dispatched by the caller.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
+    encode_impl(env, term, false)
+}
+
 /// Returns the raw binary on success, raises on error.
 /// Skips the {:ok, binary} tuple wrapping for maximum throughput.
-#[rustler::nif]
-fn encode_iodata<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
+#[inline]
+fn encode_iodata_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) -> Term<'a> {
     let env_raw = env.as_c_arg();
     ENCODE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
         let result = match encode_term(env, env_raw, term, &mut buf, MAX_DEPTH) {
-            Ok(()) => buf_to_binary(env, &buf),
+            Ok(()) => buf_to_binary(env, &buf, report_timeslice),
             Err(e) => unsafe {
                 Term::new(
                     env,
@@ -177,6 +190,16 @@ fn encode_iodata<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
         }
         result
     })
+}
+
+#[rustler::nif]
+fn encode_iodata<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
+    encode_iodata_impl(env, term, true)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_iodata_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
+    encode_iodata_impl(env, term, false)
 }
 
 #[inline]
