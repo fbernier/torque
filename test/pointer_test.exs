@@ -333,6 +333,27 @@ defmodule Torque.PointerTest do
     end
   end
 
+  describe "non-binary path entries raise" do
+    test "get_many raises ArgumentError", %{doc: doc} do
+      assert_raise ArgumentError, fn -> Torque.get_many(doc, ["/id", :bad]) end
+      assert_raise ArgumentError, fn -> Torque.get_many(doc, [42]) end
+    end
+
+    test "get_many_nil raises ArgumentError", %{doc: doc} do
+      assert_raise ArgumentError, fn -> Torque.get_many_nil(doc, ["/id", :bad]) end
+    end
+
+    test "compile_pointers raises ArgumentError" do
+      assert_raise ArgumentError, fn -> Torque.compile_pointers(["/a", 42]) end
+      assert_raise ArgumentError, fn -> Torque.compile_pointers([nil]) end
+    end
+
+    test "non-UTF-8 binary paths raise ArgumentError", %{doc: doc} do
+      assert_raise ArgumentError, fn -> Torque.get_many(doc, [<<0xFF>>]) end
+      assert_raise ArgumentError, fn -> Torque.compile_pointers([<<0xFF>>]) end
+    end
+  end
+
   describe "large subtree extraction" do
     # Exercises the node-count timeslice accounting paths (>512 terms built).
     test "get of a large root returns the full document" do

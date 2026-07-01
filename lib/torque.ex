@@ -300,7 +300,6 @@ defmodule Torque do
       :default
   """
   @doc group: :parse_get
-  @compile {:inline, get: 3}
   @spec get(reference(), binary(), term()) :: term()
   def get(doc, path, default) when is_reference(doc) and is_binary(path) do
     case Torque.Native.get(doc, path) do
@@ -318,6 +317,8 @@ defmodule Torque do
 
   More efficient than calling `get/2` in a loop because it crosses
   the NIF boundary only once.
+
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
   ## Examples
 
@@ -346,6 +347,8 @@ defmodule Torque do
   built by `compile_pointers/2`. The compiled form skips all per-call path
   parsing and is the recommended option for a fixed, repeatedly-queried path
   set.
+
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
   ## Examples
 
@@ -380,6 +383,8 @@ defmodule Torque do
 
   Compile once at startup (e.g. into a module attribute or `:persistent_term`)
   and reuse the handle for every document.
+
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
   ## Options
 

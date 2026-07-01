@@ -1,5 +1,5 @@
 use crate::atoms;
-use crate::nif_util::make_tuple2;
+use crate::nif_util::{make_tuple2, timeslice_percent};
 use crate::types::MAX_DEPTH;
 use rustler::sys::{
     c_int, c_uint, enif_get_atom, enif_get_atom_length, enif_get_double, enif_get_int64,
@@ -9,9 +9,6 @@ use rustler::sys::{
 use rustler::{schedule, Env, MapIterator, NewBinary, Term, TermType};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
-
-const BYTES_PER_REDUCTION: usize = 20;
-const REDUCTION_COUNT: usize = 4000;
 
 /// Below this output size the work is sub-microsecond, so the
 /// enif_consume_timeslice call costs more than the scheduler accounting is
@@ -28,13 +25,6 @@ thread_local! {
     /// payloads. NIFs run to completion without preemption and the encoder
     /// never re-enters this NIF, so the borrow is never nested.
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
-}
-
-/// Compute a timeslice percentage (1–100) proportional to bytes processed.
-#[inline]
-fn timeslice_percent(bytes: usize) -> i32 {
-    let reds = bytes / BYTES_PER_REDUCTION;
-    ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
 }
 
 #[derive(Debug)]
