@@ -104,6 +104,10 @@ already-parsed document via `Torque.get_many_nil(doc, pointers)`.
 {:ok, json} = Torque.encode(%{id: "abc", price: 1.5})
 # "{\"id\":\"abc\",\"price\":1.5}"
 
+# Integer keys are stringified — JSON object names must be strings
+{:ok, json} = Torque.encode(%{0 => "a", 1 => "b"})
+# "{\"0\":\"a\",\"1\":\"b\"}"
+
 # Bang variant
 json = Torque.encode!(%{id: "abc"})
 
@@ -116,8 +120,8 @@ json = Torque.encode_to_iodata(%{id: "abc"})
 
 Unlike decoding, encoding cannot cheaply predict its output size, so dirty
 scheduler dispatch is opt-in. Pass `dirty: true` (accepted by `encode/2`,
-`encode!/2`, and `encode_to_iodata/2`) when terms are expected to encode to
-large output (more than roughly 20 KB):
+`encode!/2`, `encode_to_iodata/2`, and `encode_to_iodata!/2`) when terms are
+expected to encode to large output (more than roughly 20 KB):
 
 ```elixir
 {:ok, json} = Torque.encode(big_term, dirty: true)
@@ -133,6 +137,7 @@ large output (more than roughly 20 KB):
 | `Torque.encode(term, opts)` | Encode term to JSON binary |
 | `Torque.encode!(term, opts)` | Encode term, raising on error |
 | `Torque.encode_to_iodata(term, opts)` | Encode term, returns binary directly (fastest) |
+| `Torque.encode_to_iodata!(term, opts)` | Alias for `encode_to_iodata/2` (Phoenix `:json_library`) |
 | `Torque.get(doc, path)` | Extract field by JSON Pointer path |
 | `Torque.get(doc, path, default)` | Extract field with default for missing paths |
 | `Torque.get_many(doc, paths)` | Extract multiple fields in one NIF call |
@@ -163,7 +168,7 @@ Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-prec
 
 | Elixir | JSON |
 |--------|------|
-| map (atom/binary keys) | object |
+| map (atom/binary/integer keys) | object |
 | list | array |
 | binary | string |
 | integer | number |
@@ -191,7 +196,7 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 |------|-------------|---------|
 | `:unsupported_type` | `encode/1` | Term has no JSON representation (PID, reference, port, …) |
 | `:invalid_utf8` | `encode/1` | Binary string or map key is not valid UTF-8 |
-| `:invalid_key` | `encode/1` | Map key is not an atom or binary (e.g. integer key) |
+| `:invalid_key` | `encode/1` | Map key is not an atom, binary, or integer (e.g. float or tuple key) |
 | `:malformed_proplist` | `encode/1` | `{proplist}` contains a non-`{key, value}` element |
 | `:non_finite_float` | `encode/1` | Float is infinity or NaN (unreachable from normal BEAM code) |
 | `:nesting_too_deep` | `encode/1` | Term exceeds 128 nesting levels |
@@ -286,6 +291,7 @@ MIX_ENV=bench mix run bench/torque_bench.exs
 
 ## Limitations
 
+- **Integer map keys are lossy**: JSON object names must be strings (RFC 8259 §4), so `encode/1` stringifies integer keys and `decode/1` gives them back as binaries — `%{1 => "a"}` round-trips to `%{"1" => "a"}`. A map mixing both forms, like `%{1 => "a", "1" => "b"}`, encodes to duplicate names (`{"1":"a","1":"b"}`); RFC 8259 says names *should* be unique, and decoders resolve the collision however they choose. Jason behaves identically.
 - **Nesting depth**: JSON documents nested deeper than 128 levels return `{:error, :nesting_too_deep}` from `decode/1`, `parse/1`, `get/2`, `get_many/2`, and `encode/1` rather than crashing the VM. Real-world documents are never this deep; the limit exists to prevent stack overflow in the NIF (the dirty CPU scheduler, used for inputs over 20 KB, has a small stack).
 
 ## License

@@ -261,6 +261,10 @@ fn encode_map_key(
                     .map_err(|_| EncodeError::InvalidUtf8)?;
             }
         }
+        // Object names must be strings (RFC 8259 §4), so integer keys are
+        // stringified rather than rejected, matching Jason. Skips escaping
+        // because a decimal integer is only digits and a leading '-'.
+        TermType::Integer => encode_integer(env_raw, key, buf)?,
         _ => return Err(EncodeError::InvalidKey),
     }
     buf.push(b'"');

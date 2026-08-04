@@ -93,7 +93,7 @@ Torque is a high-performance JSON library for Elixir using Rustler NIFs backed b
 
 ### Encoding
 
-`encode/1` walks Elixir terms directly (no intermediate representation) and writes JSON bytes to a buffer. Supports maps (atom/binary keys), lists, numbers, booleans, nil, and jiffy-style `{proplist}` tuples.
+`encode/1` walks Elixir terms directly (no intermediate representation) and writes JSON bytes to a buffer. Supports maps (atom/binary/integer keys — integer keys are stringified, since JSON object names must be strings), lists, numbers, booleans, nil, and jiffy-style `{proplist}` tuples.
 
 ### Scheduler Awareness
 
