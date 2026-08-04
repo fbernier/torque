@@ -20,17 +20,18 @@ defmodule Torque do
 
   ## Encoding
 
-  `encode/1` serializes Elixir terms to JSON. Supports maps (atom or
-  binary keys), lists, binaries, numbers, booleans, `nil`, and
-  jiffy-style `{proplist}` tuples.
+  `encode/1` serializes Elixir terms to JSON. Supports maps (atom,
+  binary, or integer keys), lists, binaries, numbers, booleans, `nil`,
+  and jiffy-style `{proplist}` tuples.
 
   ## Scheduler awareness
 
   Decoding and parsing automatically dispatch inputs larger than 20 KB to a
   dirty CPU scheduler to avoid blocking normal BEAM schedulers. Encoding
   cannot cheaply predict its output size up front, so dirty dispatch is
-  opt-in there: pass `dirty: true` to `encode/2`, `encode!/2`, or
-  `encode_to_iodata/2` when terms are expected to produce large output.
+  opt-in there: pass `dirty: true` to `encode/2`, `encode!/2`,
+  `encode_to_iodata/2`, or `encode_to_iodata!/2` when terms are expected
+  to produce large output.
 
   ## Type conversion
 
@@ -116,7 +117,8 @@ defmodule Torque do
 
   ## Supported terms
 
-    * Maps with atom or binary keys
+    * Maps with atom, binary, or integer keys (integer keys are
+      stringified — JSON object names must be strings)
     * Lists (JSON arrays)
     * Binaries (JSON strings)
     * Integers and floats
@@ -211,6 +213,23 @@ defmodule Torque do
   catch
     :error, value -> raise ArgumentError, "encode error: #{inspect(value)}"
   end
+
+  @doc """
+  Alias for `encode_to_iodata/2`, which already raises on error.
+
+  Exists to satisfy Phoenix's `:json_library` contract, which calls
+  `encode_to_iodata!/1` from its socket serializers, controllers, and
+  longpoll transport. Set `config :phoenix, :json_library, Torque` to use
+  Torque there.
+
+  ## Examples
+
+      iex> Torque.encode_to_iodata!(%{ok: true})
+      ~s({"ok":true})
+  """
+  @doc group: :encode
+  @spec encode_to_iodata!(term(), keyword()) :: binary()
+  def encode_to_iodata!(term, opts \\ []), do: encode_to_iodata(term, opts)
 
   # --- Parse + Get ---
 

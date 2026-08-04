@@ -151,6 +151,47 @@ defmodule Torque.EncodeTest do
     test "invalid UTF-8 binary map key returns error" do
       assert {:error, :invalid_utf8} = Torque.encode(%{<<0x80>> => "value"})
     end
+
+    test "map with integer keys stringifies them" do
+      assert {:ok, json} = Torque.encode(%{0 => "a", 1 => "b"})
+      assert Jason.decode!(json) == %{"0" => "a", "1" => "b"}
+    end
+
+    test "negative integer map key" do
+      assert {:ok, ~s({"-1":"x"})} = Torque.encode(%{-1 => "x"})
+    end
+
+    test "integer map key beyond i64 uses the u64 path" do
+      assert {:ok, json} = Torque.encode(%{9_223_372_036_854_775_808 => "x"})
+      assert Jason.decode!(json) == %{"9223372036854775808" => "x"}
+    end
+
+    test "bignum map key encodes exactly" do
+      assert {:ok, json} = Torque.encode(%{1_180_591_620_717_411_303_424 => "x"})
+      assert Jason.decode!(json) == %{"1180591620717411303424" => "x"}
+    end
+
+    test "negative bignum map key encodes exactly" do
+      assert {:ok, json} = Torque.encode(%{-1_180_591_620_717_411_303_424 => "x"})
+      assert Jason.decode!(json) == %{"-1180591620717411303424" => "x"}
+    end
+
+    test "proplist with integer keys stringifies them" do
+      assert {:ok, ~s({"1":"a","2":"b"})} = Torque.encode({[{1, "a"}, {2, "b"}]})
+    end
+
+    test "integer and binary keys that collide emit duplicate names" do
+      assert {:ok, json} = Torque.encode(%{1 => "a", "1" => "b"})
+      assert json in [~s({"1":"a","1":"b"}), ~s({"1":"b","1":"a"})]
+    end
+
+    test "float map key is still rejected" do
+      assert {:error, :invalid_key} = Torque.encode(%{1.5 => "x"})
+    end
+
+    test "tuple map key is still rejected" do
+      assert {:error, :invalid_key} = Torque.encode(%{{:a, :b} => "x"})
+    end
   end
 
   describe "encode/2 with dirty: true" do
@@ -225,6 +266,30 @@ defmodule Torque.EncodeTest do
       assert_raise ArgumentError, ~r/invalid_utf8/, fn ->
         Torque.encode_to_iodata(<<0x80>>)
       end
+    end
+  end
+
+  describe "encode_to_iodata!/2" do
+    test "matches encode_to_iodata/1 output" do
+      term = %{nested: %{list: [1, 2, 3], str: "hello"}}
+      assert Torque.encode_to_iodata!(term) == Torque.encode_to_iodata(term)
+    end
+
+    test "unsupported term raises ArgumentError" do
+      assert_raise ArgumentError, ~r/unsupported_type/, fn ->
+        Torque.encode_to_iodata!(self())
+      end
+    end
+
+    test "accepts dirty: true" do
+      term = %{"a" => [1, 2, 3], "b" => "hello"}
+      assert Torque.encode_to_iodata!(term, dirty: true) == Torque.encode_to_iodata!(term)
+    end
+
+    test "is exported at arity 1 for Phoenix's :json_library contract" do
+      Code.ensure_loaded!(Torque)
+      assert function_exported?(Torque, :encode_to_iodata!, 1)
+      assert function_exported?(Torque, :decode!, 1)
     end
   end
 end
