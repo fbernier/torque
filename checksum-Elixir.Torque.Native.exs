@@ -1,10 +1,10 @@
 %{
-  "libtorque_nif-v0.2.5-nif-2.15-aarch64-apple-darwin.so.tar.gz" => "sha256:4c3ab92d75c049d48eb388fa3a5e4c6400160d4f96ed9c1978413ac42e6ef52a",
-  "libtorque_nif-v0.2.5-nif-2.15-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:64a9c17cd45cc3240dcfeb288b993747f62a04d215872f17835416ccda8aebf6",
-  "libtorque_nif-v0.2.5-nif-2.15-x86_64-apple-darwin--v2.so.tar.gz" => "sha256:771bab2ffee5f09ae07e159dfcf49cf4c7ac0f69dc9d3f50e6022ade3618cbb7",
-  "libtorque_nif-v0.2.5-nif-2.15-x86_64-apple-darwin--v3.so.tar.gz" => "sha256:a0a54e154f5b57795f5c93d386013b9d4496cf361c5a6a041f41d1d8e29b7e96",
-  "libtorque_nif-v0.2.5-nif-2.15-x86_64-apple-darwin.so.tar.gz" => "sha256:72df465b535cbfc8b2f9737f9ccac089494784b30d194ab5ff78ed0ece2222e3",
-  "libtorque_nif-v0.2.5-nif-2.15-x86_64-unknown-linux-gnu--v2.so.tar.gz" => "sha256:fab6be5b40445a8d1c9cd98483e07d87d147239bfda9a8c258d43a192c915af2",
-  "libtorque_nif-v0.2.5-nif-2.15-x86_64-unknown-linux-gnu--v3.so.tar.gz" => "sha256:53839e3e74f2edff52a57b18ad0248a62c44e06937b04452288f181972f921bb",
-  "libtorque_nif-v0.2.5-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:e8cb9b852be3c901112a19ebdf7266bd063f5e94671d95e92db9e1d7afa0d16a",
+  "libtorque_nif-v0.2.6-nif-2.15-aarch64-apple-darwin.so.tar.gz" => "sha256:3627f5eaef3e2b90c5028203780d2fec87e8673c77b315ed52a926a2a52e93a6",
+  "libtorque_nif-v0.2.6-nif-2.15-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:61ba8ccf6490cd11f151f5c0caaeb0121796c9e6b4c3bcbbb89f77e31459aabe",
+  "libtorque_nif-v0.2.6-nif-2.15-x86_64-apple-darwin--v2.so.tar.gz" => "sha256:38005e86bf9adbaa6c7bbe87ad88b692633e761c1409316478640338eaa9c092",
+  "libtorque_nif-v0.2.6-nif-2.15-x86_64-apple-darwin--v3.so.tar.gz" => "sha256:9b76202e46790975e7a7ac053097553ceb33580bf0aba3eaf72e866b646d5d8a",
+  "libtorque_nif-v0.2.6-nif-2.15-x86_64-apple-darwin.so.tar.gz" => "sha256:1711d79addaede1f1f6522a80ca1b6ecdd6c31779046b3eb1f803534b7933da2",
+  "libtorque_nif-v0.2.6-nif-2.15-x86_64-unknown-linux-gnu--v2.so.tar.gz" => "sha256:106d5d6d59a06bca29f362656c946c690d76a95d1f3fdb8d70aa64f24755df7f",
+  "libtorque_nif-v0.2.6-nif-2.15-x86_64-unknown-linux-gnu--v3.so.tar.gz" => "sha256:149f5f8e84890f1bef9510db1af4f041bdd3a0ea1f8d00cbe15ded0e31405e4c",
+  "libtorque_nif-v0.2.6-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:d8c2fb6434a87375e041d596f9b324ad440aa3fec13ab05d5bf9e5c77ff6c5c7",
 }
