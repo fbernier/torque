@@ -37,6 +37,13 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
+if [ -z "${SKIP_PUBLISH:-}" ] && [ -z "${HEX_API_KEY:-}" ]; then
+  echo "error: HEX_API_KEY not set — export a key with api:write permission"
+  echo "  generate: mix hex.user key generate --key-name torque-release --permission api:write"
+  echo "  or set SKIP_PUBLISH=1 to stop after checksums and publish by hand"
+  exit 1
+fi
+
 # Create and push tag
 echo "==> Creating tag ${TAG}"
 git tag "$TAG"
@@ -74,10 +81,28 @@ gh release edit "$TAG" --draft=false
 echo "==> Generating checksums..."
 TORQUE_BUILD=true mix rustler_precompiled.download Torque.Native --all --print
 
-echo "==> Checksums written to checksum-Elixir.Torque.Native.exs"
+if [ -n "${SKIP_PUBLISH:-}" ]; then
+  echo "==> Checksums written to checksum-Elixir.Torque.Native.exs"
+  echo ""
+  echo "Next steps:"
+  echo "  1. git add checksum-Elixir.Torque.Native.exs"
+  echo "  2. git commit -m 'Add checksums for ${TAG}'"
+  echo "  3. git push origin main"
+  echo "  4. mix hex.publish"
+  exit 0
+fi
+
+echo "==> Committing checksums..."
+git add checksum-Elixir.Torque.Native.exs
+if [ -n "$(git status --porcelain checksum-Elixir.Torque.Native.exs)" ]; then
+  git commit -m "Add checksums for ${TAG}"
+  git push origin HEAD
+else
+  echo "    no changes to commit"
+fi
+
+echo "==> Publishing to Hex..."
+mix hex.publish --yes
+
 echo ""
-echo "Next steps:"
-echo "  1. git add checksum-Elixir.Torque.Native.exs"
-echo "  2. git commit -m 'Add checksums for ${TAG}'"
-echo "  3. git push origin main"
-echo "  4. mix hex.publish"
+echo "==> torque ${TAG} published"
