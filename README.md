@@ -21,7 +21,7 @@ Add to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:torque, "~> 0.2.6"}
+    {:torque, "~> 0.2.7"}
   ]
 end
 ```
