@@ -59,6 +59,9 @@ defmodule Torque.MixProject do
         native/torque_nif/src
         native/torque_nif/Cargo.toml
         native/torque_nif/.cargo
+        native/sonic-rs/src
+        native/sonic-rs/Cargo.toml
+        native/sonic-rs/LICENSE
         Cargo.toml
         Cargo.lock
         Cross.toml
