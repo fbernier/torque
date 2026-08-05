@@ -59,10 +59,19 @@ tag).
 ## Releasing
 
 ```bash
-./scripts/release.sh  # tags, pushes, waits for CI, generates checksums
+export HEX_API_KEY=...   # key with api:write permission
+./scripts/release.sh     # tag, wait for CI, checksums, commit, publish
 ```
 
-The script reads the version from `mix.exs`, creates a git tag, waits for the release workflow to build precompiled NIFs for all targets, then generates checksums. After it completes, commit the checksum file and run `mix hex.publish`.
+The script reads the version from `mix.exs`, creates a git tag, waits for the
+release workflow to build precompiled NIFs for all targets, generates checksums,
+commits and pushes them, then runs `mix hex.publish --yes`.
+
+`HEX_API_KEY` is Hex's unencrypted write key: setting it skips the local-password
+prompt, which is what makes the publish step non-interactive. Mint one with
+`mix hex.user key generate --key-name torque-release --permission api:write`.
+The script fails up front (before tagging) if it's missing. To stop after
+checksums and publish by hand instead, run with `SKIP_PUBLISH=1`.
 
 ### Version bumping
 
