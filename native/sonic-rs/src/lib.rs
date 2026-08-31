@@ -57,6 +57,13 @@ pub use crate::value::{
 pub use crate::value::node::RawStr;
 pub use crate::value::visitor::JsonVisitor;
 
+/// Returns whether `len` fits the parsers' `u32`-based offsets.
+/// Expressing the limit this way remains valid on 32-bit targets.
+#[inline]
+pub fn json_too_large(len: usize) -> bool {
+    len > u32::MAX as usize
+}
+
 /// Parse `json` by driving the push-based [`JsonVisitor`] directly over the
 /// original input slice (no padding copy), so the borrowed `&str` handed to
 /// `visit_str` for unescaped strings points into `json`. Added for Torque's
@@ -65,6 +72,15 @@ pub fn parse_into_visitor<'de, V>(json: &'de [u8], visitor: &mut V) -> Result<()
 where
     V: JsonVisitor<'de>,
 {
+    // The same bound `from_trait` puts on the DOM parser, so both entry points
+    // refuse the same input: offsets into the document are tracked as `u32` in
+    // both this crate and the visitors built on it.
+    if json_too_large(json.len()) {
+        return Err(crate::error::make_error(format!(
+            "Only support JSON less than 4 GiB, the input JSON is too large here, len is {}",
+            json.len()
+        )));
+    }
     let mut parser = crate::parser::Parser::new(Read::from(json));
     let mut strbuf = Vec::new();
     parser.parse_dom2(visitor, &mut strbuf)?;

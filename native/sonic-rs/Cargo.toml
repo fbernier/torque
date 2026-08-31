@@ -8,10 +8,13 @@
 #   * a `JsonVisitor::visit_overflow_int` hook: integer-shaped tokens that
 #     overflow i64/u64 are routed to it with the raw digits (default falls
 #     back to f64), so Torque can build exact Erlang bignums during decode
-#   * object keys in the visitor parse (`parse_object2`) are delivered via
-#     `visit_key` instead of `visit_str` (defaults forward to the str hooks),
-#     so Torque can reuse the term for a key repeated across sibling objects
+#   * key-specific visitor hooks with backward-compatible string defaults
+#   * one document-size check shared by DOM and visitor entry points
+#   * structured recursion-limit detection for callers
 # Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0)
+#
+# Upstream disables clippy for this crate. Tests cover Torque-owned patches
+# because the linter cannot report on them.
 
 # Standalone manifest so this is not pulled into the torque workspace.
 [workspace]

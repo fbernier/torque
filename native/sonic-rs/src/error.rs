@@ -141,6 +141,12 @@ impl Error {
     pub fn offset(&self) -> usize {
         self.err.index
     }
+
+    /// Returns whether this is the fork's parser recursion limit, allowing
+    /// callers to avoid matching an error message.
+    pub fn is_recursion_limit(&self) -> bool {
+        matches!(self.err.code, ErrorCode::RecursionLimitExceeded)
+    }
 }
 
 #[allow(clippy::fallible_impl_from)]

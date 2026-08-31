@@ -164,9 +164,7 @@ struct InputRef {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
-    /// Bound for a key the decoder wants to borrow: the input length, or 0 for
-    /// an input too large to address with `KeyOrd`'s u32 offsets (sonic-rs
-    /// rejects >2 GB, so that never happens).
+    /// Input length when every key offset fits in `u32`; zero disables borrowing.
     borrow_limit: usize,
     /// Exclusive upper bound for offsets with eight readable input bytes.
     wide_limit: usize,
@@ -620,7 +618,11 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     }
 }
 
-pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
+pub fn decode_to_term<'a>(
+    env: Env<'a>,
+    input_term: ERL_NIF_TERM,
+    bytes: &[u8],
+) -> (Term<'a>, usize) {
     DECODE_BUFS.with(|cell| {
         let mut bufs = cell.borrow_mut();
         let DecodeBufs {
@@ -658,15 +660,19 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
 
         let result = match sonic_rs::parse_into_visitor(bytes, &mut builder) {
             Ok(()) => match builder.values.first() {
-                Some(&root) => make_tuple2(env, atoms::ok().as_c_arg(), root),
-                None => make_tuple2(
-                    env,
-                    atoms::error().as_c_arg(),
-                    "empty document".encode(env).as_c_arg(),
+                Some(&root) => (make_tuple2(env, atoms::ok().as_c_arg(), root), bytes.len()),
+                None => (
+                    make_tuple2(
+                        env,
+                        atoms::error().as_c_arg(),
+                        "empty document".encode(env).as_c_arg(),
+                    ),
+                    bytes.len(),
                 ),
             },
             Err(e) => {
-                if builder.too_deep {
+                let scanned = crate::decoder::bytes_scanned(&e, bytes.len());
+                let term = if builder.too_deep {
                     make_tuple2(
                         env,
                         atoms::error().as_c_arg(),
@@ -678,7 +684,8 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
                         atoms::error().as_c_arg(),
                         format!("{}", e).encode(env).as_c_arg(),
                     )
-                }
+                };
+                (term, scanned)
             }
         };
 

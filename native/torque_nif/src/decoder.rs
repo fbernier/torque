@@ -1,6 +1,6 @@
 use crate::atoms;
 use crate::native_decode;
-use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
+use crate::nif_util::{make_tuple2, timeslice_percent, BYTES_PER_REDUCTION, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
 use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
@@ -29,6 +29,35 @@ fn consume_timeslice_nodes(env: Env, nodes: usize) {
     if nodes >= TIMESLICE_MIN_NODES {
         let reds = nodes / NODES_PER_REDUCTION;
         schedule::consume_timeslice(env, ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100));
+    }
+}
+
+/// Smallest input worth reporting to the scheduler.
+const TIMESLICE_MIN_BYTES: usize = 512;
+
+/// Charges byte-proportional work to a normal scheduler.
+#[inline]
+fn consume_timeslice_bytes(env: Env, bytes: usize) {
+    if bytes >= TIMESLICE_MIN_BYTES {
+        schedule::consume_timeslice(env, timeslice_percent(bytes));
+    }
+}
+
+/// Combines byte and term work before rounding the timeslice percentage.
+#[inline]
+fn mixed_timeslice_percent(bytes: usize, nodes: usize) -> Option<i32> {
+    if bytes < TIMESLICE_MIN_BYTES && nodes < TIMESLICE_MIN_NODES {
+        return None;
+    }
+    let reds = bytes / BYTES_PER_REDUCTION + nodes / NODES_PER_REDUCTION;
+    Some(((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100))
+}
+
+/// Charges combined byte and term work with one scheduler update.
+#[inline]
+fn consume_timeslice_mixed(env: Env, bytes: usize, nodes: usize) {
+    if let Some(percent) = mixed_timeslice_percent(bytes, nodes) {
+        schedule::consume_timeslice(env, percent);
     }
 }
 
@@ -197,62 +226,88 @@ fn pointer_lookup<'v>(
     Some(current)
 }
 
-fn do_parse(bytes: &[u8], unique_keys: bool) -> Result<ResourceArc<ParsedDocument>, String> {
-    match sonic_rs::from_slice::<sonic_rs::Value>(bytes) {
-        Ok(value) => Ok(ResourceArc::new(ParsedDocument { value, unique_keys })),
-        Err(e) => Err(format!("{}", e)),
-    }
+fn do_parse(
+    bytes: &[u8],
+    unique_keys: bool,
+) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
+    sonic_rs::from_slice::<sonic_rs::Value>(bytes)
+        .map(|value| ResourceArc::new(ParsedDocument { value, unique_keys }))
 }
 
-/// Build the `{:error, _}` term for a parse failure. The vendored sonic-rs caps
-/// DOM nesting and reports it with a "...layers deep" message; surface that as
-/// `:nesting_too_deep` for parity with decode/get/encode. Other errors keep the
-/// sonic-rs message string.
+/// Estimated work for rejected input. Every byte is validated as UTF-8, while
+/// parsing and error construction reach only part of the document. Validation
+/// is therefore charged at a fraction of full parsing work.
+const UTF8_SCAN_RATIO: usize = 32;
+
+/// Combines the full-input UTF-8 scan with syntax work through `reached`.
+/// A rejection at the end is charged like a successful parse, without billing
+/// the two passes twice.
 #[inline]
-fn parse_error_term<'a>(env: Env<'a>, reason: String) -> Term<'a> {
+pub(crate) fn timeslice_bytes(reached: usize, len: usize) -> usize {
+    let reached = reached.min(len);
+    let validated = len / UTF8_SCAN_RATIO;
+    validated + reached.saturating_sub(reached / UTF8_SCAN_RATIO)
+}
+
+/// Uses the reported error offset as the syntax-work boundary. Sonic-rs may
+/// prefer an invalid UTF-8 position over an earlier syntax fault, but building
+/// the error also walks to that position, so it remains the useful work proxy.
+#[inline]
+pub(crate) fn bytes_scanned(err: &sonic_rs::Error, len: usize) -> usize {
+    timeslice_bytes(err.offset().saturating_add(1), len)
+}
+
+/// Builds the public parse error. Recursion-limit failures use the stable
+/// `:nesting_too_deep` atom; other sonic-rs errors retain their message.
+#[inline]
+fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<'a> {
     let err_raw = atoms::error().as_c_arg();
-    if reason.contains("layers deep") {
+    if err.is_recursion_limit() {
         make_tuple2(env, err_raw, atoms::nesting_too_deep().as_c_arg())
     } else {
-        make_tuple2(env, err_raw, reason.encode(env).as_c_arg())
+        make_tuple2(env, err_raw, err.to_string().encode(env).as_c_arg())
     }
 }
 
 #[rustler::nif]
 fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false) {
-        Ok(resource) => {
-            schedule::consume_timeslice(env, timeslice_percent(json.len()));
-            make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
-        }
-        Err(reason) => parse_error_term(env, reason),
-    }
+    let (result, scanned) = match do_parse(json.as_slice(), false) {
+        Ok(resource) => (
+            make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
+            json.len(),
+        ),
+        Err(e) => (parse_error_term(env, &e), bytes_scanned(&e, json.len())),
+    };
+    consume_timeslice_bytes(env, scanned);
+    result
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_dirty<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
     match do_parse(json.as_slice(), false) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-        Err(reason) => parse_error_term(env, reason),
+        Err(e) => parse_error_term(env, &e),
     }
 }
 
 #[rustler::nif]
 fn parse_opts<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys) {
-        Ok(resource) => {
-            schedule::consume_timeslice(env, timeslice_percent(json.len()));
-            make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
-        }
-        Err(reason) => parse_error_term(env, reason),
-    }
+    let (result, scanned) = match do_parse(json.as_slice(), unique_keys) {
+        Ok(resource) => (
+            make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
+            json.len(),
+        ),
+        Err(e) => (parse_error_term(env, &e), bytes_scanned(&e, json.len())),
+    };
+    consume_timeslice_bytes(env, scanned);
+    result
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_opts_dirty<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
     match do_parse(json.as_slice(), unique_keys) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-        Err(reason) => parse_error_term(env, reason),
+        Err(e) => parse_error_term(env, &e),
     }
 }
 
@@ -343,15 +398,15 @@ fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) 
 #[rustler::nif]
 fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    let result = native_decode::decode_to_term(env, input_term, json.as_slice());
-    schedule::consume_timeslice(env, timeslice_percent(json.len()));
+    let (result, scanned) = native_decode::decode_to_term(env, input_term, json.as_slice());
+    consume_timeslice_bytes(env, scanned);
     result
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_dirty<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    native_decode::decode_to_term(env, input_term, json.as_slice())
+    native_decode::decode_to_term(env, input_term, json.as_slice()).0
 }
 
 // --- Pre-compiled pointers + fused parse/extract ---
@@ -436,19 +491,24 @@ fn extract_compiled<'a>(
     acc.into_list(env)
 }
 
+/// Returns the result term and the bytes the parser reached, which differ only
+/// when the document is rejected part way through.
 #[inline]
 fn do_parse_get_many_nil<'a>(
     env: Env<'a>,
     bytes: &[u8],
     compiled: &CompiledPaths,
     nodes: &mut usize,
-) -> Term<'a> {
+) -> (Term<'a>, usize) {
     match sonic_rs::from_slice::<sonic_rs::Value>(bytes) {
         Ok(value) => {
             let list = extract_compiled(env, &value, compiled, nodes);
-            make_tuple2(env, atoms::ok().as_c_arg(), list.as_c_arg())
+            (
+                make_tuple2(env, atoms::ok().as_c_arg(), list.as_c_arg()),
+                bytes.len(),
+            )
         }
-        Err(e) => parse_error_term(env, format!("{}", e)),
+        Err(e) => (parse_error_term(env, &e), bytes_scanned(&e, bytes.len())),
     }
 }
 
@@ -459,10 +519,9 @@ fn parse_get_many_nil<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut nodes = 0usize;
-    let result = do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes);
-    // Timeslice fractions accumulate: bytes cover the parse, nodes the extraction.
-    schedule::consume_timeslice(env, timeslice_percent(json.len()));
-    consume_timeslice_nodes(env, nodes);
+    let (result, scanned) = do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes);
+    // Bytes cover the parse, nodes the extraction; one hint covers both.
+    consume_timeslice_mixed(env, scanned, nodes);
     result
 }
 
@@ -473,7 +532,7 @@ fn parse_get_many_nil_dirty<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut nodes = 0usize;
-    do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes)
+    do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes).0
 }
 
 #[inline]
@@ -535,4 +594,193 @@ fn get_many_nil<'a>(
 
     consume_timeslice_nodes(env, nodes);
     Ok(acc.into_list(env))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rejected-input work must increase with parser progress and remain bounded
+    /// by the validation and full-parse endpoints.
+    #[test]
+    fn rejected_input_is_charged_between_one_pass_and_two() {
+        // The validation floor applies even before syntax parsing advances.
+        assert_eq!(timeslice_bytes(1, 0), 0);
+        assert_eq!(timeslice_bytes(0, 32), 1);
+        assert!(timeslice_bytes(1, 19_001) >= TIMESLICE_MIN_BYTES);
+
+        for &len in &[0usize, 1, 511, 512, 1599, 1600, 20_000, 1 << 20] {
+            let validated = timeslice_bytes(0, len);
+            assert!(validated <= len, "{len}: validating cost more than parsing");
+            assert_eq!(
+                timeslice_bytes(len, len),
+                len,
+                "{len}: reaching the end must cost what parsing it does"
+            );
+
+            let mut last = validated;
+            for reached in (0..=len).step_by(1 + len / 64) {
+                let charged = timeslice_bytes(reached, len);
+                assert!(charged >= last, "{len}/{reached}: went backwards");
+                assert!(charged <= len, "{len}/{reached}: over-charged");
+                last = charged;
+            }
+        }
+    }
+
+    /// The size predicate is portable to targets where the `u32` boundary is
+    /// not representable as a larger `usize` value.
+    #[test]
+    fn the_size_bound_sits_at_what_a_u32_offset_can_address() {
+        assert!(!sonic_rs::json_too_large(0));
+        assert!(!sonic_rs::json_too_large(u32::MAX as usize - 1));
+        assert!(!sonic_rs::json_too_large(u32::MAX as usize));
+
+        // The upper boundary exists only on wider pointer targets.
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(sonic_rs::json_too_large(u32::MAX as usize + 1));
+            assert!(sonic_rs::json_too_large(usize::MAX));
+        }
+        #[cfg(target_pointer_width = "32")]
+        assert!(!sonic_rs::json_too_large(usize::MAX));
+    }
+
+    /// Distinguishes the vendored parser's recursion limit from syntax errors.
+    #[test]
+    fn the_recursion_limit_is_told_apart_from_a_syntax_fault() {
+        // Use a larger test thread stack so debug frames reach the parser limit.
+        let deep = "[".repeat(130) + &"]".repeat(130);
+        let parsed = std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(move || {
+                let err = sonic_rs::from_slice::<sonic_rs::Value>(deep.as_bytes()).unwrap_err();
+                (err.is_recursion_limit(), format!("{}", err))
+            })
+            .expect("spawn")
+            .join()
+            .expect("the parser should stop at the cap, not overflow");
+        assert!(parsed.0, "{}", parsed.1);
+
+        for ordinary in ["!", "{\"a\":}", "[1,", "\"unterminated"] {
+            let err = sonic_rs::from_slice::<sonic_rs::Value>(ordinary.as_bytes()).unwrap_err();
+            assert!(!err.is_recursion_limit(), "{ordinary}: {err}");
+        }
+    }
+
+    /// Fused extraction combines byte and term work before rounding. This test
+    /// compares that rule with the old split accounting at both floors.
+    #[test]
+    fn a_mixed_charge_rounds_once_rather_than_twice() {
+        let split = |bytes: usize, nodes: usize| {
+            let b = if bytes >= TIMESLICE_MIN_BYTES {
+                timeslice_percent(bytes)
+            } else {
+                0
+            };
+            let n = if nodes >= TIMESLICE_MIN_NODES {
+                ((nodes / NODES_PER_REDUCTION * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
+            } else {
+                0
+            };
+            b + n
+        };
+        let combined = |bytes, nodes| mixed_timeslice_percent(bytes, nodes).unwrap_or(0);
+
+        // Separate clamping over-reports this pair.
+        assert_eq!((split(512, 512), combined(512, 512)), (4, 3));
+        // Separate truncation under-reports this pair.
+        assert_eq!((split(1599, 512), combined(1599, 512)), (4, 5));
+        // The next byte removes the rounding difference.
+        assert_eq!((split(1600, 512), combined(1600, 512)), (5, 5));
+        // Below both floors there is nothing to report.
+        assert_eq!(mixed_timeslice_percent(511, 511), None);
+        // Work below one floor still contributes when the other is reportable.
+        assert!(combined(511, 512) >= 1);
+        assert!(combined(512, 511) >= 1);
+
+        for bytes in [0usize, 511, 512, 1599, 1600, 20_000, 1 << 20] {
+            for nodes in [0usize, 511, 512, 20_000, 1 << 20] {
+                let got = mixed_timeslice_percent(bytes, nodes).unwrap_or(0);
+                assert!((0..=100).contains(&got), "{bytes}/{nodes}: {got}");
+                let only_bytes = combined(bytes, 0);
+                assert!(
+                    got >= only_bytes,
+                    "{bytes}/{nodes}: nodes reduced the charge"
+                );
+            }
+        }
+    }
+
+    /// Malformed inputs whose DOM and visitor parsers report different offsets.
+    fn malformed_documents() -> [(&'static str, Vec<u8>); 3] {
+        let filler = 4_000;
+        [
+            (
+                "rejected on byte 0, bad byte at the end",
+                [b"!".to_vec(), vec![b' '; filler], vec![0xff]].concat(),
+            ),
+            (
+                "a whole valid document, then a bad trailing byte",
+                [br#"{"a":1}"#.to_vec(), vec![b' '; filler], vec![0xff]].concat(),
+            ),
+            (
+                "bad byte inside a string the parser is part way through",
+                [
+                    b"\"".to_vec(),
+                    vec![b'a'; filler],
+                    vec![0xff],
+                    b"\"".to_vec(),
+                ]
+                .concat(),
+            ),
+        ]
+    }
+
+    /// Visitor used only to collect parser errors without building terms.
+    struct NoopVisitor;
+
+    impl<'de> sonic_rs::JsonVisitor<'de> for NoopVisitor {}
+
+    /// The visitor parser reports invalid UTF-8 in place of the syntax fault it
+    /// found first, so all three shapes are charged for the bad byte's offset —
+    /// including the one the DOM parser rejects on byte 0.
+    #[test]
+    fn the_visitor_parser_charges_for_the_utf8_offset() {
+        for (what, doc) in malformed_documents() {
+            let err = sonic_rs::parse_into_visitor(&doc, &mut NoopVisitor).unwrap_err();
+            let charged = bytes_scanned(&err, doc.len());
+            assert!(charged <= doc.len(), "{what}: charged past the document");
+            assert!(
+                charged > doc.len() / 2,
+                "{what}: charged {charged} of {} for an error at {}",
+                doc.len(),
+                err.offset()
+            );
+        }
+    }
+
+    /// Building an error walks the input to the offset it reports, so the
+    /// charge follows that offset. The DOM parser keeps the fault it found on
+    /// byte 0, so the first shape is charged for its start here and for the
+    /// whole document in the visitor test above.
+    #[test]
+    fn an_error_is_charged_for_the_offset_it_reports() {
+        // Only the first: the DOM parser stops on byte 0 and never reaches the
+        // bad byte, so it is the one shape charged for its start.
+        let reported_late = [false, true, true];
+
+        for ((what, doc), late) in malformed_documents().into_iter().zip(reported_late) {
+            let err = sonic_rs::from_slice::<sonic_rs::Value>(&doc).unwrap_err();
+            let charged = bytes_scanned(&err, doc.len());
+            assert!(charged <= doc.len(), "{what}: charged past the document");
+            assert_eq!(
+                charged > doc.len() / 2,
+                late,
+                "{what}: charged {charged} of {} for an error at {}",
+                doc.len(),
+                err.offset()
+            );
+        }
+    }
 }

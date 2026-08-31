@@ -17,7 +17,7 @@ pub fn make_tuple2<'a>(env: Env<'a>, a: ERL_NIF_TERM, b: ERL_NIF_TERM) -> Term<'
     }
 }
 
-const BYTES_PER_REDUCTION: usize = 20;
+pub const BYTES_PER_REDUCTION: usize = 20;
 /// Reductions per full BEAM timeslice (CONTEXT_REDS).
 pub const REDUCTION_COUNT: usize = 4000;
 
