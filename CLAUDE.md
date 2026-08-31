@@ -16,7 +16,8 @@ mix format --check-formatted       # check Elixir formatting
 mix dialyzer                       # static type analysis
 cargo fmt                          # format Rust code (run from repo root)
 cargo fmt --check                  # check Rust formatting
-cargo clippy -- -D warnings        # Rust linter
+cargo clippy --workspace --all-targets -- -D warnings   # Rust linter (as CI runs it)
+cargo test --workspace             # Rust unit tests
 MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks
 ```
 
@@ -150,7 +151,7 @@ crossover. "Extract subtree — object key order" runs the same orders through
 
 ### Scheduler Awareness
 
-Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
+Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`. The `get/2` NIF always runs on a normal scheduler. That is right for the pointer traversal, which is sub-microsecond, but not for `value_to_term`, which builds every term in the subtree returned: extracting a 1.3 MB array measured 1.6 ms in one call against 1 µs for a scalar lookup. `consume_timeslice_nodes` reports that work afterwards, adjusting the process's reduction budget without preempting a call already made — the deliberate choice of `7560c71`. The same hole is wider on the compiled-pointer paths: `parse_get_many_nil/2` and `get_many_nil/2` pick dirty by `byte_size(json) > @timeslice_bytes`, but a `pointers()` handle can hold thousands of paths and each converts its own subtree, so the work is unbounded by the size being measured - 54 bytes of JSON against 10,000 root pointers takes 2.5 ms in one normal-scheduler call. No dirty variant exists for the get family, and encode's opt-in `dirty: true` shape has no room in `get/3`, whose third argument is already `default` and typed `term()`.
 
 ### Type Conversion
 
