@@ -160,7 +160,9 @@ expected to encode to large output (more than roughly 20 KB):
 | `true`, `false` | `true`, `false` |
 | `null` | `nil` |
 
-For objects with duplicate keys, the last value wins (unless `unique_keys: true` is passed to `parse/2`).
+For objects with duplicate keys, the last value wins: `{"a":1,"b":2,"a":3}` decodes to `%{"a" => 3, "b" => 2}`. Jason and OTP's `:json` keep the *first* value instead, so a document with repeated names decodes to different values depending on the library.
+
+`unique_keys: true` on `parse/2` is a promise that the document has none. If it does anyway, a path lookup stops at the first match instead of the last — `get(doc, "/a")` is `3` by default and `1` with the option — while building the enclosing object still keeps the last either way.
 
 Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) via `decode/1`, rather than degrading to lossy floats. The `parse/2` + `get/2` path returns them as floats, since the parsed document cannot hold a bignum.
 
@@ -291,7 +293,7 @@ MIX_ENV=bench mix run bench/torque_bench.exs
 
 ## Limitations
 
-- **Integer map keys are lossy**: JSON object names must be strings (RFC 8259 §4), so `encode/1` stringifies integer keys and `decode/1` gives them back as binaries — `%{1 => "a"}` round-trips to `%{"1" => "a"}`. A map mixing both forms, like `%{1 => "a", "1" => "b"}`, encodes to duplicate names (`{"1":"a","1":"b"}`); RFC 8259 says names *should* be unique, and decoders resolve the collision however they choose. Jason behaves identically.
+- **Integer map keys are lossy**: JSON object names must be strings (RFC 8259 §4), so `encode/1` stringifies integer keys and `decode/1` gives them back as binaries — `%{1 => "a"}` round-trips to `%{"1" => "a"}`. A map mixing both forms, like `%{1 => "a", "1" => "b"}`, encodes to duplicate names (`{"1":"a","1":"b"}`); RFC 8259 says names *should* be unique, and decoders resolve the collision however they choose — Torque keeps the last value, as described under [JSON to Elixir](#json-to-elixir). Jason behaves identically on the encode side.
 - **Nesting depth**: JSON documents nested deeper than 128 levels return `{:error, :nesting_too_deep}` from `decode/1`, `parse/1`, `get/2`, `get_many/2`, and `encode/1` rather than crashing the VM. Real-world documents are never this deep; the limit exists to prevent stack overflow in the NIF (the dirty CPU scheduler, used for inputs over 20 KB, has a small stack).
 
 ## License

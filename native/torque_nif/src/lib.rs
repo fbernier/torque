@@ -2,6 +2,7 @@ mod atoms;
 mod decoder;
 mod encoder;
 mod escape;
+pub(crate) mod map_order;
 pub(crate) mod native_decode;
 pub(crate) mod nif_util;
 mod types;

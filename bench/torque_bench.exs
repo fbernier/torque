@@ -350,6 +350,259 @@ Benchee.run(
     ] ++ ci_formatters
 )
 
+# `Jason.encode!` emits BEAM map order, which is already ideal for ERTS
+# flatmaps. Schema order models non-BEAM producers; reversed order bounds the
+# insertion-sort worst case. Keep each schema stable across records so branch
+# behavior matches real producers.
+rewrite_keys = fn f, order, v ->
+  cond do
+    is_map(v) ->
+      "{" <>
+        (v
+         |> Enum.to_list()
+         |> order.()
+         |> Enum.map_join(",", fn {k, x} -> Jason.encode!(k) <> ":" <> f.(f, order, x) end)) <>
+        "}"
+
+    is_list(v) ->
+      "[" <> Enum.map_join(v, ",", &f.(f, order, &1)) <> "]"
+
+    true ->
+      Jason.encode!(v)
+  end
+end
+
+:rand.seed(:exsss, {4, 8, 15})
+
+# Reuse one deterministic permutation per key set, as a schema-driven producer does.
+schema_order = fn pairs ->
+  shape = pairs |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+  cache_key = {:schema_order, shape}
+
+  permutation =
+    case Process.get(cache_key) do
+      nil ->
+        p = Enum.shuffle(shape)
+        Process.put(cache_key, p)
+        p
+
+      p ->
+        p
+    end
+
+  by_key = Map.new(pairs)
+  Enum.map(permutation, fn k -> {k, Map.fetch!(by_key, k)} end)
+end
+
+reverse_order = &Enum.sort_by(&1, fn {k, _} -> k end, :desc)
+
+sample_schema = rewrite_keys.(rewrite_keys, schema_order, Torque.decode!(sample_json))
+sample_reversed = rewrite_keys.(rewrite_keys, reverse_order, Torque.decode!(sample_json))
+large_schema = rewrite_keys.(rewrite_keys, schema_order, Torque.decode!(large_json))
+large_reversed = rewrite_keys.(rewrite_keys, reverse_order, Torque.decode!(large_json))
+
+BenchGroup.set("Decode — object key order")
+IO.puts("\n=== KEY-ORDER SENSITIVITY (same bytes, different member order) ===\n")
+
+Benchee.run(
+  %{
+    "torque decode 1.2 KB [term order]" => fn -> Torque.decode!(sample_json) end,
+    "torque decode 1.2 KB [schema order]" => fn -> Torque.decode!(sample_schema) end,
+    "torque decode 1.2 KB [reversed — worst case]" => fn -> Torque.decode!(sample_reversed) end,
+    "torque decode 750 KB [term order]" => fn -> Torque.decode!(large_json) end,
+    "torque decode 750 KB [schema order]" => fn -> Torque.decode!(large_schema) end,
+    "torque decode 750 KB [reversed — worst case]" => fn -> Torque.decode!(large_reversed) end
+  },
+  warmup: 2,
+  time: 5,
+  memory_time: 2,
+  percentiles: [50, 95, 99],
+  formatters:
+    [
+      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+    ] ++ ci_formatters
+)
+
+# Vary live object shapes while holding record count, size, and key order fixed.
+pad2 = fn n -> String.pad_leading(Integer.to_string(n), 2, "0") end
+
+shape_variety = fn ids ->
+  pad = fn n, width -> String.pad_leading(Integer.to_string(n), width, "0") end
+
+  key_sets =
+    for s <- ids do
+      for i <- 1..20, do: "#{pad.(s, 2)}_#{pad.(i, 2)}_field"
+    end
+
+  rows =
+    for r <- 1..div(600, length(ids)), keys <- key_sets do
+      Map.new(keys, fn k -> {k, "value_#{k}_#{pad.(r, 3)}"} end)
+    end
+
+  rewrite_keys.(rewrite_keys, reverse_order, %{"rows" => rows})
+end
+
+# These IDs cover distinct direct-mapped shape slots; update them if `slot_of` changes.
+one_shape = shape_variety.([19])
+eight_shapes = shape_variety.([19, 25, 1, 2, 5, 8, 12, 15])
+
+many_shapes =
+  shape_variety.([
+    19,
+    22,
+    23,
+    25,
+    26,
+    27,
+    1,
+    28,
+    29,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17
+  ])
+
+[one_shape, eight_shapes, many_shapes]
+|> Enum.map(&byte_size/1)
+|> Enum.uniq()
+|> case do
+  [_only] -> :ok
+  sizes -> raise "shape-variety fixtures must be the same size, got #{inspect(sizes)}"
+end
+
+# Sets `MIN_ORDERED_MEMBERS`; rerun before changing the flatmap threshold.
+member_sweep =
+  for n <- [2, 3, 4, 5, 8, 16, 32, 33], order <- [:term, :reversed], into: %{} do
+    pairs = for i <- 1..n, do: {"key_#{pad2.(i)}", i}
+    sorted = if order == :term, do: Enum.sort(pairs), else: Enum.sort(pairs, :desc)
+    json = "{" <> Enum.map_join(sorted, ",", fn {k, v} -> ~s("#{k}":#{v}) end) <> "}"
+
+    {"torque decode #{String.pad_leading(Integer.to_string(n), 2)} members [#{order}]",
+     fn -> Torque.decode!(json) end}
+  end
+
+BenchGroup.set("Decode — member count sweep")
+IO.puts("\n=== MEMBER COUNT SWEEP (where ordering starts to pay) ===\n")
+
+Benchee.run(member_sweep,
+  warmup: 1,
+  time: 3,
+  percentiles: [50, 95, 99],
+  formatters:
+    [
+      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+    ] ++ ci_formatters
+)
+
+# Exercises the `value_to_term` caller across member counts, key prefixes, and order.
+extract_sweep =
+  for n <- [4, 6, 8, 12, 32],
+      style <- [:distinct, :prefix],
+      order <- [:term, :shuffled, :reversed],
+      into: %{} do
+    keys =
+      case style do
+        :distinct -> for i <- 1..n, do: <<?a + rem(i, 26)>> <> pad2.(i) <> "x"
+        :prefix -> for i <- 1..n, do: "field_#{pad2.(i)}"
+      end
+
+    keys =
+      case order do
+        :term -> Enum.sort(keys)
+        :reversed -> Enum.sort(keys, :desc)
+        :shuffled -> Enum.shuffle(keys)
+      end
+
+    row = "{" <> Enum.map_join(keys, ",", fn k -> ~s("#{k}":"#{k}") end) <> "}"
+    json = "{\"rows\":[" <> Enum.map_join(1..200, ",", fn _ -> row end) <> "]}"
+    {:ok, doc} = Torque.parse(json)
+
+    {"torque get #{String.pad_leading(Integer.to_string(n), 2)} members [#{style}, #{order}]",
+     fn -> Torque.get(doc, "/rows") end}
+  end
+
+BenchGroup.set("Extract — member count sweep")
+IO.puts("\n=== EXTRACT MEMBER SWEEP (where ordering starts to pay in value_to_term) ===\n")
+
+Benchee.run(extract_sweep,
+  warmup: 1,
+  time: 3,
+  percentiles: [50, 95, 99],
+  formatters:
+    [
+      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+    ] ++ ci_formatters
+)
+
+BenchGroup.set("Decode — object shape variety")
+IO.puts("\n=== SHAPE VARIETY (same size, more distinct object shapes) ===\n")
+IO.puts("Shape-variety payload size: #{byte_size(one_shape)} bytes\n")
+
+Benchee.run(
+  %{
+    "torque decode [1 shape]" => fn -> Torque.decode!(one_shape) end,
+    "torque decode [8 shapes — one per slot]" => fn -> Torque.decode!(eight_shapes) end,
+    "torque decode [24 shapes — three per slot]" => fn -> Torque.decode!(many_shapes) end
+  },
+  warmup: 2,
+  time: 5,
+  memory_time: 2,
+  percentiles: [50, 95, 99],
+  formatters:
+    [
+      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+    ] ++ ci_formatters
+)
+
+# Sets the small-input accounting cutoff for successful and rejected parses.
+sized = fn n, kind ->
+  case kind do
+    :valid -> ~s({"a":1}) <> String.duplicate(" ", n - 7)
+    :reject_first -> "!" <> String.duplicate(" ", n - 1)
+    :reject_last -> String.duplicate(" ", n - 1) <> "!"
+  end
+end
+
+accounting_sweep =
+  for n <- [8, 68, 511, 512, 1143, 1600],
+      {kind, label} <- [
+        valid: "valid",
+        reject_first: "rejected at byte 0",
+        reject_last: "rejected at the end"
+      ],
+      n >= 8,
+      into: %{} do
+    json = sized.(n, kind)
+
+    {"torque decode #{String.pad_leading(Integer.to_string(n), 4)} B [#{label}]",
+     fn -> Torque.Native.decode(json) end}
+  end
+
+BenchGroup.set("Decode — small input accounting")
+IO.puts("\n=== SMALL INPUT ACCOUNTING (where charging stops being worth its call) ===\n")
+
+Benchee.run(accounting_sweep,
+  warmup: 1,
+  time: 2,
+  percentiles: [50, 95, 99],
+  formatters:
+    [
+      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+    ] ++ ci_formatters
+)
+
 BenchGroup.set("Encode — 1.2 KB OpenRTB")
 IO.puts("\n=== ENCODE BENCHMARK ===\n")
 
@@ -457,6 +710,36 @@ Benchee.run(
       Torque.get_many(doc, fields)
     end
   },
+  warmup: 2,
+  time: 5,
+  memory_time: 2,
+  percentiles: [50, 95, 99],
+  formatters:
+    [
+      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+    ] ++ ci_formatters
+)
+
+BenchGroup.set("Extract subtree — object key order")
+IO.puts("\n=== EXTRACT SUBTREE, KEY ORDER (value_to_term, not the fused decoder) ===\n")
+
+# The reordering runs on two paths: `build_map` in the fused decoder, which the
+# decode groups above cover, and `reorder_object` in `value_to_term`, which
+# nothing else here reaches. Extracting a whole subtree is what puts every
+# object in the document through it, so these parse once and pull the record
+# array back out in each member order.
+order_docs = [term: large_json, schema: large_schema, reversed: large_reversed]
+
+parsed_docs =
+  for {label, json} <- order_docs do
+    {:ok, doc} = Torque.parse(json)
+    {label, doc}
+  end
+
+Benchee.run(
+  Map.new(parsed_docs, fn {label, doc} ->
+    {"torque get subtree [#{label} order]", fn -> Torque.get(doc, "/statuses") end}
+  end),
   warmup: 2,
   time: 5,
   memory_time: 2,

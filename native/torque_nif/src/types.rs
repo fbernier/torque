@@ -1,12 +1,11 @@
-use rustler::sys::{
-    enif_make_list_from_array, enif_make_map_from_arrays, enif_make_map_put, enif_make_new_map,
-    ERL_NIF_TERM,
-};
+use rustler::sys::{enif_make_list_from_array, enif_make_map_put, enif_make_new_map, ERL_NIF_TERM};
 use rustler::{Env, NewBinary, Term};
 use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
 use std::mem::MaybeUninit;
 
 use crate::atoms;
+use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
+use crate::nif_util::map_from_arrays;
 
 const STACK_SIZE: usize = 64;
 
@@ -23,6 +22,104 @@ fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {
     let mut binary = NewBinary::new(env, bytes.len());
     binary.as_mut_slice().copy_from_slice(bytes);
     binary.into()
+}
+
+/// Put an object's already-built key/value terms into Erlang term order, so
+/// `enif_make_map_from_arrays` confirms the order in `n - 1` comparisons
+/// instead of insertion-sorting the terms in O(n²) (see [`crate::map_order`]).
+///
+/// `key_strs` are the keys the caller already unpacked to build the key terms.
+/// Taking them rather than reaching into the object again matters: unpacking a
+/// key is a `Value` type dispatch, and doing it twice per member was most of
+/// what this cost on small objects.
+///
+/// Out of line because `value_to_term` recurses up to `MAX_DEPTH` with a frame
+/// already sized for two 64-entry term arrays; this runs after that recursion
+/// unwinds, so its scratch is live at one depth at a time.
+///
+/// Records the permutation it applied into `applied`, so a caller that falls
+/// back can restore document order without converting the object again.
+#[inline(never)]
+fn reorder_object(
+    key_strs: &[&str],
+    keys: &mut [ERL_NIF_TERM],
+    vals: &mut [ERL_NIF_TERM],
+    applied: &mut Option<[u8; FLATMAP_LIMIT]>,
+) {
+    let n = keys.len();
+    debug_assert_eq!(key_strs.len(), n);
+    if !(MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&n) {
+        return;
+    }
+    let mut prefixes: [MaybeUninit<u64>; FLATMAP_LIMIT] = [MaybeUninit::uninit(); FLATMAP_LIMIT];
+    for (prefix, key) in prefixes[..n].iter_mut().zip(key_strs.iter()) {
+        prefix.write(prefix_be(key.as_bytes()));
+    }
+    // SAFETY: every prefix below `n` was initialized above.
+    let prefixes = unsafe { std::slice::from_raw_parts(prefixes.as_ptr().cast(), n) };
+    let key_at = |i: usize| key_strs[i];
+    order_members(
+        prefixes,
+        |a, b| key_at(a) < key_at(b),
+        |perm| {
+            let mut sorted_k: [MaybeUninit<ERL_NIF_TERM>; FLATMAP_LIMIT] =
+                [MaybeUninit::uninit(); FLATMAP_LIMIT];
+            let mut sorted_v: [MaybeUninit<ERL_NIF_TERM>; FLATMAP_LIMIT] =
+                [MaybeUninit::uninit(); FLATMAP_LIMIT];
+            for (i, &member) in perm.iter().enumerate() {
+                let s = member as usize;
+                sorted_k[i].write(keys[s]);
+                sorted_v[i].write(vals[s]);
+            }
+            for i in 0..n {
+                // SAFETY: both scratch arrays are initialized through `n`.
+                keys[i] = unsafe { sorted_k[i].assume_init() };
+                vals[i] = unsafe { sorted_v[i].assume_init() };
+            }
+
+            let mut order = [0u8; FLATMAP_LIMIT];
+            order[..n].copy_from_slice(perm);
+            *applied = Some(order);
+        },
+    );
+}
+
+/// Inserts in document order so duplicate keys keep their last value. `order`
+/// maps sorted positions back to source members when pre-sorting ran.
+#[cold]
+fn dedup_built<'a>(
+    env: Env<'a>,
+    keys: &[ERL_NIF_TERM],
+    vals: &[ERL_NIF_TERM],
+    order: Option<[u8; FLATMAP_LIMIT]>,
+) -> Option<Term<'a>> {
+    let n = keys.len();
+    let mut source = [0u8; FLATMAP_LIMIT];
+    let source: &[u8] = match order {
+        Some(order) => {
+            debug_assert!(n <= FLATMAP_LIMIT);
+            for (position, &member) in order[..n].iter().enumerate() {
+                source[member as usize] = position as u8;
+            }
+            &source[..n]
+        }
+        None => &[],
+    };
+
+    unsafe {
+        let mut map = enif_make_new_map(env.as_c_arg());
+        for member in 0..n {
+            let i = if source.is_empty() {
+                member
+            } else {
+                source[member] as usize
+            };
+            let mut new_map: ERL_NIF_TERM = 0;
+            enif_make_map_put(env.as_c_arg(), map, keys[i], vals[i], &mut new_map);
+            map = new_map;
+        }
+        Some(Term::new(env, map))
+    }
 }
 
 /// Convert a sonic-rs Value to an Erlang term.
@@ -111,23 +208,35 @@ pub fn value_to_term<'a>(
                     [MaybeUninit::uninit(); STACK_SIZE];
                 let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
                     [MaybeUninit::uninit(); STACK_SIZE];
+                // Keep raw keys for ordering instead of unpacking each `Value` twice.
+                let mut key_strs: [MaybeUninit<&str>; FLATMAP_LIMIT] =
+                    [MaybeUninit::uninit(); FLATMAP_LIMIT];
+                let orderable = (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&count);
                 for (i, (k, v)) in obj.iter().enumerate() {
+                    if orderable {
+                        key_strs[i].write(k);
+                    }
                     keys[i].write(make_binary_term(env, k).as_c_arg());
                     vals[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
-                let mut map: ERL_NIF_TERM = 0;
+                let mut applied = None;
+                // SAFETY: keys and values are initialized through `count`; key strings
+                // are also initialized through `count` when `orderable` is true.
                 unsafe {
-                    if enif_make_map_from_arrays(
-                        env.as_c_arg(),
-                        keys.as_ptr() as *const ERL_NIF_TERM,
-                        vals.as_ptr() as *const ERL_NIF_TERM,
-                        count,
-                        &mut map,
-                    ) != 0
-                    {
+                    let (keys, vals) = (
+                        std::slice::from_raw_parts_mut(keys.as_mut_ptr().cast(), count),
+                        std::slice::from_raw_parts_mut(vals.as_mut_ptr().cast(), count),
+                    );
+                    if orderable {
+                        let key_strs = std::slice::from_raw_parts(key_strs.as_ptr().cast(), count);
+                        reorder_object(key_strs, keys, vals, &mut applied);
+                    }
+
+                    let mut map: ERL_NIF_TERM = 0;
+                    if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
                         Some(Term::new(env, map))
                     } else {
-                        build_map_dedup(env, obj, child_depth, nodes)
+                        dedup_built(env, keys, vals, applied)
                     }
                 }
             } else {
@@ -139,43 +248,14 @@ pub fn value_to_term<'a>(
                 }
                 let mut map: ERL_NIF_TERM = 0;
                 unsafe {
-                    if enif_make_map_from_arrays(
-                        env.as_c_arg(),
-                        keys.as_ptr(),
-                        vals.as_ptr(),
-                        count,
-                        &mut map,
-                    ) != 0
-                    {
+                    if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
                         Some(Term::new(env, map))
                     } else {
-                        build_map_dedup(env, obj, child_depth, nodes)
+                        // Only flatmaps are reordered, so these remain in document order.
+                        dedup_built(env, &keys, &vals, None)
                     }
                 }
             }
         }
-    }
-}
-
-/// Fallback for objects with duplicate keys. Iterates all pairs so that the
-/// last value for each duplicate key wins, matching common JSON parser behaviour.
-/// Marked `#[cold]` so the optimiser keeps the duplicate-free fast path hot.
-#[cold]
-fn build_map_dedup<'a>(
-    env: Env<'a>,
-    obj: &sonic_rs::Object,
-    depth: u32,
-    nodes: &mut usize,
-) -> Option<Term<'a>> {
-    unsafe {
-        let mut map = enif_make_new_map(env.as_c_arg());
-        for (k, v) in obj.iter() {
-            let key = make_binary_term(env, k).as_c_arg();
-            let val = value_to_term(env, v, depth, nodes)?.as_c_arg();
-            let mut new_map: ERL_NIF_TERM = 0;
-            enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
-            map = new_map;
-        }
-        Some(Term::new(env, map))
     }
 }

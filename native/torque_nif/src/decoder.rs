@@ -93,9 +93,10 @@ impl TermAcc {
 
 /// Looks up `key` in an object.
 ///
-/// When `unique_keys` is true, uses sonic-rs's internal index (fast).
-/// Otherwise, does a reverse linear scan so that the last value wins,
-/// matching the duplicate-key behaviour of `value_to_term` / `build_map_dedup`.
+/// sonic-rs stores objects as a flat pair slice with no index, so both arms
+/// scan. With `unique_keys` its own `get` scans forward and stops at the first
+/// match; otherwise this scans backward so the last value wins, matching the
+/// duplicate-key behaviour of `value_to_term` / `build_map_dedup`.
 #[inline]
 fn object_get<'v>(
     value: &'v sonic_rs::Value,

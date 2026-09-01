@@ -613,6 +613,71 @@ defmodule Torque.PropertyTest do
       end
     end
 
+    # The generators above hand Elixir maps to Jason, so their keys reach the
+    # decoder already in term order — the one order needing no work. These build
+    # the object text directly from a generated member order, so the sort, the
+    # shape memo and the duplicate fallback are reachable. Each member carries
+    # the text to emit and the key it decodes to, which differ under escapes.
+    defp ordering_member do
+      one_of([
+        map(string(:alphanumeric, min_length: 1, max_length: 12), &{&1, &1}),
+        # Share an eight-byte prefix, so only the tie-break orders them
+        # and a memo hit has to re-check the pair.
+        map(string(:alphanumeric, max_length: 4), &{"created_" <> &1, "created_" <> &1}),
+        # Escaped: its bytes live in the parser's scratch buffer, which
+        # disables reordering for its object.
+        map(string(:alphanumeric, max_length: 3), &{"esc\\u0062" <> &1, "escb" <> &1}),
+        # A key holding a NUL, which pads to the same prefix as its truncation.
+        map(string(:alphanumeric, max_length: 3), &{"a\\u0000" <> &1, "a\0" <> &1}),
+        constant({"", ""})
+      ])
+    end
+
+    defp ordering_object do
+      gen all(
+            members <-
+              list_of(tuple({ordering_member(), integer(0..999)}),
+                min_length: 1,
+                max_length: 33
+              )
+          ) do
+        json =
+          "{" <>
+            Enum.map_join(members, ",", fn {{text, _}, v} -> ~s("#{text}":#{v}) end) <>
+            "}"
+
+        # Last value wins, in the order the document lists them.
+        expected =
+          Enum.reduce(members, %{}, fn {{_, key}, v}, acc -> Map.put(acc, key, v) end)
+
+        {json, expected}
+      end
+    end
+
+    property "decode and parse+get agree with source order for any member order" do
+      check all({json, expected} <- ordering_object(), max_runs: 300) do
+        assert Torque.decode!(json) == expected
+
+        {:ok, doc} = Torque.parse(json)
+        assert {:ok, expected} == Torque.get(doc, "")
+      end
+    end
+
+    property "repeated and interleaved shapes decode independently" do
+      check all(
+              objects <- list_of(ordering_object(), min_length: 2, max_length: 5),
+              repeats <- integer(2..4),
+              max_runs: 100
+            ) do
+        # Shapes alternate and repeat, so a memoized permutation meets the
+        # shape after it as well as its own.
+        sequence = objects |> List.duplicate(repeats) |> List.flatten()
+        json = "[" <> Enum.map_join(sequence, ",", fn {j, _} -> j end) <> "]"
+
+        assert Torque.decode!(json) == Enum.map(sequence, fn {_, e} -> e end)
+      end
+    end
+
     test "path without leading slash returns no_such_field" do
       {:ok, doc} = Torque.parse(~s({"a":1}))
       assert {:error, :no_such_field} = Torque.get(doc, "a")
