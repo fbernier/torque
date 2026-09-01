@@ -22,7 +22,6 @@ use std::mem::MaybeUninit;
 use crate::atoms;
 use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
 use crate::nif_util::{make_tuple2, map_from_arrays};
-use crate::types::MAX_DEPTH;
 
 const STACK_SIZE: usize = 64;
 
@@ -223,7 +222,6 @@ struct TermBuilder<'de, 'a, 'b> {
     unsortable: u32,
     /// Running object member count, saved and restored with each frame.
     members: u32,
-    too_deep: bool,
 }
 
 impl<'de, 'a, 'b> TermBuilder<'de, 'a, 'b> {
@@ -541,10 +539,6 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'de, 'a, 'b> {
 
     #[inline]
     fn visit_array_start(&mut self, _hint: usize) -> bool {
-        if self.frames.len() >= MAX_DEPTH as usize {
-            self.too_deep = true;
-            return false;
-        }
         self.frames.push(Frame {
             values: self.values.len(),
             keys: self.key_ords.len() as u32,
@@ -579,10 +573,6 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'de, 'a, 'b> {
 
     #[inline]
     fn visit_object_start(&mut self, _hint: usize) -> bool {
-        if self.frames.len() >= MAX_DEPTH as usize {
-            self.too_deep = true;
-            return false;
-        }
         self.frames.push(Frame {
             values: self.values.len(),
             keys: self.key_ords.len() as u32,
@@ -659,7 +649,6 @@ pub fn decode_to_term<'a>(
             keys,
             unsortable: 0,
             members: 0,
-            too_deep: false,
         };
 
         let result = match sonic_rs::parse_into_visitor(bytes, &mut builder) {
@@ -676,7 +665,7 @@ pub fn decode_to_term<'a>(
             },
             Err(e) => {
                 let scanned = crate::decoder::bytes_scanned(&e, bytes.len());
-                let term = if builder.too_deep {
+                let term = if e.is_recursion_limit() {
                     make_tuple2(
                         env,
                         atoms::error().as_c_arg(),

@@ -1,7 +1,3 @@
-use bumpalo::Bump;
-
-use super::node::RawStr;
-
 pub trait JsonVisitor<'de> {
     fn visit_dom_start(&mut self) -> bool {
         false
@@ -15,17 +11,14 @@ pub trait JsonVisitor<'de> {
         false
     }
 
-    #[allow(dead_code)]
     fn visit_u64(&mut self, _val: u64) -> bool {
         false
     }
 
-    #[allow(dead_code)]
     fn visit_i64(&mut self, _val: i64) -> bool {
         false
     }
 
-    #[allow(dead_code)]
     fn visit_f64(&mut self, _val: f64) -> bool {
         false
     }
@@ -40,12 +33,10 @@ pub trait JsonVisitor<'de> {
         self.visit_f64(as_f64)
     }
 
-    #[allow(dead_code)]
     fn visit_raw_number(&mut self, _val: &str) -> bool {
         false
     }
 
-    #[allow(dead_code)]
     fn visit_borrowed_raw_number(&mut self, _val: &str) -> bool {
         false
     }
@@ -74,9 +65,7 @@ pub trait JsonVisitor<'de> {
         false
     }
 
-    // Torque patch: the visitor-driven parse (`parse_dom2`) delivers object
-    // keys through `visit_key`, so the defaults forward to the string hooks
-    // for visitors that don't care about the distinction.
+    // Object-key hooks default to string hooks for visitors that do not distinguish them.
     #[allow(dead_code)]
     fn visit_key(&mut self, key: &str) -> bool {
         self.visit_str(key)
@@ -87,15 +76,7 @@ pub trait JsonVisitor<'de> {
         self.visit_borrowed_str(key)
     }
 
-    fn visit_raw_str(&mut self, _value: &str, _raw: RawStr) -> bool {
-        false
-    }
-
     fn visit_dom_end(&mut self) -> bool {
         false
-    }
-
-    fn allocator(&mut self) -> Option<&mut Bump> {
-        None
     }
 }

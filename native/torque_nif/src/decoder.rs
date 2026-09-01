@@ -135,25 +135,25 @@ fn array_index(token: &str) -> Option<usize> {
 
 /// Looks up `key` in an object.
 ///
-/// sonic-rs stores objects as a flat pair slice with no index, so both arms
-/// scan. With `unique_keys` its own `get` scans forward and stops at the first
-/// match; otherwise this scans backward so the last value wins, matching the
-/// duplicate-key behaviour of `value_to_term` / `build_map_dedup`.
+/// Parsed objects expose a pair slice, so unique-key lookups scan forward and
+/// ordinary lookups scan backward for the last value. Rust-built objects cannot
+/// contain duplicates and use the regular `Value` lookup.
 #[inline]
 fn object_get<'v>(
     value: &'v sonic_rs::Value,
     key: &str,
     unique_keys: bool,
 ) -> Option<&'v sonic_rs::Value> {
-    if unique_keys {
-        value.get(key)
+    let pairs = match value.as_pair_slice() {
+        Some(pairs) => pairs,
+        None => return value.get(key),
+    };
+    let hit = if unique_keys {
+        pairs.iter().find(|(k, _)| k.as_str() == Some(key))
     } else {
-        value
-            .as_object()?
-            .iter()
-            .rfind(|(k, _)| *k == key)
-            .map(|(_, v)| v)
-    }
+        pairs.iter().rfind(|(k, _)| k.as_str() == Some(key))
+    };
+    hit.map(|(_, v)| v)
 }
 
 #[inline]

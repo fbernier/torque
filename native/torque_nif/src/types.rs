@@ -24,21 +24,10 @@ fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {
     binary.into()
 }
 
-/// Put an object's already-built key/value terms into Erlang term order, so
-/// `enif_make_map_from_arrays` confirms the order in `n - 1` comparisons
-/// instead of insertion-sorting the terms in O(n²) (see [`crate::map_order`]).
-///
-/// `key_strs` are the keys the caller already unpacked to build the key terms.
-/// Taking them rather than reaching into the object again matters: unpacking a
-/// key is a `Value` type dispatch, and doing it twice per member was most of
-/// what this cost on small objects.
-///
-/// Out of line because `value_to_term` recurses up to `MAX_DEPTH` with a frame
-/// already sized for two 64-entry term arrays; this runs after that recursion
-/// unwinds, so its scratch is live at one depth at a time.
-///
-/// Records the permutation it applied into `applied`, so a caller that falls
-/// back can restore document order without converting the object again.
+/// Orders flatmap keys from their raw strings before ERTS sees the built terms.
+/// The applied permutation is retained so duplicate-key fallback can recover
+/// document order. Kept out of line so its scratch arrays do not enlarge the
+/// recursive `value_to_term` frame.
 #[inline(never)]
 fn reorder_object(
     key_strs: &[&str],
@@ -122,6 +111,31 @@ fn dedup_built<'a>(
     }
 }
 
+/// Fallback for Rust-built `Value` objects, which use a hash map rather than a
+/// document pair slice and cannot contain duplicate keys.
+#[cold]
+fn object_from_map<'a>(
+    env: Env<'a>,
+    value: &sonic_rs::Value,
+    depth: u32,
+    nodes: &mut usize,
+) -> Option<Term<'a>> {
+    let obj = value.as_object()?;
+    let child_depth = depth - 1;
+    *nodes += 2 * obj.len();
+    unsafe {
+        let mut map = enif_make_new_map(env.as_c_arg());
+        for (k, v) in obj.iter() {
+            let key = make_binary_term(env, k).as_c_arg();
+            let val = value_to_term(env, v, child_depth, nodes)?.as_c_arg();
+            let mut new_map: ERL_NIF_TERM = 0;
+            enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
+            map = new_map;
+        }
+        Some(Term::new(env, map))
+    }
+}
+
 /// Convert a sonic-rs Value to an Erlang term.
 ///
 /// `depth` is the remaining nesting budget; returns `None` when it reaches zero
@@ -162,7 +176,7 @@ pub fn value_to_term<'a>(
             if depth == 0 {
                 return None;
             }
-            let arr: &sonic_rs::Array = value.as_array().unwrap();
+            let arr = value.as_value_slice().unwrap_or(&[]);
             let count = arr.len();
             let child_depth = depth - 1;
             *nodes += count;
@@ -199,8 +213,11 @@ pub fn value_to_term<'a>(
             if depth == 0 {
                 return None;
             }
-            let obj: &sonic_rs::Object = value.as_object().unwrap();
-            let count = obj.len();
+            let pairs = match value.as_pair_slice() {
+                Some(pairs) => pairs,
+                None => return object_from_map(env, value, depth, nodes),
+            };
+            let count = pairs.len();
             let child_depth = depth - 1;
             *nodes += 2 * count;
             if count <= STACK_SIZE {
@@ -212,11 +229,12 @@ pub fn value_to_term<'a>(
                 let mut key_strs: [MaybeUninit<&str>; FLATMAP_LIMIT] =
                     [MaybeUninit::uninit(); FLATMAP_LIMIT];
                 let orderable = (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&count);
-                for (i, (k, v)) in obj.iter().enumerate() {
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    let key = k.as_str().unwrap_or("");
                     if orderable {
-                        key_strs[i].write(k);
+                        key_strs[i].write(key);
                     }
-                    keys[i].write(make_binary_term(env, k).as_c_arg());
+                    keys[i].write(make_binary_term(env, key).as_c_arg());
                     vals[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 let mut applied = None;
@@ -242,8 +260,8 @@ pub fn value_to_term<'a>(
             } else {
                 let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
-                for (k, v) in obj.iter() {
-                    keys.push(make_binary_term(env, k).as_c_arg());
+                for (k, v) in pairs.iter() {
+                    keys.push(make_binary_term(env, k.as_str().unwrap_or("")).as_c_arg());
                     vals.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 let mut map: ERL_NIF_TERM = 0;

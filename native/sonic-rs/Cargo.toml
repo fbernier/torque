@@ -1,17 +1,22 @@
-# Vendored copy of sonic-rs 0.3.17 with a minimal Torque patch:
-#   * `JsonVisitor` and `RawStr` made public + re-exported
+# Vendored sonic-rs 0.5.8 with Torque-specific changes:
+#   * public `JsonVisitor` exports
 #   * `parse_into_visitor` entry added, so Torque can build Erlang terms
 #     directly during the native SIMD parse (one pass, zero-copy strings)
 #     instead of going through the slower serde path
-#   * a recursion-depth limit added to the DOM parser so deeply nested input
-#     returns an error instead of overflowing the stack and crashing the VM
+#   * a shared nesting limit for DOM and visitor parsing that returns an error
+#     before stack exhaustion
 #   * a `JsonVisitor::visit_overflow_int` hook: integer-shaped tokens that
 #     overflow i64/u64 are routed to it with the raw digits (default falls
 #     back to f64), so Torque can build exact Erlang bignums during decode
 #   * key-specific visitor hooks with backward-compatible string defaults
-#   * one document-size check shared by DOM and visitor entry points
+#   * one document-size check shared by serde and visitor entry points
 #   * structured recursion-limit detection for callers
-# Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0)
+#   * direct object and array slice accessors for parsed documents
+#   * `Read` caches the pinned input's slice pointer instead of resolving it
+#     through the `PinnedInput` enum on every `peek`/`at`/`eat`/`remain`
+# Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0), tag v0.5.8,
+# commit e339451e37a8f2d3f9b93f155985d31fcbcb115a. Diff against that commit to
+# inspect the Torque patches.
 #
 # Upstream disables clippy for this crate. Tests cover Torque-owned patches
 # because the linter cannot report on them.
@@ -22,7 +27,7 @@
 [package]
 edition = "2021"
 name = "sonic-rs"
-version = "0.3.17"
+version = "0.5.8"
 authors = ["Volo Team <volo@cloudwego.io>"]
 build = false
 autobins = false
@@ -38,22 +43,25 @@ name = "sonic_rs"
 path = "src/lib.rs"
 
 [dependencies]
-bumpalo = "3.13"
-bytes = "1.9"
+ahash = "0.8"
+bumpalo = "3.19"
+bytes = "1.10"
 cfg-if = "1.0"
 faststr = { version = "0.2", features = ["serde"] }
 itoa = "1.0"
 ref-cast = "1.0"
-ryu = "1.0"
 serde = { version = "1.0", features = ["rc", "derive"] }
 simdutf8 = "0.1"
 sonic-number = "0.1"
 sonic-simd = "0.1"
 thiserror = "2.0"
+zmij = "1.0"
 
 [features]
 arbitrary_precision = []
+avx512 = ["sonic-simd/avx512"]
 default = []
+non_trailing_zero = []
+sanitize = []
 sort_keys = []
-use_raw = []
 utf8_lossy = []
