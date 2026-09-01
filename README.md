@@ -60,7 +60,8 @@ data = Torque.decode!(json)
 
 ### Selective Field Extraction
 
-Parse once, extract many fields without building the full Elixir term tree:
+Parse once, then query that document as often as you like — without building
+the full Elixir term tree:
 
 ```elixir
 {:ok, doc} = Torque.parse(json)
@@ -68,13 +69,20 @@ Parse once, extract many fields without building the full Elixir term tree:
 {:ok, "example.com"} = Torque.get(doc, "/site/domain")
 nil = Torque.get(doc, "/missing/field", nil)
 
-# Batch extraction (single NIF call, fastest path)
+# Batch extraction — one NIF call for any number of paths
 results = Torque.get_many(doc, ["/id", "/site/domain", "/device/ip"])
 # [{:ok, "req-1"}, {:ok, "example.com"}, {:ok, "1.2.3.4"}]
 ```
 
+The handle is what makes this worthwhile: `parse/2` builds the document so that
+later lookups are cheap. If you are extracting from a payload **once** and then
+discarding it, use [compiled pointers](#compiled-pointers) instead — they skip
+the parts no path selects rather than building a document you are about to
+throw away, which measures ~2× on a 440 KB payload.
+
 When your JSON is known to have no duplicate object keys, pass `unique_keys: true`
-for faster field lookups (uses sonic-rs internal indexing instead of linear scan):
+for faster field lookups (a lookup then stops at the first match instead of
+scanning the whole object for a later one):
 
 ```elixir
 {:ok, doc} = Torque.parse(json, unique_keys: true)
@@ -83,12 +91,16 @@ for faster field lookups (uses sonic-rs internal indexing instead of linear scan
 ### Compiled Pointers
 
 When the same fixed set of paths is extracted from every document, compile the
-pointers once and reuse the handle. `parse_get_many_nil/2` then fuses the parse
-and extraction into a single NIF call, skipping all per-request path parsing —
-roughly 1.5× faster end-to-end than `parse/2` + `get_many_nil/2`.
+pointers once and reuse the handle. `parse_get_many_nil/2` then reads the
+document in a single pass, building values only where a path ends and skipping
+everything else — so its cost tracks the document's size rather than its
+contents. On a 440 KB feed with three paths that is ~2.3× the throughput of the
+full parse it replaces, and ~6× with `validate: false` (below); on a 500-byte
+request it is ~1.9× `parse/2` + `get_many_nil/2`.
 
 ```elixir
-# Once, at startup (e.g. a module attribute or :persistent_term):
+# Once, at startup (e.g. :persistent_term — the handle is a resource
+# reference, so it cannot live in a module attribute):
 pointers = Torque.compile_pointers(["/id", "/site/domain", "/imp/0/banner/w"], unique_keys: true)
 
 # Per document — parse + extract in one call:
@@ -97,6 +109,19 @@ pointers = Torque.compile_pointers(["/id", "/site/domain", "/imp/0/banner/w"], u
 
 Missing fields and JSON `null` both become `nil`. The handle also works with an
 already-parsed document via `Torque.get_many_nil(doc, pointers)`.
+
+By default a malformed document is reported wherever the fault is, exactly as
+`parse/2` reports it, even when the fault sits in a region no path selects.
+`validate: false` gives that up: unselected regions are scanned with the SIMD
+container scanner instead of being parsed, which is several times cheaper per
+skipped byte, and a malformed number, string or separator inside one of them
+goes unreported. UTF-8 is still checked over every byte the walk consumes, and
+selected values are parsed either way, so what comes back is still
+well-formed — use it only for input you already trust.
+
+```elixir
+pointers = Torque.compile_pointers(paths, unique_keys: true, validate: false)
+```
 
 ### Encoding
 

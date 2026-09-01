@@ -1424,7 +1424,7 @@ impl Value {
         let slice = PaddedSliceRead::new(buffer.as_mut_slice(), json);
         let mut parser = Parser::new(slice).with_config(cfg);
         let mut vis = DocumentVisitor::new(json.len(), smut);
-        parser.parse_dom(&mut vis, None)?;
+        parser.parse_dom(&mut vis, None, 0)?;
         let idx = parser.read.index();
 
         // NOTE: root node should is the first node
@@ -1433,16 +1433,18 @@ impl Value {
         Ok(idx)
     }
 
+    /// `depth` continues the caller's nesting budget when parsing a subtree.
     #[inline(never)]
     pub(crate) fn parse_without_padding<'de, R: Reader<'de>>(
         &mut self,
         shared: &mut Shared,
         strbuf: &mut Vec<u8>,
         parser: &mut Parser<R>,
+        depth: usize,
     ) -> Result<()> {
         let remain_len = parser.read.remain();
         let mut vis = DocumentVisitor::new(remain_len, shared);
-        parser.parse_dom(&mut vis, Some(strbuf))?;
+        parser.parse_dom(&mut vis, Some(strbuf), depth)?;
         *self = unsafe { vis.root.as_ref().clone() };
         Ok(())
     }

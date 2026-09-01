@@ -12,6 +12,7 @@ mod pointer;
 pub mod reader;
 mod util;
 
+pub mod extract;
 pub mod format;
 pub mod lazyvalue;
 pub mod parser;
@@ -85,7 +86,7 @@ where
     let mut strbuf = Vec::new();
     // `Some` preserves the input and uses scratch space only for escaped strings.
     // `None` unescapes in place and requires a padded, mutable buffer.
-    parser.parse_dom(visitor, Some(&mut strbuf))?;
+    parser.parse_dom(visitor, Some(&mut strbuf), 0)?;
     parser.parse_trailing()?;
     parser.read.check_utf8_final()
 }

@@ -5,3 +5,4 @@
 /priv/native/
 **/target/
 erl_crash.dump
+/native/sonic-rs/Cargo.lock
