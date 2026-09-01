@@ -1,5 +1,9 @@
-use rustler::sys::{enif_make_tuple_from_array, ERL_NIF_TERM};
+use rustler::sys::{
+    enif_get_map_size, enif_make_map_from_arrays, enif_make_tuple_from_array, ERL_NIF_TERM,
+};
 use rustler::{Env, Term};
+
+use crate::map_order::FLATMAP_LIMIT;
 
 /// Build a 2-tuple from two raw NIF terms.
 #[inline]
@@ -22,4 +26,31 @@ pub const REDUCTION_COUNT: usize = 4000;
 pub fn timeslice_percent(bytes: usize) -> i32 {
     let reds = bytes / BYTES_PER_REDUCTION;
     ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
+}
+
+/// Build a map from key and value arrays.
+///
+/// Returns false if ERTS rejected the members or if duplicate keys collapsed
+/// the map size (handling OTP bug erlang/otp#10975 for large maps).
+///
+/// # Safety
+///
+/// `keys` and `vals` must point to `count` initialized terms, and `map` to a
+/// writable term.
+#[inline]
+pub unsafe fn map_from_arrays(
+    env: Env,
+    keys: *const ERL_NIF_TERM,
+    vals: *const ERL_NIF_TERM,
+    count: usize,
+    map: *mut ERL_NIF_TERM,
+) -> bool {
+    if enif_make_map_from_arrays(env.as_c_arg(), keys, vals, count, map) == 0 {
+        return false;
+    }
+    if count <= FLATMAP_LIMIT {
+        return true;
+    }
+    let mut size = 0;
+    enif_get_map_size(env.as_c_arg(), *map, &mut size) != 0 && size == count
 }

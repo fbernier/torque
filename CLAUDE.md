@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 TORQUE_BUILD=true mix deps.get     # fetch deps + force local Rust build
 TORQUE_BUILD=true mix compile      # build (includes Rust NIF compilation)
-TORQUE_BUILD=true mix test         # run all tests
+TORQUE_BUILD=true mix test         # functional tests
+TORQUE_BUILD=true mix test --include perf   # full suite, including :perf
 mix test test/pointer_test.exs:42  # run single test by line number
 mix compile --warnings-as-errors   # build with strict warnings
 mix format                         # format Elixir code
@@ -100,6 +101,49 @@ Torque is a high-performance JSON library for Elixir using Rustler NIFs backed b
 
 3. **Full decode** — `decode/1` builds Erlang terms directly during the SIMD parse by implementing sonic-rs's native `JsonVisitor` (`native_decode.rs`): single pass, no intermediate `Value`, zero-copy sub-binaries for unescaped strings, and a per-call key cache that decodes a key repeated across objects (the common array-of-records shape) to one shared term (median −3–4%, p99 −16%, decoded-term heap −37% on record-shaped payloads).
 
+### Map Key Ordering
+
+`enif_make_map_from_arrays` hands small maps to ERTS's
+`erts_validate_and_sort_flatmap`, an insertion sort whose comparator is a full
+generic term comparison. Keys arriving in Erlang term order cost it `n - 1`
+comparisons; any other order costs O(n²). Only the BEAM iterates maps in term
+order, so only BEAM-encoded JSON gets the cheap path — every other producer
+emits its schema's field order, which on a record array was 68% of decode time.
+
+`map_order.rs` orders each object's members first, comparing the raw key bytes
+the parser already holds instead of built terms, and memoizes the permutation
+per object shape so an array of records does not re-derive it per element.
+Shared by the decoder (`native_decode.rs`) and `value_to_term` (`types.rs`). On
+the 776 KB fixture: schema order −13.1%, reversed −30.6%, term-ordered JSON
++2-3%, key-order sensitivity 1.19×/1.52× → 1.01×/1.03×; the same records
+through `get/2` −4.3% and −16.5%. That fixture's dominant object has 40 members,
+making it an ERTS hashmap that none of this reaches; on the shape-variety
+group's record array it is −68%.
+
+The two callers cross over at different sizes — `value_to_term` holds `Value`s
+and unpacks every key to reach the bytes the decoder already has, so its fixed
+cost per object is about double — and a second, higher threshold for it was
+measured and rejected: on 7-member records it bought 6% on term-ordered input
+by giving up 12% on schema-ordered input, the order this exists to fix. What
+`reorder_object` does instead is take the keys its caller has already unpacked,
+which is free for every order. Term-ordered input still pays the scan and saves
+nothing, and on this path that is 6-7% rather than the decoder's 2-3%.
+
+This is correctness-neutral — ERTS sorts whatever it is handed — so the ways it
+can silently switch itself off are pinned by regression tests in
+`test/decode_order_perf_test.exs` and `map_order.rs`. Read those and the
+module's doc comments before changing it.
+
+Keep all four key-order benchmark groups. "Decode — object key order" varies
+member order, since every other payload in that file is `Jason.encode!` output
+and only exercises the free case. "Decode — object shape variety" varies how
+many distinct shapes a document cycles through, which is what the memo is keyed
+on. "Decode — member count sweep" and "Extract — member count sweep" are where
+the threshold comes from, the second sweeping key style as well because keys
+that share a prefix make ERTS's comparator work harder and shift the
+crossover. "Extract subtree — object key order" runs the same orders through
+`value_to_term`, the other caller, which no other group reaches.
+
 ### Encoding
 
 `encode/1` walks Elixir terms directly (no intermediate representation) and writes JSON bytes to a buffer. Supports maps (atom/binary/integer keys — integer keys are stringified, since JSON object names must be strings), lists, numbers, booleans, nil, and jiffy-style `{proplist}` tuples.
@@ -127,6 +171,7 @@ Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU 
 - `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` + `CompiledPaths` (`PathSeg`) resources
 - `native/torque_nif/src/decoder.rs` — parse, get, get_many, get_many_nil, decode NIFs; compiled-pointer + fused `parse_get_many_nil` path
 - `native/torque_nif/src/native_decode.rs` — fused decoder; builds terms during the SIMD parse via sonic-rs's `JsonVisitor`
+- `native/torque_nif/src/map_order.rs` — Erlang term ordering for object keys, shared by the decoder and `value_to_term`
 - `native/torque_nif/src/encoder.rs` — direct term-walking JSON encoder
 - `native/torque_nif/src/types.rs` — sonic_rs Value → Erlang term conversion (used by get/get_many)
 - `native/torque_nif/src/atoms.rs` — cached atoms (ok, error, nil, no_such_field, nesting_too_deep, unsupported_type, non_finite_float, invalid_key, malformed_proplist, invalid_utf8)

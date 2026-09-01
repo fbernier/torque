@@ -29,7 +29,8 @@ jobs:
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
   test:
     name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
@@ -37,12 +38,19 @@ jobs:
     strategy:
       matrix:
         include:
+          # Every pair must exist in setup-beam's compatibility table. The
+          # newest row also exercises current ERTS flatmap behavior.
+          - otp: "29"
+            elixir: "1.20"
           - otp: "28"
-            elixir: "1.18"
+            elixir: "1.19"
           - otp: "27"
             elixir: "1.18"
           - otp: "26"
             elixir: "1.17"
+          # Oldest Elixir version declared by the package.
+          - otp: "26"
+            elixir: "1.15"
     steps:
       - uses: actions/checkout@v6
 
@@ -56,3 +64,68 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
+
+  # Run unsafe pointer-range and unaligned prefix-load paths on the same arm64
+  # architecture used for release artifacts, not only through cross-compilation.
+  arm64:
+    name: Test (arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: mix deps.get
+      # Rust unit tests directly cover the architecture-sensitive prefix loads.
+      - run: cargo test --workspace
+      - run: mix test
+        env:
+          TORQUE_BUILD: "true"
+
+  # Wall-clock regressions run separately from the functional matrix.
+  #
+  # Pin the legacy job before the OTP fix for erlang/otp#10975 so it exercises
+  # the large-map duplicate-key workaround. Retire this row with the workaround.
+  legacy_otp:
+    name: Test (OTP 28.4.3, before erlang/otp#10976)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28.4.3"
+          elixir-version: "1.19"
+          version-type: strict
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: mix deps.get
+      - run: mix test
+        env:
+          TORQUE_BUILD: "true"
+
+  # Run key-order throughput checks on current ERTS; functional tests cannot
+  # observe this correctness-neutral optimization.
+  perf:
+    name: Key-order timing regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: mix deps.get
+      - run: mix test --only perf
+        env:
+          TORQUE_BUILD: "true"

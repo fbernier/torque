@@ -10,8 +10,8 @@
 //! result. After a successful parse the stack holds exactly the root term.
 
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_from_arrays,
-    enif_make_map_put, enif_make_new_map, enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
+    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_put,
+    enif_make_new_map, enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
@@ -19,7 +19,8 @@ use std::cell::RefCell;
 use std::mem::MaybeUninit;
 
 use crate::atoms;
-use crate::nif_util::make_tuple2;
+use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
+use crate::nif_util::{make_tuple2, map_from_arrays};
 use crate::types::MAX_DEPTH;
 
 const STACK_SIZE: usize = 64;
@@ -28,6 +29,9 @@ const STACK_SIZE: usize = 64;
 /// so a one-off huge document doesn't pin a large allocation on a scheduler
 /// thread indefinitely. Mirrors the encoder's `BUF_RETAIN_CAP`.
 const VALUES_RETAIN_CAP: usize = 1 << 17;
+
+/// Equivalent retention cap for key-order entries.
+const KEY_ORDS_RETAIN_CAP: usize = VALUES_RETAIN_CAP / 2;
 
 const KEY_CACHE_SLOTS: usize = 256;
 /// Longest key eligible for caching; bounds the byte-compare on lookup.
@@ -101,21 +105,57 @@ impl KeyCache {
     }
 }
 
+/// Sort metadata captured while an object key still points into the input.
+/// Escaped keys use parser scratch space and disable pre-sorting for that object.
+/// Metadata stops at `FLATMAP_LIMIT`, where ERTS switches to hash maps.
+#[derive(Clone, Copy)]
+struct KeyOrd {
+    prefix: u64,
+    off: u32,
+    len: u32,
+}
+
+impl KeyOrd {
+    /// Placeholder for a key whose bytes cannot be borrowed from the input.
+    const UNSORTABLE: KeyOrd = KeyOrd {
+        prefix: 0,
+        off: 0,
+        len: 0,
+    };
+
+    /// Full comparison for keys with the same prefix.
+    #[cold]
+    #[inline(never)]
+    fn slow_lt(&self, other: &KeyOrd, base: *const u8) -> bool {
+        unsafe {
+            std::slice::from_raw_parts(base.add(self.off as usize), self.len as usize)
+                < std::slice::from_raw_parts(base.add(other.off as usize), other.len as usize)
+        }
+    }
+}
+
+/// Saved stack positions and ordering state for an open container.
+#[derive(Clone, Copy)]
+struct Frame {
+    values: usize,
+    keys: u32,
+    unsortable: u32,
+    members: u32,
+}
+
 struct DecodeBufs {
     values: Vec<ERL_NIF_TERM>,
-    frames: Vec<usize>,
+    frames: Vec<Frame>,
+    key_ords: Vec<KeyOrd>,
     keys: KeyCache,
 }
 
 thread_local! {
-    /// Reused across decode calls on each scheduler thread, avoiding two heap
-    /// allocations (the value and frame stacks) per call — the dominant
-    /// per-call cost for small payloads. NIFs run to completion without
-    /// preemption and decode never re-enters this NIF, so the borrow is never
-    /// nested.
+    /// Scratch buffers reused by each scheduler thread.
     static DECODE_BUFS: RefCell<DecodeBufs> = RefCell::new(DecodeBufs {
         values: Vec::with_capacity(64),
         frames: Vec::with_capacity(16),
+        key_ords: Vec::with_capacity(32),
         keys: KeyCache::new(),
     });
 }
@@ -124,6 +164,47 @@ struct InputRef {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
+    /// Bound for a key the decoder wants to borrow: the input length, or 0 for
+    /// an input too large to address with `KeyOrd`'s u32 offsets (sonic-rs
+    /// rejects >2 GB, so that never happens).
+    borrow_limit: usize,
+    /// Exclusive upper bound for offsets with eight readable input bytes.
+    wide_limit: usize,
+}
+
+impl InputRef {
+    /// Offset of `s` when its entire span lies within `limit`.
+    #[inline]
+    fn offset_within(&self, s: &str, limit: usize) -> Option<usize> {
+        let offset = (s.as_ptr() as usize).checked_sub(self.base as usize)?;
+        let room = limit.checked_sub(offset)?;
+        (s.len() <= room).then_some(offset)
+    }
+}
+
+/// Zero-padded key prefix used by the cache and key ordering.
+///
+/// # Safety
+///
+/// `ptr` must cover `len` bytes, and eight bytes when `wide` is true.
+#[inline]
+unsafe fn key_prefix_le(ptr: *const u8, len: usize, wide: bool) -> u64 {
+    if !wide {
+        return tail_prefix_le(std::slice::from_raw_parts(ptr, len));
+    }
+    let eight = u64::from_le_bytes(ptr.cast::<[u8; 8]>().read_unaligned());
+    if len < 8 {
+        eight & ((1u64 << (len * 8)) - 1)
+    } else {
+        eight
+    }
+}
+
+/// Handles keys too close to the input end for a wide read.
+#[cold]
+#[inline(never)]
+fn tail_prefix_le(bytes: &[u8]) -> u64 {
+    prefix_be(bytes).swap_bytes()
 }
 
 struct TermBuilder<'a, 'b> {
@@ -132,9 +213,15 @@ struct TermBuilder<'a, 'b> {
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
     values: &'b mut Vec<ERL_NIF_TERM>,
-    /// `values` index where each currently-open container's children begin.
-    frames: &'b mut Vec<usize>,
+    /// Start of each open container in `values`.
+    frames: &'b mut Vec<Frame>,
+    /// Sort metadata for open object members.
+    key_ords: &'b mut Vec<KeyOrd>,
     keys: &'b mut KeyCache,
+    /// Running unsortable-key count, saved and restored with each frame.
+    unsortable: u32,
+    /// Running object member count, saved and restored with each frame.
+    members: u32,
     too_deep: bool,
 }
 
@@ -148,15 +235,10 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     /// (escaped strings are unescaped into the parser's scratch buffer).
     #[inline]
     fn str_term(&self, s: &str) -> ERL_NIF_TERM {
-        let ptr = s.as_ptr();
-        if ptr >= self.input.base {
-            let offset = unsafe { ptr.offset_from(self.input.base) } as usize;
-            let len = s.len();
-            if offset + len <= self.input.len {
-                return unsafe {
-                    enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, len)
-                };
-            }
+        if let Some(offset) = self.input.offset_within(s, self.input.len) {
+            return unsafe {
+                enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
+            };
         }
         let mut binary = NewBinary::new(self.env, s.len());
         binary.as_mut_slice().copy_from_slice(s.as_bytes());
@@ -164,32 +246,41 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         term.as_c_arg()
     }
 
-    /// Term for an object key, memoized in the per-call key cache.
-    ///
-    /// Only borrowed keys qualify: an escaped key's bytes live in the parser's
-    /// scratch buffer, which later strings overwrite, so its pointer can't be
-    /// used as a cache identity. Those (rare) keys fall back to `str_term`.
-    /// The `len.max(8)` bound keeps the unaligned prefix load in-bounds; a key
-    /// inside the final 8 bytes of the document (impossible in valid JSON,
-    /// which needs at least `":x}` after it) just falls back.
+    /// Builds an object-key term and records its sort order when possible.
+    /// Escaped keys bypass the cache and disable pre-sorting for their object.
     #[inline]
     fn key_term(&mut self, s: &str) -> ERL_NIF_TERM {
         let ptr = s.as_ptr();
         let len = s.len();
-        if self.keys.debit > KEY_CACHE_BYPASS_AT
-            || len == 0
-            || len > KEY_CACHE_MAX_LEN
-            || ptr < self.input.base
+        let mut prefix = 0u64;
+        let mut offset = 0usize;
+        let mut borrowed = false;
+        if let Some(at) = self.input.offset_within(s, self.input.borrow_limit) {
+            offset = at;
+            borrowed = true;
+            // SAFETY: the key is in the input, and `wide_limit` proves whether
+            // eight bytes are readable from this offset.
+            prefix = unsafe { key_prefix_le(ptr, len, offset < self.input.wide_limit) };
+        }
+
+        // ERTS hash maps do not benefit from term-order metadata.
+        self.members += 1;
+        if self.members <= FLATMAP_LIMIT as u32 {
+            if borrowed {
+                self.key_ords.push(KeyOrd {
+                    prefix: prefix.swap_bytes(),
+                    off: offset as u32,
+                    len: len as u32,
+                });
+            } else {
+                self.unsortable += 1;
+                self.key_ords.push(KeyOrd::UNSORTABLE);
+            }
+        }
+
+        if !borrowed || len == 0 || len > KEY_CACHE_MAX_LEN || self.keys.debit > KEY_CACHE_BYPASS_AT
         {
             return self.str_term(s);
-        }
-        let offset = unsafe { ptr.offset_from(self.input.base) } as usize;
-        if offset + len.max(8) > self.input.len {
-            return self.str_term(s);
-        }
-        let mut prefix = unsafe { (ptr as *const u64).read_unaligned() };
-        if len < 8 {
-            prefix &= (1u64 << (len * 8)) - 1;
         }
         let h = (prefix ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
@@ -221,60 +312,90 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     }
 }
 
-/// Build a map term from interleaved `[k0, v0, k1, v1, ...]` children.
-/// De-interleaves into separate key/value arrays for `enif_make_map_from_arrays`.
+/// De-interleaves object children and pre-sorts eligible flatmap keys.
 #[inline]
-fn build_map(env: Env, kv: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+fn build_map(env: Env, kv: &[ERL_NIF_TERM], ords: &[KeyOrd], base: *const u8) -> ERL_NIF_TERM {
     let pairs = kv.len() / 2;
-    if pairs <= STACK_SIZE {
-        let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
-        let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
-        for i in 0..pairs {
-            keys[i].write(kv[2 * i]);
-            vals[i].write(kv[2 * i + 1]);
-        }
-        // SAFETY: keys[..pairs]/vals[..pairs] were just written.
-        unsafe {
-            make_map(
-                env,
-                std::slice::from_raw_parts(keys.as_ptr() as *const ERL_NIF_TERM, pairs),
-                std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, pairs),
-            )
-        }
-    } else {
+    if pairs > STACK_SIZE {
         let mut keys = Vec::with_capacity(pairs);
         let mut vals = Vec::with_capacity(pairs);
         for i in 0..pairs {
             keys.push(kv[2 * i]);
             vals.push(kv[2 * i + 1]);
         }
-        make_map(env, &keys, &vals)
+        return make_map(env, &keys, &vals, kv);
+    }
+
+    let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
+    let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
+    let mut prefixes: [MaybeUninit<u64>; FLATMAP_LIMIT] = [MaybeUninit::uninit(); FLATMAP_LIMIT];
+    let permuted =
+        ords.len() == pairs && (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&pairs) && {
+            for (slot, o) in prefixes[..pairs].iter_mut().zip(ords) {
+                slot.write(o.prefix);
+            }
+            // SAFETY: prefixes[..pairs] was initialized above.
+            let prefixes = unsafe { std::slice::from_raw_parts(prefixes.as_ptr().cast(), pairs) };
+            order_members(
+                prefixes,
+                |a, b| ords[a].slow_lt(&ords[b], base),
+                |perm| {
+                    for (i, &member) in perm.iter().enumerate() {
+                        let s = member as usize;
+                        keys[i].write(kv[2 * s]);
+                        vals[i].write(kv[2 * s + 1]);
+                    }
+                },
+            )
+        };
+    if !permuted {
+        for i in 0..pairs {
+            keys[i].write(kv[2 * i]);
+            vals[i].write(kv[2 * i + 1]);
+        }
+    }
+
+    // SAFETY: keys[..pairs] and vals[..pairs] were initialized.
+    unsafe {
+        make_map(
+            env,
+            std::slice::from_raw_parts(keys.as_ptr() as *const ERL_NIF_TERM, pairs),
+            std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, pairs),
+            kv,
+        )
     }
 }
 
+/// Builds an ERTS map, inserting in source order if array construction rejects it.
 #[inline]
-fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+fn make_map(
+    env: Env,
+    keys: &[ERL_NIF_TERM],
+    vals: &[ERL_NIF_TERM],
+    kv: &[ERL_NIF_TERM],
+) -> ERL_NIF_TERM {
     unsafe {
         let mut map: ERL_NIF_TERM = 0;
-        if enif_make_map_from_arrays(
-            env.as_c_arg(),
-            keys.as_ptr(),
-            vals.as_ptr(),
-            keys.len(),
-            &mut map,
-        ) != 0
-        {
+        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) {
             map
         } else {
-            // Duplicate keys: last value wins (matches value_to_term).
-            map = enif_make_new_map(env.as_c_arg());
-            for i in 0..keys.len() {
-                let mut new_map: ERL_NIF_TERM = 0;
-                enif_make_map_put(env.as_c_arg(), map, keys[i], vals[i], &mut new_map);
-                map = new_map;
-            }
-            map
+            map_from_source(env, kv)
         }
+    }
+}
+
+/// Source-order insertion preserves last-value-wins for duplicate keys.
+#[cold]
+#[inline(never)]
+fn map_from_source(env: Env, kv: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+    unsafe {
+        let mut map = enif_make_new_map(env.as_c_arg());
+        for member in kv.as_chunks::<2>().0 {
+            let mut new_map: ERL_NIF_TERM = 0;
+            enif_make_map_put(env.as_c_arg(), map, member[0], member[1], &mut new_map);
+            map = new_map;
+        }
+        map
     }
 }
 
@@ -409,6 +530,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
         true
     }
 
+    /// `key_term` also records the key's sort order (see its docs).
     #[inline]
     fn visit_key(&mut self, key: &str) -> bool {
         let t = self.key_term(key);
@@ -422,20 +544,33 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             self.too_deep = true;
             return false;
         }
-        self.frames.push(self.values.len());
+        self.frames.push(Frame {
+            values: self.values.len(),
+            keys: self.key_ords.len() as u32,
+            unsortable: self.unsortable,
+            members: self.members,
+        });
+        self.members = 0;
         true
     }
 
     #[inline]
     fn visit_array_end(&mut self, _len: usize) -> bool {
-        let start = match self.frames.pop() {
-            Some(s) => s,
+        let frame = match self.frames.pop() {
+            Some(f) => f,
             None => return false,
         };
+        let start = frame.values;
         let count = (self.values.len() - start) as u32;
         let list = unsafe {
             enif_make_list_from_array(self.env.as_c_arg(), self.values[start..].as_ptr(), count)
         };
+        // Arrays hold no keys of their own, but an object nested inside one
+        // may have bumped `unsortable`; rewind so enclosing objects are judged
+        // only on their own keys.
+        self.unsortable = frame.unsortable;
+        self.members = frame.members;
+        self.key_ords.truncate(frame.keys as usize);
         self.values.truncate(start);
         self.values.push(list);
         true
@@ -447,17 +582,38 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             self.too_deep = true;
             return false;
         }
-        self.frames.push(self.values.len());
+        self.frames.push(Frame {
+            values: self.values.len(),
+            keys: self.key_ords.len() as u32,
+            unsortable: self.unsortable,
+            members: self.members,
+        });
+        self.members = 0;
         true
     }
 
     #[inline]
     fn visit_object_end(&mut self, _len: usize) -> bool {
-        let start = match self.frames.pop() {
-            Some(s) => s,
+        let frame = match self.frames.pop() {
+            Some(f) => f,
             None => return false,
         };
-        let map = build_map(self.env, &self.values[start..]);
+        let start = frame.values;
+        // An escaped key can't be borrowed for comparison, so give up on
+        // reordering the object that contains it and let ERTS order that one.
+        // Only this object's own keys count: `unsortable` is a running total,
+        // so it is rewound on close, or a single escaped key deep in the tree
+        // would disqualify every object enclosing it — whose own key metadata
+        // is still perfectly good.
+        let ords: &[KeyOrd] = if self.unsortable == frame.unsortable {
+            &self.key_ords[frame.keys as usize..]
+        } else {
+            &[]
+        };
+        let map = build_map(self.env, &self.values[start..], ords, self.input.base);
+        self.unsortable = frame.unsortable;
+        self.members = frame.members;
+        self.key_ords.truncate(frame.keys as usize);
         self.values.truncate(start);
         self.values.push(map);
         true
@@ -470,10 +626,13 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
         let DecodeBufs {
             values,
             frames,
+            key_ords,
             keys,
         } = &mut *bufs;
+        // Clear state left by an unwind; successful calls already leave it empty.
         values.clear();
         frames.clear();
+        key_ords.clear();
         keys.next_epoch();
         let mut builder = TermBuilder {
             env,
@@ -481,10 +640,19 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
                 term: input_term,
                 base: bytes.as_ptr(),
                 len: bytes.len(),
+                borrow_limit: if bytes.len() <= u32::MAX as usize {
+                    bytes.len()
+                } else {
+                    0
+                },
+                wide_limit: bytes.len().saturating_sub(7),
             },
             values,
             frames,
+            key_ords,
             keys,
+            unsortable: 0,
+            members: 0,
             too_deep: false,
         };
 
@@ -514,9 +682,132 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
             }
         };
 
+        // Release exceptional growth before returning the buffers to thread-local storage.
+        builder.values.clear();
+        builder.frames.clear();
+        builder.key_ords.clear();
         if builder.values.capacity() > VALUES_RETAIN_CAP {
             builder.values.shrink_to(VALUES_RETAIN_CAP);
         }
+        if builder.key_ords.capacity() > KEY_ORDS_RETAIN_CAP {
+            builder.key_ords.shrink_to(KEY_ORDS_RETAIN_CAP);
+        }
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input_of(doc: &[u8]) -> InputRef {
+        InputRef {
+            term: 0,
+            base: doc.as_ptr(),
+            len: doc.len(),
+            borrow_limit: doc.len(),
+            wide_limit: doc.len().saturating_sub(7),
+        }
+    }
+
+    #[test]
+    fn a_span_is_inside_the_input_only_when_all_of_it_is() {
+        let doc = b"{\"ab\":1}";
+        let input = input_of(doc);
+        let at =
+            |off: usize, len: usize| std::str::from_utf8(&doc[off..off + len]).expect("fixture");
+
+        for off in 0..doc.len() {
+            for len in 0..=(doc.len() - off) {
+                assert_eq!(
+                    input.offset_within(at(off, len), input.borrow_limit),
+                    Some(off),
+                    "{off}/{len}"
+                );
+            }
+        }
+
+        assert_eq!(
+            input.offset_within(at(doc.len(), 0), input.borrow_limit),
+            Some(doc.len())
+        );
+
+        let scratch = String::from("{\"ab\":1}");
+        assert_eq!(
+            input.offset_within(scratch.as_str(), input.borrow_limit),
+            None
+        );
+    }
+
+    #[test]
+    fn spans_outside_the_input_are_rejected_from_both_sides() {
+        let backing = b"HEAD{\"ab\":1}TAIL";
+        let input = InputRef {
+            term: 0,
+            base: backing[4..].as_ptr(),
+            len: 8,
+            borrow_limit: 8,
+            wide_limit: 1,
+        };
+        let at = |r: std::ops::Range<usize>| std::str::from_utf8(&backing[r]).unwrap();
+
+        assert_eq!(
+            input.offset_within(at(4..12), 8),
+            Some(0),
+            "exactly the input"
+        );
+        assert_eq!(
+            input.offset_within(at(12..12), 8),
+            Some(8),
+            "empty at the end"
+        );
+        assert_eq!(input.offset_within(at(0..4), 8), None, "entirely before");
+        assert_eq!(
+            input.offset_within(at(3..5), 8),
+            None,
+            "straddles the start"
+        );
+        assert_eq!(input.offset_within(at(4..13), 8), None, "runs past the end");
+        assert_eq!(input.offset_within(at(12..16), 8), None, "entirely after");
+        assert_eq!(input.offset_within(at(4..5), 0), None, "zero limit");
+    }
+
+    /// Covers the unaligned fast path and tail fallback at every input offset.
+    #[test]
+    fn the_wide_load_agrees_with_a_byte_wise_prefix_everywhere() {
+        // Keys of every length that matters, and bytes that matter: multi-byte
+        // UTF-8, an embedded NUL, and the high bytes that would sign-extend if
+        // anything treated them as signed.
+        let mut doc = Vec::new();
+        for chunk in [
+            b"a".as_slice(),
+            b"ab",
+            "\u{00e9}\u{4e2d}\u{1f600}".as_bytes(),
+            b"abcdefg",
+            b"abcdefgh",
+            b"abcdefghi",
+            b"k\0v",
+            &[0xff; 9],
+            &[0x80, 0x00, 0x7f, 0xff],
+            &[b'x'; 64],
+        ] {
+            doc.extend_from_slice(chunk);
+        }
+        let wide_limit = doc.len().saturating_sub(7);
+
+        for offset in 0..doc.len() {
+            for len in 0..=(doc.len() - offset).min(64) {
+                let key = &doc[offset..offset + len];
+                let wide = offset < wide_limit;
+                // SAFETY: offset + len is inside doc, and `wide` is exactly the
+                // test the decoder makes before reading eight bytes.
+                let got = unsafe { key_prefix_le(doc[offset..].as_ptr(), len, wide) };
+                assert_eq!(
+                    got,
+                    prefix_be(key).swap_bytes(),
+                    "offset {offset} len {len} wide {wide}"
+                );
+            }
+        }
+    }
 }
