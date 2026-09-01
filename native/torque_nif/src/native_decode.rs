@@ -16,6 +16,7 @@ use rustler::sys::{
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
 use crate::atoms;
@@ -160,7 +161,7 @@ thread_local! {
     });
 }
 
-struct InputRef {
+struct InputRef<'de> {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
@@ -168,9 +169,11 @@ struct InputRef {
     borrow_limit: usize,
     /// Exclusive upper bound for offsets with eight readable input bytes.
     wide_limit: usize,
+    /// Prevents this reference from outliving the input allocation.
+    _input: PhantomData<&'de [u8]>,
 }
 
-impl InputRef {
+impl InputRef<'_> {
     /// Offset of `s` when its entire span lies within `limit`.
     #[inline]
     fn offset_within(&self, s: &str, limit: usize) -> Option<usize> {
@@ -205,9 +208,9 @@ fn tail_prefix_le(bytes: &[u8]) -> u64 {
     prefix_be(bytes).swap_bytes()
 }
 
-struct TermBuilder<'a, 'b> {
+struct TermBuilder<'de, 'a, 'b> {
     env: Env<'a>,
-    input: InputRef,
+    input: InputRef<'de>,
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
     values: &'b mut Vec<ERL_NIF_TERM>,
@@ -223,7 +226,7 @@ struct TermBuilder<'a, 'b> {
     too_deep: bool,
 }
 
-impl<'a, 'b> TermBuilder<'a, 'b> {
+impl<'de, 'a, 'b> TermBuilder<'de, 'a, 'b> {
     #[inline]
     fn push(&mut self, term: ERL_NIF_TERM) {
         self.values.push(term);
@@ -463,7 +466,7 @@ fn bignum_term_large(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     rustler::BigInt::parse_bytes(raw.as_bytes(), 10).map(|big| big.encode(env).as_c_arg())
 }
 
-impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
+impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'de, 'a, 'b> {
     #[inline]
     fn visit_dom_start(&mut self) -> bool {
         true
@@ -648,6 +651,7 @@ pub fn decode_to_term<'a>(
                     0
                 },
                 wide_limit: bytes.len().saturating_sub(7),
+                _input: PhantomData,
             },
             values,
             frames,
@@ -707,13 +711,14 @@ pub fn decode_to_term<'a>(
 mod tests {
     use super::*;
 
-    fn input_of(doc: &[u8]) -> InputRef {
+    fn input_of(doc: &[u8]) -> InputRef<'_> {
         InputRef {
             term: 0,
             base: doc.as_ptr(),
             len: doc.len(),
             borrow_limit: doc.len(),
             wide_limit: doc.len().saturating_sub(7),
+            _input: PhantomData,
         }
     }
 
@@ -755,6 +760,7 @@ mod tests {
             len: 8,
             borrow_limit: 8,
             wide_limit: 1,
+            _input: PhantomData,
         };
         let at = |r: std::ops::Range<usize>| std::str::from_utf8(&backing[r]).unwrap();
 
