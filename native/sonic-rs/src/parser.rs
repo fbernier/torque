@@ -49,6 +49,17 @@ fn is_integer_token(slice: &[u8]) -> bool {
     !slice.iter().any(|&b| matches!(b, b'.' | b'e' | b'E'))
 }
 
+/// Restores negative zero from the source token after `sonic-number` loses its
+/// sign. Kept outside `parse_number` so integer parsing avoids this check.
+#[inline(always)]
+pub(crate) fn restore_neg_zero(f: f64, token: &[u8]) -> f64 {
+    if f == 0.0 && token.first() == Some(&b'-') {
+        -0.0
+    } else {
+        f
+    }
+}
+
 // support borrow for owned deserizlie or skip
 pub enum Reference<'b, 'c, T>
 where
@@ -387,7 +398,7 @@ where
                     if is_integer_token(slice) {
                         vis.visit_overflow_int(as_str(slice), f)
                     } else {
-                        vis.visit_f64(f)
+                        vis.visit_f64(restore_neg_zero(f, slice))
                     }
                 }
                 ParserNumber::Unsigned(f) => vis.visit_u64(f),
