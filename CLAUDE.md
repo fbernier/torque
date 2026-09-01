@@ -92,7 +92,9 @@ to tag on a mismatch), and the `{:torque, "~> x.y.z"}` install snippet in
 
 ## Architecture
 
-Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON). sonic-rs is **vendored** under `native/sonic-rs/` with a minimal patch (see that crate's `Cargo.toml`): its native push-based `JsonVisitor` is made public, and its DOM parser is capped at 128 nesting levels so deeply nested input returns an error instead of overflowing the stack.
+Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON). sonic-rs **0.5.8** is **vendored** under `native/sonic-rs/` with a minimal patch (see that crate's `Cargo.toml`): its native push-based `JsonVisitor` is made public, its parser is capped at 128 nesting levels so deeply nested input returns an error instead of overflowing the stack, and a document's objects/arrays are exposed as slices (`Value::as_pair_slice` / `as_value_slice`) so term building walks them without going through `Object`'s two-representation iterator.
+
+`Read` caches the pinned input's `NonNull<[u8]>` in a field instead of resolving it per access. `slice()` backs every `peek`/`at`/`eat`/`remain`, and reaching it through `PinnedInput::as_ptr` cost a discriminant branch plus, on the `FastStr` arm, a second dispatch over that type's own representations — *per token*. The input is pinned and never reassigned, which is exactly the invariant that makes one resolved pointer valid for the whole parse; caching it cut validated one-pass extraction by 24% of its instructions and full decode by 6.5%.
 
 ### Decoding Strategies
 

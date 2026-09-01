@@ -165,7 +165,7 @@ For objects with duplicate keys, the last value wins: `{"a":1,"b":2,"a":3}` deco
 
 `unique_keys: true` on `parse/2` is a promise that the document has none. If it does anyway, a path lookup stops at the first match instead of the last — `get(doc, "/a")` is `3` by default and `1` with the option — while building the enclosing object still keeps the last either way.
 
-Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) via `decode/1`, rather than degrading to lossy floats. The `parse/2` + `get/2` path returns them as floats, since the parsed document cannot hold a bignum.
+Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) via `decode/1`, including integers beyond the finite-float range. Expensive integer conversions move to a dirty scheduler before conversion, even when the JSON input is small. The parsed-document and compiled extraction paths cannot hold bignums: they use finite floats for out-of-range integers and reject magnitudes beyond that representation.
 
 ### Elixir to JSON
 

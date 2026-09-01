@@ -16,14 +16,18 @@ use rustler::sys::{
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
 use crate::atoms;
 use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
 use crate::nif_util::{make_tuple2, map_from_arrays};
-use crate::types::MAX_DEPTH;
 
 const STACK_SIZE: usize = 64;
+
+/// Decimal-to-binary bignum conversion is quadratic in digit count. Bound its
+/// cumulative work before conversion, independently of the JSON byte budget.
+const NORMAL_INTEGER_WORK: usize = 512 * 512;
 
 /// Cap on the retained thread-local value stack (in terms, 8 bytes each ≈ 1 MB),
 /// so a one-off huge document doesn't pin a large allocation on a scheduler
@@ -160,7 +164,7 @@ thread_local! {
     });
 }
 
-struct InputRef {
+struct InputRef<'de> {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
@@ -168,9 +172,11 @@ struct InputRef {
     borrow_limit: usize,
     /// Exclusive upper bound for offsets with eight readable input bytes.
     wide_limit: usize,
+    /// Prevents this reference from outliving the input allocation.
+    _input: PhantomData<&'de [u8]>,
 }
 
-impl InputRef {
+impl InputRef<'_> {
     /// Offset of `s` when its entire span lies within `limit`.
     #[inline]
     fn offset_within(&self, s: &str, limit: usize) -> Option<usize> {
@@ -205,9 +211,9 @@ fn tail_prefix_le(bytes: &[u8]) -> u64 {
     prefix_be(bytes).swap_bytes()
 }
 
-struct TermBuilder<'a, 'b> {
+struct TermBuilder<'de, 'a, 'b, const BOUNDED: bool> {
     env: Env<'a>,
-    input: InputRef,
+    input: InputRef<'de>,
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
     values: &'b mut Vec<ERL_NIF_TERM>,
@@ -220,10 +226,11 @@ struct TermBuilder<'a, 'b> {
     unsortable: u32,
     /// Running object member count, saved and restored with each frame.
     members: u32,
-    too_deep: bool,
+    integer_work: usize,
+    dirty_required: bool,
 }
 
-impl<'a, 'b> TermBuilder<'a, 'b> {
+impl<'de, 'a, 'b, const BOUNDED: bool> TermBuilder<'de, 'a, 'b, BOUNDED> {
     #[inline]
     fn push(&mut self, term: ERL_NIF_TERM) {
         self.values.push(term);
@@ -470,7 +477,7 @@ fn bignum_term_large(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     rustler::BigInt::parse_bytes(raw.as_bytes(), 10).map(|big| big.encode(env).as_c_arg())
 }
 
-impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
+impl<'de, 'a, 'b, const BOUNDED: bool> JsonVisitor<'de> for TermBuilder<'de, 'a, 'b, BOUNDED> {
     #[inline]
     fn visit_dom_start(&mut self) -> bool {
         true
@@ -521,9 +528,20 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     /// Integer literal beyond i64/u64 range: build an exact Erlang bignum from
     /// the raw digits instead of degrading to a lossy f64.
     #[inline]
-    fn visit_overflow_int(&mut self, raw: &str, as_f64: f64) -> bool {
-        let t = bignum_term(self.env, raw)
-            .unwrap_or_else(|| unsafe { enif_make_double(self.env.as_c_arg(), as_f64) });
+    fn visit_overflow_int(&mut self, raw: &str, _as_f64: f64) -> bool {
+        if BOUNDED {
+            let digits = raw.len() - usize::from(raw.starts_with('-'));
+            self.integer_work = self
+                .integer_work
+                .saturating_add(digits.saturating_mul(digits));
+            if self.integer_work > NORMAL_INTEGER_WORK {
+                self.dirty_required = true;
+                return false;
+            }
+        }
+        let Some(t) = bignum_term(self.env, raw) else {
+            return false;
+        };
         self.push(t);
         true
     }
@@ -545,10 +563,6 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
     #[inline]
     fn visit_array_start(&mut self, _hint: usize) -> bool {
-        if self.frames.len() >= MAX_DEPTH as usize {
-            self.too_deep = true;
-            return false;
-        }
         self.frames.push(Frame {
             values: self.values.len(),
             keys: self.key_ords.len() as u32,
@@ -583,10 +597,6 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
     #[inline]
     fn visit_object_start(&mut self, _hint: usize) -> bool {
-        if self.frames.len() >= MAX_DEPTH as usize {
-            self.too_deep = true;
-            return false;
-        }
         self.frames.push(Frame {
             values: self.values.len(),
             keys: self.key_ords.len() as u32,
@@ -625,7 +635,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     }
 }
 
-pub fn decode_to_term<'a>(
+pub fn decode_to_term<'a, const BOUNDED: bool>(
     env: Env<'a>,
     input_term: ERL_NIF_TERM,
     bytes: &[u8],
@@ -643,7 +653,7 @@ pub fn decode_to_term<'a>(
         frames.clear();
         key_ords.clear();
         keys.next_epoch();
-        let mut builder = TermBuilder {
+        let mut builder = TermBuilder::<BOUNDED> {
             env,
             input: InputRef {
                 term: input_term,
@@ -655,6 +665,7 @@ pub fn decode_to_term<'a>(
                     0
                 },
                 wide_limit: bytes.len().saturating_sub(7),
+                _input: PhantomData,
             },
             values,
             frames,
@@ -662,7 +673,8 @@ pub fn decode_to_term<'a>(
             keys,
             unsortable: 0,
             members: 0,
-            too_deep: false,
+            integer_work: 0,
+            dirty_required: false,
         };
 
         let result = match sonic_rs::parse_into_visitor(bytes, &mut builder) {
@@ -679,7 +691,9 @@ pub fn decode_to_term<'a>(
             },
             Err(e) => {
                 let scanned = crate::decoder::bytes_scanned(&e, bytes.len());
-                let term = if builder.too_deep {
+                let term = if builder.dirty_required {
+                    atoms::dirty_required().to_term(env)
+                } else if e.is_recursion_limit() {
                     make_tuple2(
                         env,
                         atoms::error().as_c_arg(),
@@ -714,13 +728,14 @@ pub fn decode_to_term<'a>(
 mod tests {
     use super::*;
 
-    fn input_of(doc: &[u8]) -> InputRef {
+    fn input_of(doc: &[u8]) -> InputRef<'_> {
         InputRef {
             term: 0,
             base: doc.as_ptr(),
             len: doc.len(),
             borrow_limit: doc.len(),
             wide_limit: doc.len().saturating_sub(7),
+            _input: PhantomData,
         }
     }
 
@@ -762,6 +777,7 @@ mod tests {
             len: 8,
             borrow_limit: 8,
             wide_limit: 1,
+            _input: PhantomData,
         };
         let at = |r: std::ops::Range<usize>| std::str::from_utf8(&backing[r]).unwrap();
 

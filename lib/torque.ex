@@ -90,7 +90,10 @@ defmodule Torque do
   end
 
   def decode(json) when is_binary(json) do
-    Torque.Native.decode(json)
+    case Torque.Native.decode(json) do
+      :dirty_required -> Torque.Native.decode_dirty(json)
+      result -> result
+    end
   end
 
   @doc """

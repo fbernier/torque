@@ -241,4 +241,59 @@ defmodule Torque.DecodeTest do
 
     defp desc_obj(map), do: obj(Enum.sort(map, :desc))
   end
+
+  describe "numbers" do
+    test "root integers stay exact across the finite-float and stack-bignum limits" do
+      # Finite fallback, overflow recovery, and the heap-backed integer converter.
+      for value <- [
+            Integer.pow(10, 308) + 7,
+            -Integer.pow(10, 309) - 7,
+            Integer.pow(10, 700) + 7
+          ] do
+        assert {:ok, ^value} = Torque.decode(Integer.to_string(value))
+      end
+    end
+
+    test "overflowed integers remain exact inside arrays and objects" do
+      value = Integer.pow(10, 400) + 7
+      negative = -value
+      json = ~s({"values":[#{value},{"negative":#{negative}}],"negative":#{negative}})
+
+      assert {:ok, %{"values" => [^value, %{"negative" => ^negative}], "negative" => ^negative}} =
+               Torque.decode(json)
+    end
+
+    test "huge malformed numbers and trailing junk are not recovered as integers" do
+      huge = String.duplicate("9", 700)
+
+      for json <- [
+            "0" <> huge,
+            "-" <> huge <> ".",
+            huge <> "e+",
+            huge <> "x",
+            "[" <> huge <> " false]",
+            ~s({"value":#{huge}x})
+          ] do
+        assert {:error, _} = Torque.decode(json)
+      end
+    end
+
+    test "overflow recovery does not accept nonfinite decimal or exponent floats" do
+      huge = String.duplicate("9", 400)
+
+      for json <- ["1e309", "[-" <> huge <> ".0]", ~s({"value":#{huge}e0})] do
+        assert {:error, _} = Torque.decode(json)
+      end
+
+      assert {:ok, 1.0e308} = Torque.decode("1e308")
+      assert {:ok, 1.0} = Torque.decode("1" <> String.duplicate("0", 400) <> "e-400")
+    end
+
+    test "DOM parsing still rejects integers beyond its finite-float representation" do
+      huge = "1" <> String.duplicate("0", 400)
+
+      assert {:error, _} = Torque.parse(huge)
+      assert {:error, _} = Torque.parse(~s({"value":#{huge}}))
+    end
+  end
 end
