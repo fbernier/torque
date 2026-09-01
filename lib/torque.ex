@@ -5,15 +5,20 @@ defmodule Torque do
   ## Decoding strategies
 
     * **Parse + Get** — `parse/2` returns an opaque document reference.
-      `get/2`, `get/3`, `get_many/2`, and `get_many_nil/2` extract fields
-      by JSON Pointer (RFC 6901) paths without materializing the full
-      Elixir term tree. Ideal when only a subset of fields is needed.
+      `get/2`, `get/3`, `get_many/2`, `get_many_nil/2` and
+      `get_many_defaults/2` extract fields by JSON Pointer (RFC 6901) paths
+      without materializing the full Elixir term tree. Ideal when the *same*
+      document is queried more than once, which is what the handle is for.
 
     * **Compiled pointers** — when the same fixed set of paths is extracted
       from every document, `compile_pointers/2` pre-parses the paths once and
-      `parse_get_many_nil/2` fuses the parse and extraction into a single NIF
-      call. Skips all per-request path parsing — roughly 1.5× faster end-to-end
-      than `parse/2` + `get_many_nil/2`.
+      `parse_get_many_nil/2` reads the document in a single pass, building
+      values only where a path ends and skipping everything else. For one-shot
+      extraction — parse a payload, take a few fields, discard it — prefer this
+      over `parse/2` + `get/2`: it never builds the document it is about to
+      throw away, which measures ~2× on a 440 KB payload and more as the
+      document grows. `validate: false` on the handle trades reporting faults
+      in the parts no path selects for a cheaper skip.
 
     * **Full decode** — `decode/1` converts an entire JSON binary into
       Elixir terms in one pass.
@@ -340,7 +345,9 @@ defmodule Torque do
   `{:ok, value}` or `{:error, :no_such_field}`.
 
   More efficient than calling `get/2` in a loop because it crosses
-  the NIF boundary only once.
+  the NIF boundary only once. For a document you query once and then discard,
+  `compile_pointers/2` + `parse_get_many_nil/2` is faster still — it never
+  builds the document at all.
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
@@ -405,8 +412,10 @@ defmodule Torque do
   in place of a path list, eliminating all per-call path parsing (≈2× faster
   extraction on a typical field set).
 
-  Compile once at startup (e.g. into a module attribute or `:persistent_term`)
-  and reuse the handle for every document.
+  Compile once at startup (e.g. into `:persistent_term`, application state or
+  the process holding the documents) and reuse the handle for every document.
+  A `t:pointers/0` is a NIF resource reference, so it cannot be built at
+  compile time into a module attribute.
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary or JSON Pointer.
   A JSON Pointer is either empty or begins with `/`.
@@ -417,6 +426,15 @@ defmodule Torque do
       stops at the first match (faster). Defaults to `false` (reverse scan,
       last-value-wins for duplicate keys), matching `parse/2`. Safe to enable
       when keys are known to be unique.
+
+    * `:validate` — controls validation of regions not selected by any path.
+      The default, `true`, reports malformed input anywhere in the document.
+      When `false`, unselected regions are skipped without syntax validation;
+      selected values and all consumed UTF-8 are still validated. The check
+      for content *after* the document is skipped too, so `~s({"a":1} junk)`
+      succeeds where `decode/1` and the default reject it. Truncated input is
+      still rejected, because skipping has to find the closing delimiter. Use
+      it only with trusted input.
 
   Extraction results are returned in the same order as `paths`.
 
@@ -430,7 +448,11 @@ defmodule Torque do
   @doc group: :parse_get
   @spec compile_pointers([binary()], keyword()) :: pointers()
   def compile_pointers(paths, opts \\ []) when is_list(paths) do
-    Torque.Native.compile_paths(paths, Keyword.get(opts, :unique_keys, false))
+    Torque.Native.compile_paths(
+      paths,
+      Keyword.get(opts, :unique_keys, false),
+      Keyword.get(opts, :validate, true)
+    )
   end
 
   @doc """

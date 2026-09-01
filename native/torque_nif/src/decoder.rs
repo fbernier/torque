@@ -453,19 +453,38 @@ fn compile_paths<'a>(
     env: Env<'a>,
     paths: ListIterator<'a>,
     unique_keys: bool,
+    validate: bool,
 ) -> NifResult<Term<'a>> {
     let mut out = Vec::new();
+    let mut plan = sonic_rs::extract::ExtractPlan::new();
     for pt in paths {
         // Non-binary (or non-UTF-8) entries are caller bugs: badarg. Silently
         // compiling them (e.g. as "") would return the whole document.
         let p: &str = pt.decode()?;
-        out.push(compile_one(p)?);
+        let segs = compile_one(p)?;
+        // The plan borrows segments and copies only new keys.
+        plan.add_path(plan_segs(&segs));
+        out.push(segs);
     }
+    plan.finish();
     Ok(ResourceArc::new(CompiledPaths {
         paths: out,
+        plan,
         unique_keys,
+        validate,
     })
     .encode(env))
+}
+
+/// Borrows compiled path segments for plan construction.
+fn plan_segs(
+    segs: &[PathSeg],
+) -> impl ExactSizeIterator<Item = sonic_rs::extract::Seg<'_>> + use<'_> {
+    use sonic_rs::extract::Seg;
+    segs.iter().map(|s| match s {
+        PathSeg::Key(k) => Seg::Key(k),
+        PathSeg::Num { idx, key } => Seg::Index { idx: *idx, key },
+    })
 }
 
 /// Extract all compiled paths from an already-traversed `value` into a result
@@ -491,8 +510,9 @@ fn extract_compiled<'a>(
     acc.into_list(env)
 }
 
-/// Returns the result term and the bytes the parser reached, which differ only
-/// when the document is rejected part way through.
+/// Parses once and returns the result term with the number of bytes reached.
+/// Selected values are built directly; other regions are parsed or skipped
+/// according to the compiled validation policy.
 #[inline]
 fn do_parse_get_many_nil<'a>(
     env: Env<'a>,
@@ -500,11 +520,34 @@ fn do_parse_get_many_nil<'a>(
     compiled: &CompiledPaths,
     nodes: &mut usize,
 ) -> (Term<'a>, usize) {
-    match sonic_rs::from_slice::<sonic_rs::Value>(bytes) {
-        Ok(value) => {
-            let list = extract_compiled(env, &value, compiled, nodes);
+    use sonic_rs::extract::{Keys, Validate};
+
+    let validate = if compiled.validate {
+        Validate::Yes
+    } else {
+        Validate::No
+    };
+    let keys = if compiled.unique_keys {
+        Keys::Unique
+    } else {
+        Keys::Repeatable
+    };
+
+    match sonic_rs::extract::extract(bytes, &compiled.plan, validate, keys) {
+        Ok(values) => {
+            let nil_raw = atoms::nil().as_c_arg();
+            let mut acc = TermAcc::with_hint(values.len());
+            for v in values.iter() {
+                let t = match v {
+                    Some(v) => value_to_term(env, v, MAX_DEPTH, nodes)
+                        .map(|t| t.as_c_arg())
+                        .unwrap_or(nil_raw),
+                    None => nil_raw,
+                };
+                acc.push(t);
+            }
             (
-                make_tuple2(env, atoms::ok().as_c_arg(), list.as_c_arg()),
+                make_tuple2(env, atoms::ok().as_c_arg(), acc.into_list(env).as_c_arg()),
                 bytes.len(),
             )
         }

@@ -12,13 +12,15 @@
 #   * one document-size check shared by serde and visitor entry points
 #   * structured recursion-limit detection for callers
 #   * negative-zero restoration only at float conversion sites
-
-#   * direct object and array slice accessors for parsed documents
+#   * reusable multi-path extraction with optional structural skipping and
+#     indexed construction for wide plan nodes
+#   * shared nesting enforcement for validated structural skips
+#   * `skip_one_value_at` skips without materialising the skipped bytes, for
+#     the callers that discard them
+#   * validated skips reject invalid Unicode escapes and non-finite numbers
+#   * `skip_member` takes scalar container members without a recursive frame
 #   * `Read` caches the pinned input's slice pointer instead of resolving it
 #     through the `PinnedInput` enum on every `peek`/`at`/`eat`/`remain`
-# Upstream: https://github.com/cloudwego/sonic-rs (Apache-2.0), tag v0.5.8,
-# commit e339451e37a8f2d3f9b93f155985d31fcbcb115a. Diff against that commit to
-# inspect the Torque patches.
 #
 # Upstream disables clippy for this crate. Tests cover Torque-owned patches
 # because the linter cannot report on them.

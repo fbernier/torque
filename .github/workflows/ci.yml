@@ -32,6 +32,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+      # The vendored crate carries its own `[workspace]`, so none of the above
+      # reaches it. Its root also disables every lint for upstream code, which
+      # is why the clippy run below needs no `-D warnings`: the Torque-owned
+      # module re-enables and denies them itself, and nothing else here would
+      # report anything.
+      - run: cargo fmt --manifest-path native/sonic-rs/Cargo.toml --check
+      - run: cargo clippy --manifest-path native/sonic-rs/Cargo.toml --lib
+
   test:
     name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
     runs-on: ubuntu-latest

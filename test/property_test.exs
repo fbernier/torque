@@ -737,6 +737,22 @@ defmodule Torque.PropertyTest do
       end
     end
 
+    @dup_json ~s({"a":{"b":[10,20],"c":1},"a":{"b":[30],"d":2},"b":["x"],"b":["y","z"],"0":1,"0":2,"":{"a":1},"":9})
+
+    property "duplicate keys resolve identically on every extraction path" do
+      {:ok, doc} = Torque.parse(@dup_json)
+
+      check all(paths <- StreamData.list_of(pointer_path(), min_length: 1, max_length: 4)) do
+        raw = Torque.get_many_nil(doc, paths)
+        compiled = Torque.compile_pointers(paths)
+        loose = Torque.compile_pointers(paths, validate: false)
+
+        assert Torque.get_many_nil(doc, compiled) == raw
+        assert {:ok, raw} == Torque.parse_get_many_nil(@dup_json, compiled)
+        assert {:ok, raw} == Torque.parse_get_many_nil(@dup_json, loose)
+      end
+    end
+
     test "a path that is not a JSON Pointer is a caller bug, not a crash" do
       # Single-byte cases exercise the root-pointer fast path.
       for bad <- ["foo", "é", "a/b", " /a", "x", "~", ".", " "] do
