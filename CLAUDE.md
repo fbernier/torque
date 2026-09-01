@@ -185,7 +185,7 @@ Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU 
 - `lib/torque.ex` — public API with `@doc`, typespecs, dirty scheduler dispatch
 - `lib/torque/native.ex` — RustlerPrecompiled NIF stubs (set `TORQUE_BUILD=true` to compile from source)
 - `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` + `CompiledPaths` (`PathSeg`) resources
-- `native/torque_nif/src/decoder.rs` — parse, get, get_many, get_many_nil, decode NIFs; compiled-pointer + fused `parse_get_many_nil` path
+- `native/torque_nif/src/decoder.rs` — parse, get, get_many, get_many_nil, get_many_defaults, decode NIFs; compiled-pointer + one-pass `parse_get_many_nil` path
 - `native/torque_nif/src/native_decode.rs` — fused decoder; builds terms during the SIMD parse via sonic-rs's `JsonVisitor`
 - `native/torque_nif/src/map_order.rs` — Erlang term ordering for object keys, shared by the decoder and `value_to_term`
 - `native/torque_nif/src/encoder.rs` — direct term-walking JSON encoder

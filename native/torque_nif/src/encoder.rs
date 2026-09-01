@@ -1,12 +1,12 @@
 use crate::atoms;
-use crate::nif_util::{make_tuple2, timeslice_percent};
+use crate::nif_util::{make_tuple2, timeslice_percent, MapEntries};
 use crate::types::MAX_DEPTH;
 use rustler::sys::{
     c_int, c_uint, enif_get_atom, enif_get_atom_length, enif_get_double, enif_get_int64,
     enif_get_list_cell, enif_get_tuple, enif_get_uint64, enif_inspect_binary, enif_is_empty_list,
     ErlNifBinary, ErlNifCharEncoding, ErlNifEnv, ERL_NIF_TERM,
 };
-use rustler::{schedule, Env, MapIterator, NewBinary, Term, TermType};
+use rustler::{schedule, Env, NewBinary, Term, TermType};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 
@@ -193,10 +193,10 @@ fn encode_iodata_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
 }
 
 #[inline]
-fn encode_term(
-    env: Env,
+fn encode_term<'a>(
+    env: Env<'a>,
     env_raw: *mut ErlNifEnv,
-    term: Term,
+    term: Term<'a>,
     buf: &mut Vec<u8>,
     depth: u32,
 ) -> Result<(), EncodeError> {
@@ -212,17 +212,17 @@ fn encode_term(
     }
 }
 
-fn encode_map(
-    env: Env,
+fn encode_map<'a>(
+    env: Env<'a>,
     env_raw: *mut ErlNifEnv,
-    term: Term,
+    term: Term<'a>,
     buf: &mut Vec<u8>,
     depth: u32,
 ) -> Result<(), EncodeError> {
     if depth == 0 {
         return Err(EncodeError::DepthExceeded);
     }
-    let iter = MapIterator::new(term).ok_or(EncodeError::UnsupportedType)?;
+    let iter = MapEntries::new(env, term).ok_or(EncodeError::UnsupportedType)?;
     buf.push(b'{');
     let mut first = true;
     for (key, value) in iter {
@@ -271,10 +271,10 @@ fn encode_map_key(
     Ok(())
 }
 
-fn encode_list(
-    env: Env,
+fn encode_list<'a>(
+    env: Env<'a>,
     env_raw: *mut ErlNifEnv,
-    term: Term,
+    term: Term<'a>,
     buf: &mut Vec<u8>,
     depth: u32,
 ) -> Result<(), EncodeError> {
@@ -404,10 +404,10 @@ unsafe fn get_tuple_raw<'a>(
     ))
 }
 
-fn encode_tuple(
-    env: Env,
+fn encode_tuple<'a>(
+    env: Env<'a>,
     env_raw: *mut ErlNifEnv,
-    term: Term,
+    term: Term<'a>,
     buf: &mut Vec<u8>,
     depth: u32,
 ) -> Result<(), EncodeError> {
@@ -421,10 +421,10 @@ fn encode_tuple(
     Err(EncodeError::UnsupportedType)
 }
 
-fn encode_proplist(
-    env: Env,
+fn encode_proplist<'a>(
+    env: Env<'a>,
     env_raw: *mut ErlNifEnv,
-    term: Term,
+    term: Term<'a>,
     buf: &mut Vec<u8>,
     depth: u32,
 ) -> Result<(), EncodeError> {

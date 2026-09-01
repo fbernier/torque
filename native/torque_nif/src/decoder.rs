@@ -1,11 +1,14 @@
 use crate::atoms;
 use crate::native_decode;
-use crate::nif_util::{make_tuple2, timeslice_percent, BYTES_PER_REDUCTION, REDUCTION_COUNT};
+use crate::nif_util::{
+    make_tuple2, map_from_arrays, timeslice_percent, MapEntries, BYTES_PER_REDUCTION,
+    REDUCTION_COUNT,
+};
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
 use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
 use rustler::{schedule, Binary, Encoder, Env, ListIterator, NifResult, ResourceArc, Term};
-use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+use sonic_rs::JsonValueTrait;
 
 const GET_MANY_STACK: usize = 64;
 
@@ -379,11 +382,55 @@ fn get_many<'a>(
     Ok(acc.into_list(env))
 }
 
+/// Implements `get_many_defaults/2` without an intermediate result list. Keys
+/// and fallback terms come directly from the input map; missing, null, or
+/// over-nested values retain their fallback.
+#[rustler::nif]
+fn get_many_defaults<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    defaults: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let count = defaults.map_size()?;
+    let nil_raw = atoms::nil().as_c_arg();
+    let entries = MapEntries::new(env, defaults).ok_or(rustler::Error::BadArg)?;
+
+    let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
+    let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
+    let mut nodes = 0usize;
+
+    for (key, default) in entries {
+        // A non-binary (or non-UTF-8) key is a caller bug, the same one the
+        // path list version reports.
+        let path: &str = key.decode()?;
+        let found = pointer_lookup(&doc.value, path, doc.unique_keys)
+            .and_then(|value| value_to_term(env, value, MAX_DEPTH, &mut nodes))
+            .map(|term| term.as_c_arg())
+            .filter(|term| *term != nil_raw);
+        keys.push(key.as_c_arg());
+        vals.push(found.unwrap_or_else(|| default.as_c_arg()));
+    }
+
+    consume_timeslice_nodes(env, nodes);
+    let mut map: ERL_NIF_TERM = 0;
+    // SAFETY: keys and vals hold `count` initialised terms each, and the keys
+    // came from a map, so they are already unique.
+    let built = unsafe { map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) };
+    if built {
+        Ok(unsafe { Term::new(env, map) })
+    } else {
+        Err(rustler::Error::BadArg)
+    }
+}
+
 #[rustler::nif]
 fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
     match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) if value.is_array() => {
-            let len = value.as_array().unwrap().len();
+        Some(value) => {
+            let len = match value.as_value_slice() {
+                Some(values) => values.len(),
+                None => return atoms::nil().to_term(env),
+            };
             unsafe {
                 Term::new(
                     env,

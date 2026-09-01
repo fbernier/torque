@@ -520,15 +520,7 @@ defmodule Torque do
           %{binary() => term()}
   def get_many_defaults(doc, defaults)
       when is_reference(doc) and is_map(defaults) do
-    paths = Map.keys(defaults)
-    values = Torque.Native.get_many_nil(doc, paths)
-
-    paths
-    |> Enum.zip(values)
-    |> Map.new(fn
-      {path, nil} -> {path, Map.get(defaults, path)}
-      pv -> pv
-    end)
+    Torque.Native.get_many_defaults(doc, defaults)
   end
 
   @doc """
