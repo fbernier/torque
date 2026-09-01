@@ -91,6 +91,19 @@ impl TermAcc {
     }
 }
 
+/// Parses an RFC 6901 array index. Numeric tokens with leading zeroes remain
+/// object keys so raw and compiled pointers resolve them identically.
+#[inline]
+fn array_index(token: &str) -> Option<usize> {
+    let b = token.as_bytes();
+    match b {
+        [] => None,
+        [b'0'] => Some(0),
+        [first, ..] if first.is_ascii_digit() && *first != b'0' => token.parse().ok(),
+        _ => None,
+    }
+}
+
 /// Looks up `key` in an object.
 ///
 /// sonic-rs stores objects as a flat pair slice with no index, so both arms
@@ -133,9 +146,8 @@ fn pointer_lookup<'v>(
 
     let mut current = value;
     for segment in path[1..].split('/') {
-        let seg_bytes = segment.as_bytes();
-        if current.is_array() && !seg_bytes.is_empty() && seg_bytes[0].is_ascii_digit() {
-            if let Ok(index) = segment.parse::<usize>() {
+        if current.is_array() {
+            if let Some(index) = array_index(segment) {
                 current = current.get(index)?;
                 continue;
             }
@@ -355,27 +367,30 @@ use crate::{CompiledPaths, PathSeg};
 /// `Num`, keeping both the parsed index and the literal key so the lookup can
 /// pick the right interpretation per node (array index vs. object key) —
 /// matching the runtime behaviour of `pointer_lookup`.
-fn compile_one(path: &str) -> Vec<PathSeg> {
+fn compile_one(path: &str) -> NifResult<Vec<PathSeg>> {
     let mut segs = Vec::new();
-    if path.len() <= 1 {
-        return segs;
+    // Torque treats both empty and slash-only pointers as the document root.
+    if path.is_empty() || path == "/" {
+        return Ok(segs);
     }
-    for segment in path[1..].split('/') {
-        let b = segment.as_bytes();
+    // Reject non-pointers before slicing. A multibyte leading character could
+    // otherwise panic inside the NIF.
+    let rest = match path.strip_prefix('/') {
+        Some(rest) => rest,
+        None => return Err(rustler::Error::BadArg),
+    };
+    for segment in rest.split('/') {
         let key = if segment.contains('~') {
             segment.replace("~1", "/").replace("~0", "~")
         } else {
             segment.to_string()
         };
-        if !b.is_empty() && b[0].is_ascii_digit() {
-            if let Ok(idx) = segment.parse::<usize>() {
-                segs.push(PathSeg::Num { idx, key });
-                continue;
-            }
+        match array_index(segment) {
+            Some(idx) => segs.push(PathSeg::Num { idx, key }),
+            None => segs.push(PathSeg::Key(key)),
         }
-        segs.push(PathSeg::Key(key));
     }
-    segs
+    Ok(segs)
 }
 
 #[rustler::nif]
@@ -389,7 +404,7 @@ fn compile_paths<'a>(
         // Non-binary (or non-UTF-8) entries are caller bugs: badarg. Silently
         // compiling them (e.g. as "") would return the whole document.
         let p: &str = pt.decode()?;
-        out.push(compile_one(p));
+        out.push(compile_one(p)?);
     }
     Ok(ResourceArc::new(CompiledPaths {
         paths: out,
