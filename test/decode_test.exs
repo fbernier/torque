@@ -295,5 +295,23 @@ defmodule Torque.DecodeTest do
       assert {:error, _} = Torque.parse(huge)
       assert {:error, _} = Torque.parse(~s({"value":#{huge}}))
     end
+
+    test "every decoding strategy keeps the sign of a negative zero" do
+      # Sonic-number loses the sign; every conversion path must restore it.
+      json = ~s({"z":-0.0})
+      neg = <<-0.0::float-64>>
+
+      assert <<Torque.decode!(json)["z"]::float-64>> == neg
+
+      {:ok, doc} = Torque.parse(json)
+      assert {:ok, got} = Torque.get(doc, "/z")
+      assert <<got::float-64>> == neg
+
+      ptrs = Torque.compile_pointers(["/z"])
+      assert [from_doc] = Torque.get_many_nil(doc, ptrs)
+      assert <<from_doc::float-64>> == neg
+      assert {:ok, [fused]} = Torque.parse_get_many_nil(json, ptrs)
+      assert <<fused::float-64>> == neg
+    end
   end
 end

@@ -11,6 +11,8 @@
 #   * key-specific visitor hooks with backward-compatible string defaults
 #   * one document-size check shared by serde and visitor entry points
 #   * structured recursion-limit detection for callers
+#   * negative-zero restoration only at float conversion sites
+
 #   * direct object and array slice accessors for parsed documents
 #   * `Read` caches the pinned input's slice pointer instead of resolving it
 #     through the `PinnedInput` enum on every `peek`/`at`/`eat`/`remain`
