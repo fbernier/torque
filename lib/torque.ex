@@ -32,9 +32,21 @@ defmodule Torque do
   ## Scheduler awareness
 
   Decoding and parsing automatically dispatch inputs larger than 20 KB to a
-  dirty CPU scheduler to avoid blocking normal BEAM schedulers. Encoding
-  cannot cheaply predict its output size up front, so dirty dispatch is
-  opt-in there: pass `dirty: true` to `encode/2`, `encode!/2`,
+  dirty CPU scheduler to avoid blocking normal BEAM schedulers. Batch lookups
+  dispatch on the number of paths instead, which is the size the document
+  cannot report: `get_many/2`, `get_many_nil/2`, `get_many_defaults/2` and
+  `parse_get_many_nil/2` build one result per path, so 100k pointers against a
+  two-byte document is 100k terms of work. Past 2048 paths they go dirty, and
+  `compile_pointers/2` always does — it is startup work.
+
+  What neither size can predict is a single huge result: `get/2` on a path
+  holding a megabyte of array converts the whole subtree on a normal
+  scheduler. It reports that work to ERTS afterwards rather than moving,
+  which adjusts the calling process's reduction budget without preempting a
+  call already made.
+
+  Encoding cannot cheaply predict its output size up front, so dirty dispatch
+  is opt-in there: pass `dirty: true` to `encode/2`, `encode!/2`,
   `encode_to_iodata/2`, or `encode_to_iodata!/2` when terms are expected
   to produce large output.
 
@@ -56,12 +68,19 @@ defmodule Torque do
 
   @timeslice_bytes 20_480
 
+  # Batch lookup work scales with the path set, not the document. Calibrate this
+  # threshold on `get_many_defaults/2`, the most expensive batch operation.
+  @dirty_path_count 2048
+
   @typedoc """
   An opaque handle to a set of pre-compiled JSON Pointer paths, returned by
   `compile_pointers/2`. Pass it to `parse_get_many_nil/2` or `get_many_nil/2`
   in place of a path list to skip per-call path parsing.
+
+  It carries its own path count, so dispatching a call to a dirty scheduler
+  costs a tuple element rather than a walk of the paths it was built from.
   """
-  @opaque pointers :: reference()
+  @opaque pointers :: {reference(), non_neg_integer()}
 
   # --- Decoding ---
 
@@ -351,6 +370,9 @@ defmodule Torque do
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
+  Automatically uses a dirty CPU scheduler past 2048 paths: the work is one
+  result per path, which the document's size does not report.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":2}))
@@ -361,7 +383,11 @@ defmodule Torque do
   @spec get_many(reference(), [binary()]) ::
           [{:ok, term()} | {:error, :no_such_field | :nesting_too_deep}]
   def get_many(doc, paths) when is_reference(doc) and is_list(paths) do
-    Torque.Native.get_many(doc, paths)
+    if many_paths?(paths) do
+      Torque.Native.get_many_dirty(doc, paths)
+    else
+      Torque.Native.get_many(doc, paths)
+    end
   end
 
   @doc """
@@ -381,6 +407,9 @@ defmodule Torque do
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
+  Automatically uses a dirty CPU scheduler past 2048 paths, counted from the
+  handle when given one.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":null}))
@@ -395,11 +424,28 @@ defmodule Torque do
   @doc group: :parse_get
   @spec get_many_nil(reference(), [binary()] | pointers()) :: [term()]
   def get_many_nil(doc, paths) when is_reference(doc) and is_list(paths) do
-    Torque.Native.get_many_nil(doc, paths)
+    if many_paths?(paths) do
+      Torque.Native.get_many_nil_dirty(doc, paths)
+    else
+      Torque.Native.get_many_nil(doc, paths)
+    end
   end
 
-  def get_many_nil(doc, pointers) when is_reference(doc) and is_reference(pointers) do
+  def get_many_nil(doc, {pointers, count})
+      when is_reference(doc) and is_reference(pointers) and count >= @dirty_path_count do
+    Torque.Native.get_many_nil_compiled_dirty(doc, pointers)
+  end
+
+  def get_many_nil(doc, {pointers, count})
+      when is_reference(doc) and is_reference(pointers) and is_integer(count) do
     Torque.Native.get_many_nil_compiled(doc, pointers)
+  end
+
+  # Whether a path list is long enough to belong on a dirty scheduler.
+  # `length/1` would walk all of it, which on the lists this exists to catch is
+  # the cost being avoided; dropping the threshold's worth of cells stops there.
+  defp many_paths?(paths) do
+    match?([_ | _], Enum.drop(paths, @dirty_path_count - 1))
   end
 
   @doc """
@@ -414,8 +460,13 @@ defmodule Torque do
 
   Compile once at startup (e.g. into `:persistent_term`, application state or
   the process holding the documents) and reuse the handle for every document.
-  A `t:pointers/0` is a NIF resource reference, so it cannot be built at
-  compile time into a module attribute.
+  A `t:pointers/0` holds a NIF resource reference, so it cannot be built at
+  compile time into a module attribute. It carries the number of paths it was
+  built from, which is what `get_many_nil/2` and `parse_get_many_nil/2`
+  dispatch on; treat it as opaque either way.
+
+  Runs on a dirty CPU scheduler: this is startup work, and a large path set
+  takes long enough that where it runs matters more than the dispatch costs.
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary or JSON Pointer.
   A JSON Pointer is either empty or begins with `/`.
@@ -466,7 +517,8 @@ defmodule Torque do
 
   Returns `{:ok, values}` (in the same order as the paths given to
   `compile_pointers/2`) or `{:error, reason}` if the JSON is malformed.
-  Automatically uses a dirty CPU scheduler for inputs larger than 20 KB.
+  Automatically uses a dirty CPU scheduler for inputs larger than 20 KB, and
+  for handles holding enough paths to be the larger half of the work.
 
   ## Examples
 
@@ -481,12 +533,14 @@ defmodule Torque do
   @doc group: :parse_get
   @spec parse_get_many_nil(binary(), pointers()) ::
           {:ok, [term()]} | {:error, binary() | :nesting_too_deep}
-  def parse_get_many_nil(json, pointers)
-      when is_binary(json) and is_reference(pointers) and byte_size(json) > @timeslice_bytes do
+  def parse_get_many_nil(json, {pointers, count})
+      when is_binary(json) and is_reference(pointers) and
+             (byte_size(json) > @timeslice_bytes or count >= @dirty_path_count) do
     Torque.Native.parse_get_many_nil_dirty(json, pointers)
   end
 
-  def parse_get_many_nil(json, pointers) when is_binary(json) and is_reference(pointers) do
+  def parse_get_many_nil(json, {pointers, count})
+      when is_binary(json) and is_reference(pointers) and is_integer(count) do
     Torque.Native.parse_get_many_nil(json, pointers)
   end
 
@@ -509,6 +563,9 @@ defmodule Torque do
   Note: a parsed JSON `null` at the path is indistinguishable from a missing
   field (same as `get_many_nil/2`) — both substitute the default.
 
+  Automatically uses a dirty CPU scheduler past 2048 keys. It is the slowest
+  of the batch lookups per path, so that threshold is calibrated on it.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"a":1,"b":null}))
@@ -518,6 +575,11 @@ defmodule Torque do
   @doc group: :parse_get
   @spec get_many_defaults(reference(), %{binary() => term()}) ::
           %{binary() => term()}
+  def get_many_defaults(doc, defaults)
+      when is_reference(doc) and is_map(defaults) and map_size(defaults) >= @dirty_path_count do
+    Torque.Native.get_many_defaults_dirty(doc, defaults)
+  end
+
   def get_many_defaults(doc, defaults)
       when is_reference(doc) and is_map(defaults) do
     Torque.Native.get_many_defaults(doc, defaults)

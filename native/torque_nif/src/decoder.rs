@@ -108,6 +108,12 @@ impl TermAcc {
         self.count += 1;
     }
 
+    /// Result terms emitted, including scalars and missing values.
+    #[inline]
+    fn len(&self) -> usize {
+        self.count
+    }
+
     #[inline]
     fn into_list<'a>(self, env: Env<'a>) -> Term<'a> {
         let terms = match &self.heap {
@@ -357,11 +363,15 @@ fn get_one_result(
     }
 }
 
-#[rustler::nif]
-fn get_many<'a>(
+/// Look every path up and build the result list. Shared by the normal and
+/// dirty NIFs: which scheduler runs it is the caller's decision, made from the
+/// path count, and the work is the same either way.
+#[inline]
+fn do_get_many<'a>(
     env: Env<'a>,
-    doc: ResourceArc<ParsedDocument>,
+    doc: &ParsedDocument,
     paths: ListIterator<'a>,
+    nodes: &mut usize,
 ) -> NifResult<Term<'a>> {
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
@@ -369,27 +379,53 @@ fn get_many<'a>(
         nsf: atoms::no_such_field().as_c_arg(),
         ntd: atoms::nesting_too_deep().as_c_arg(),
     };
-    let mut nodes = 0usize;
     let mut acc = TermAcc::new();
 
     for path_term in paths {
         // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
         let path: &str = path_term.decode()?;
-        acc.push(get_one_result(env, &doc, path, &result_atoms, &mut nodes));
+        acc.push(get_one_result(env, doc, path, &result_atoms, nodes));
     }
 
-    consume_timeslice_nodes(env, nodes);
+    // Every result is a term this call built, whatever it holds: a scalar, a
+    // `nil` for a missing path, the tuple around it. `value_to_term` counts
+    // only container children, so without this a batch of scalar or missing
+    // paths - the shape a large path set most often has - reports no work.
+    *nodes += acc.len();
     Ok(acc.into_list(env))
+}
+
+#[rustler::nif]
+fn get_many<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    paths: ListIterator<'a>,
+) -> NifResult<Term<'a>> {
+    let mut nodes = 0usize;
+    let result = do_get_many(env, &doc, paths, &mut nodes)?;
+    consume_timeslice_nodes(env, nodes);
+    Ok(result)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn get_many_dirty<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    paths: ListIterator<'a>,
+) -> NifResult<Term<'a>> {
+    let mut nodes = 0usize;
+    do_get_many(env, &doc, paths, &mut nodes)
 }
 
 /// Implements `get_many_defaults/2` without an intermediate result list. Keys
 /// and fallback terms come directly from the input map; missing, null, or
 /// over-nested values retain their fallback.
-#[rustler::nif]
-fn get_many_defaults<'a>(
+#[inline]
+fn do_get_many_defaults<'a>(
     env: Env<'a>,
-    doc: ResourceArc<ParsedDocument>,
+    doc: &ParsedDocument,
     defaults: Term<'a>,
+    nodes: &mut usize,
 ) -> NifResult<Term<'a>> {
     let count = defaults.map_size()?;
     let nil_raw = atoms::nil().as_c_arg();
@@ -397,21 +433,22 @@ fn get_many_defaults<'a>(
 
     let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
     let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
-    let mut nodes = 0usize;
 
     for (key, default) in entries {
         // A non-binary (or non-UTF-8) key is a caller bug, the same one the
         // path list version reports.
         let path: &str = key.decode()?;
         let found = pointer_lookup(&doc.value, path, doc.unique_keys)
-            .and_then(|value| value_to_term(env, value, MAX_DEPTH, &mut nodes))
+            .and_then(|value| value_to_term(env, value, MAX_DEPTH, nodes))
             .map(|term| term.as_c_arg())
             .filter(|term| *term != nil_raw);
         keys.push(key.as_c_arg());
         vals.push(found.unwrap_or_else(|| default.as_c_arg()));
     }
 
-    consume_timeslice_nodes(env, nodes);
+    // One result per key, whether it came from the document or from the
+    // caller's default, plus the map ERTS builds over all of them.
+    *nodes += count;
     let mut map: ERL_NIF_TERM = 0;
     // SAFETY: keys and vals hold `count` initialised terms each, and the keys
     // came from a map, so they are already unique.
@@ -421,6 +458,28 @@ fn get_many_defaults<'a>(
     } else {
         Err(rustler::Error::BadArg)
     }
+}
+
+#[rustler::nif]
+fn get_many_defaults<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    defaults: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let mut nodes = 0usize;
+    let result = do_get_many_defaults(env, &doc, defaults, &mut nodes)?;
+    consume_timeslice_nodes(env, nodes);
+    Ok(result)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn get_many_defaults_dirty<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    defaults: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let mut nodes = 0usize;
+    do_get_many_defaults(env, &doc, defaults, &mut nodes)
 }
 
 #[rustler::nif]
@@ -495,7 +554,15 @@ fn compile_one(path: &str) -> NifResult<Vec<PathSeg>> {
     Ok(segs)
 }
 
-#[rustler::nif]
+/// Compiling is startup work - a fixed path set, once, before any document is
+/// read - so it runs dirty unconditionally rather than sizing a dispatch it
+/// would then have to get right for path sets of any length.
+///
+/// Returns `{handle, path_count}`. The count is what the per-call dispatch
+/// decides on, and this is the only place that already knows it: taking
+/// `length/1` of the caller's list at every call site would walk the list the
+/// count exists to avoid walking.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn compile_paths<'a>(
     env: Env<'a>,
     paths: ListIterator<'a>,
@@ -514,13 +581,19 @@ fn compile_paths<'a>(
         out.push(segs);
     }
     plan.finish();
-    Ok(ResourceArc::new(CompiledPaths {
+    let count = out.len();
+    let handle = ResourceArc::new(CompiledPaths {
         paths: out,
         plan,
         unique_keys,
         validate,
     })
-    .encode(env))
+    .encode(env);
+    Ok(make_tuple2(
+        env,
+        handle.as_c_arg(),
+        count.encode(env).as_c_arg(),
+    ))
 }
 
 /// Borrows compiled path segments for plan construction.
@@ -554,6 +627,7 @@ fn extract_compiled<'a>(
         };
         acc.push(r);
     }
+    *nodes += acc.len();
     acc.into_list(env)
 }
 
@@ -593,6 +667,7 @@ fn do_parse_get_many_nil<'a>(
                 };
                 acc.push(t);
             }
+            *nodes += acc.len();
             (
                 make_tuple2(env, atoms::ok().as_c_arg(), acc.into_list(env).as_c_arg()),
                 bytes.len(),
@@ -659,21 +734,31 @@ fn get_many_nil_compiled<'a>(
     result
 }
 
-#[rustler::nif]
-fn get_many_nil<'a>(
+#[rustler::nif(schedule = "DirtyCpu")]
+fn get_many_nil_compiled_dirty<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
+    compiled: ResourceArc<CompiledPaths>,
+) -> Term<'a> {
+    let mut nodes = 0usize;
+    extract_compiled(env, &doc.value, &compiled, &mut nodes)
+}
+
+#[inline]
+fn do_get_many_nil<'a>(
+    env: Env<'a>,
+    doc: &ParsedDocument,
     paths: ListIterator<'a>,
+    nodes: &mut usize,
 ) -> NifResult<Term<'a>> {
     let nil_raw = atoms::nil().as_c_arg();
-    let mut nodes = 0usize;
     let mut acc = TermAcc::new();
 
     for path_term in paths {
         // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
         let path: &str = path_term.decode()?;
         let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
-            Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
+            Some(value) => match value_to_term(env, value, MAX_DEPTH, nodes) {
                 Some(term) => term.as_c_arg(),
                 None => nil_raw,
             },
@@ -682,8 +767,30 @@ fn get_many_nil<'a>(
         acc.push(r);
     }
 
-    consume_timeslice_nodes(env, nodes);
+    *nodes += acc.len();
     Ok(acc.into_list(env))
+}
+
+#[rustler::nif]
+fn get_many_nil<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    paths: ListIterator<'a>,
+) -> NifResult<Term<'a>> {
+    let mut nodes = 0usize;
+    let result = do_get_many_nil(env, &doc, paths, &mut nodes)?;
+    consume_timeslice_nodes(env, nodes);
+    Ok(result)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn get_many_nil_dirty<'a>(
+    env: Env<'a>,
+    doc: ResourceArc<ParsedDocument>,
+    paths: ListIterator<'a>,
+) -> NifResult<Term<'a>> {
+    let mut nodes = 0usize;
+    do_get_many_nil(env, &doc, paths, &mut nodes)
 }
 
 #[cfg(test)]

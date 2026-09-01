@@ -861,4 +861,40 @@ defmodule Torque.PointerTest do
       assert large < 100_000, "8192 paths took #{Float.round(large / 1000, 1)} ms to compile"
     end
   end
+
+  # Dirty dispatch depends on path count and bytes, not document size.
+  describe "path-count dispatch" do
+    @doc_json ~s({"a":1,"b":{"c":"x"},"arr":[10,20]})
+
+    test "a compiled handle carries the number of paths it was built from" do
+      assert {ref, 3} = Torque.compile_pointers(["/a", "/b/c", "/a"])
+      assert is_reference(ref)
+      assert {_, 0} = Torque.compile_pointers([])
+    end
+
+    test "a path set past the threshold answers what the normal scheduler does" do
+      # 2049 paths: over the dispatch threshold, so every call below runs on a
+      # dirty scheduler while the reference values come from the normal NIF.
+      paths = ["/a", "/b/c", "/arr/1"] ++ for(i <- 1..2046, do: "/missing#{i}")
+      defaults = Map.new(paths, fn p -> {p, :default} end)
+      {:ok, doc} = Torque.parse(@doc_json)
+      {ref, count} = ptrs = Torque.compile_pointers(paths)
+      assert count == length(paths)
+
+      assert Torque.get_many_nil(doc, paths) == Torque.Native.get_many_nil(doc, paths)
+      assert Torque.get_many(doc, paths) == Torque.Native.get_many(doc, paths)
+      assert Torque.get_many_nil(doc, ptrs) == Torque.Native.get_many_nil_compiled(doc, ref)
+
+      assert Torque.get_many_defaults(doc, defaults) ==
+               Torque.Native.get_many_defaults(doc, defaults)
+
+      assert Torque.parse_get_many_nil(@doc_json, ptrs) ==
+               Torque.Native.parse_get_many_nil(@doc_json, ref)
+
+      # And the values themselves, so "identical" cannot mean "both wrong".
+      assert [1, "x", 20 | rest] = Torque.get_many_nil(doc, ptrs)
+      assert Enum.all?(rest, &is_nil/1)
+      assert Torque.get_many_defaults(doc, defaults)["/missing1"] == :default
+    end
+  end
 end

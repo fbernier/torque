@@ -12,7 +12,8 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
   with one documented deviation: `"/"` selects the root, not the empty key)
 - Batch field extraction (`get_many/2`) with single NIF call
 - Pre-compiled pointers with fused parse + extract (`parse_get_many_nil/2`)
-- Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than 20 KB (opt-in `dirty: true` for encode)
+- Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than 20 KB,
+  and for batch lookups past 2048 paths (opt-in `dirty: true` for encode)
 - jiffy-compatible `{proplist}` encoding
 
 ## Installation
@@ -108,7 +109,9 @@ pointers = Torque.compile_pointers(["/id", "/site/domain", "/imp/0/banner/w"], u
 ```
 
 Missing fields and JSON `null` both become `nil`. The handle also works with an
-already-parsed document via `Torque.get_many_nil(doc, pointers)`.
+already-parsed document via `Torque.get_many_nil(doc, pointers)`. It is opaque:
+a resource reference plus the number of paths it holds, which is what sends a
+large path set to a dirty scheduler without walking the list at every call.
 
 By default a malformed document is reported wherever the fault is, exactly as
 `parse/2` reports it, even when the fault sits in a region no path selects.
