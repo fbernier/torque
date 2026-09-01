@@ -388,6 +388,54 @@ defmodule Torque.PointerTest do
     end
   end
 
+  describe "get_many_defaults/2" do
+    setup do
+      {:ok, doc} = Torque.parse(~s({"a":1,"b":null,"deep":{"x":[1,2]},"s":"str"}))
+      %{d: doc}
+    end
+
+    test "keeps the default for a missing path, a null, and nothing else", %{d: doc} do
+      assert Torque.get_many_defaults(doc, %{"/a" => 0, "/b" => 0, "/missing" => :gone}) ==
+               %{"/a" => 1, "/b" => 0, "/missing" => :gone}
+    end
+
+    test "agrees with get_many_nil plus manual substitution", %{d: doc} do
+      defaults = %{"/a" => 0, "/b" => :d, "/deep" => :d, "/deep/x/1" => :d, "/missing" => :d}
+      paths = Map.keys(defaults)
+
+      manual =
+        paths
+        |> Enum.zip(Torque.get_many_nil(doc, paths))
+        |> Map.new(fn
+          {p, nil} -> {p, Map.get(defaults, p)}
+          pv -> pv
+        end)
+
+      assert Torque.get_many_defaults(doc, defaults) == manual
+    end
+
+    test "extracts subtrees and the whole document", %{d: doc} do
+      assert %{"/deep" => %{"x" => [1, 2]}, "" => whole} =
+               Torque.get_many_defaults(doc, %{"/deep" => :d, "" => :d})
+
+      assert whole == Torque.decode!(~s({"a":1,"b":null,"deep":{"x":[1,2]},"s":"str"}))
+    end
+
+    test "empty map, and more keys than a flatmap holds", %{d: doc} do
+      assert Torque.get_many_defaults(doc, %{}) == %{}
+
+      many = Map.new(1..100, fn i -> {"/k#{i}", i} end)
+      result = Torque.get_many_defaults(doc, many)
+      assert map_size(result) == 100
+      assert result == many
+    end
+
+    test "a non-binary key is a caller bug", %{d: doc} do
+      assert_raise ArgumentError, fn -> Torque.get_many_defaults(doc, %{:a => 1}) end
+      assert_raise ArgumentError, fn -> Torque.get_many_defaults(doc, %{<<0xFF>> => 1}) end
+    end
+  end
+
   describe "compile_pointers/2 + get_many_nil/2" do
     @ptr_paths [
       "/id",

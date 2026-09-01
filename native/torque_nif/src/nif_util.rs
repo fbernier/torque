@@ -1,5 +1,9 @@
+use std::mem::MaybeUninit;
+
 use rustler::sys::{
-    enif_get_map_size, enif_make_map_from_arrays, enif_make_tuple_from_array, ERL_NIF_TERM,
+    enif_get_map_size, enif_make_map_from_arrays, enif_make_tuple_from_array,
+    enif_map_iterator_create, enif_map_iterator_destroy, enif_map_iterator_get_pair,
+    enif_map_iterator_next, ErlNifMapIterator, ErlNifMapIteratorEntry, ERL_NIF_TERM,
 };
 use rustler::{Env, Term};
 
@@ -53,4 +57,63 @@ pub unsafe fn map_from_arrays(
     }
     let mut size = 0;
     enif_get_map_size(env.as_c_arg(), *map, &mut size) != 0 && size == count
+}
+
+/// Single-direction forward iterator over map entries.
+///
+/// Avoids the overhead of bidirectional iterators when only forward traversal
+/// is needed. Destroys the underlying ERTS iterator on drop.
+pub struct MapEntries<'a> {
+    env: Env<'a>,
+    iter: ErlNifMapIterator,
+}
+
+impl<'a> MapEntries<'a> {
+    pub fn new(env: Env<'a>, map: Term<'a>) -> Option<Self> {
+        let mut iter = MaybeUninit::<ErlNifMapIterator>::uninit();
+        // SAFETY: `enif_map_iterator_create` initialises `iter` and reports
+        // whether it did; anything but a map leaves it untouched and fails.
+        let created = unsafe {
+            enif_map_iterator_create(
+                env.as_c_arg(),
+                map.as_c_arg(),
+                iter.as_mut_ptr(),
+                ErlNifMapIteratorEntry::ERL_NIF_MAP_ITERATOR_HEAD,
+            )
+        };
+        if created == 0 {
+            return None;
+        }
+        Some(MapEntries {
+            env,
+            // SAFETY: created, as just checked.
+            iter: unsafe { iter.assume_init() },
+        })
+    }
+}
+
+impl<'a> Iterator for MapEntries<'a> {
+    type Item = (Term<'a>, Term<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (mut key, mut val) = (0 as ERL_NIF_TERM, 0 as ERL_NIF_TERM);
+        // SAFETY: the iterator is live for as long as `self` is, and both terms
+        // it hands back belong to `self.env`.
+        unsafe {
+            if enif_map_iterator_get_pair(self.env.as_c_arg(), &mut self.iter, &mut key, &mut val)
+                == 0
+            {
+                return None;
+            }
+            enif_map_iterator_next(self.env.as_c_arg(), &mut self.iter);
+            Some((Term::new(self.env, key), Term::new(self.env, val)))
+        }
+    }
+}
+
+impl Drop for MapEntries<'_> {
+    fn drop(&mut self) {
+        // SAFETY: created in `new` and destroyed exactly once, here.
+        unsafe { enif_map_iterator_destroy(self.env.as_c_arg(), &mut self.iter) };
+    }
 }
