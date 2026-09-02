@@ -840,6 +840,74 @@ defmodule Torque.PointerTest do
     end
   end
 
+  # A string the parser never had to unescape comes back as a sub-binary of the
+  # caller's JSON rather than a copy, the way `decode/1` has always returned
+  # string values. What has to hold is that the bytes are the same ones a
+  # parsed document answers with, and that they survive the input going away.
+  describe "extracted strings" do
+    test "every way of writing a string answers what a parsed document does" do
+      json =
+        ~s({"plain":"hello","esc":"a\\nb\\"c\\\\d","uni":"caf\\u00e9",) <>
+          ~s("empty":"","tail":"at the very end"})
+
+      paths = ["/plain", "/esc", "/uni", "/empty", "/tail"]
+      {:ok, doc} = Torque.parse(json)
+      expected = ["hello", "a\nb\"c\\d", "café", "", "at the very end"]
+      assert Torque.get_many_nil(doc, paths) == expected
+
+      for ptrs <- [
+            Torque.compile_pointers(paths),
+            Torque.compile_pointers(paths, validate: false),
+            Torque.compile_pointers(paths, unique_keys: true)
+          ] do
+        assert {:ok, ^expected} = Torque.parse_get_many_nil(json, ptrs)
+      end
+    end
+
+    test "an extracted string keeps its bytes after the input is dropped" do
+      ptrs = Torque.compile_pointers(["/ua"])
+      ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0"
+
+      extracted =
+        (fn ->
+           json = :binary.copy(~s({"pad":"#{String.duplicate("x", 512)}","ua":"#{ua}"}))
+           {:ok, [v]} = Torque.parse_get_many_nil(json, ptrs)
+           v
+         end).()
+
+      :erlang.garbage_collect()
+      for _ <- 1..50, do: :binary.copy(<<0::size(8192)>>)
+      :erlang.garbage_collect()
+
+      assert extracted == ua
+    end
+
+    # Pointing a term at the input keeps the whole input alive behind it, which
+    # is the wrong trade for the one call whose purpose is to answer a few
+    # paths and drop the document: a 100-byte user agent taken from a 400 KB
+    # feed held all 400 KB. Measured in a process of its own, since
+    # `process_info(:binary)` reports what the *caller* still references and
+    # the test's own scope holds the input.
+    test "a small field taken from a large input does not keep it alive" do
+      ptrs = Torque.compile_pointers(["/ua"])
+      ua = String.duplicate("u", 100)
+      parent = self()
+
+      spawn(fn ->
+        json = ~s({"pad":"#{String.duplicate("x", 400_000)}","ua":"#{ua}"})
+        {:ok, [v]} = Torque.parse_get_many_nil(json, ptrs)
+        :erlang.garbage_collect()
+        {:binary, refs} = :erlang.process_info(self(), :binary)
+        send(parent, {v, Enum.sum(Enum.map(refs, fn {_, size, _} -> size end))})
+        # Hold until the assertions run, so nothing above can be collected.
+        receive do: (:done -> :ok)
+      end)
+
+      assert_receive {^ua, retained}
+      assert retained < 4096, "a 100-byte field kept #{retained} bytes of input alive"
+    end
+  end
+
   describe "compiled pointer plans" do
     # Plan construction must index wide fan-out instead of scanning every prior
     # child. The ratio detects quadratic growth; the ceiling catches both sides

@@ -27,7 +27,8 @@ use sonic_number::ParserNumber;
 
 use crate::{
     error::{ErrorCode, Result},
-    parser::{restore_neg_zero, Parser, DEFAULT_KEY_BUF_CAPACITY, MAX_PARSE_DEPTH},
+    parser::Reference,
+    parser::{restore_neg_zero, Parser, MAX_PARSE_DEPTH},
     reader::{Read, Reader},
     util::utf8::from_utf8,
     value::shared::Shared,
@@ -172,13 +173,24 @@ impl ExtractPlan {
     }
 }
 
+/// Extracted value. Unescaped strings may borrow the input; all other values
+/// own their storage through `Value`.
+#[derive(Debug, Clone)]
+pub enum Extracted<'de> {
+    /// Bytes inside the input, valid UTF-8, no escapes.
+    Str(&'de str),
+    /// Anything else: containers, numbers, literals, and strings that had to be
+    /// unescaped into scratch space.
+    Value(Value),
+}
+
 /// Extracts every planned path in insertion order. Missing paths return `None`.
 pub fn extract<'de, Input: JsonInput<'de>>(
     json: Input,
     plan: &ExtractPlan,
     validate: Validate,
     keys: Keys,
-) -> Result<Vec<Option<Value>>> {
+) -> Result<Vec<Option<Extracted<'de>>>> {
     let slice = json.to_u8_slice();
     // `Value` stores offsets in `u32`, so enforce the same bound as full parsing.
     if crate::json_too_large(slice.len()) {
@@ -190,8 +202,10 @@ pub fn extract<'de, Input: JsonInput<'de>>(
     let reader = Read::new(slice, false);
     let mut parser = Parser::new(reader);
 
-    let mut out: Vec<Option<Value>> = (0..plan.slots).map(|_| None).collect();
-    let mut strbuf = Vec::with_capacity(DEFAULT_KEY_BUF_CAPACITY);
+    let mut out: Vec<Option<Extracted<'de>>> = (0..plan.slots).map(|_| None).collect();
+    // Escaped strings share this scratch buffer. Documents without escapes do
+    // not allocate it.
+    let mut strbuf = Vec::new();
     let mut ex = Extractor {
         plan,
         out: &mut out,
@@ -228,9 +242,9 @@ enum Seen {
     Stamped(u32),
 }
 
-struct Extractor<'p, 'o> {
+struct Extractor<'p, 'o, 'de> {
     plan: &'p ExtractPlan,
-    out: &'o mut Vec<Option<Value>>,
+    out: &'o mut Vec<Option<Extracted<'de>>>,
     checked: bool,
     first_wins: bool,
     /// Stamp per plan node, indexed by node id. Empty until a node wider than
@@ -240,7 +254,7 @@ struct Extractor<'p, 'o> {
     generation: u32,
 }
 
-impl Extractor<'_, '_> {
+impl<'de> Extractor<'_, '_, 'de> {
     /// Prepares duplicate tracking for an object whose plan node has `keys`
     /// planned keys.
     #[inline]
@@ -281,7 +295,7 @@ impl Extractor<'_, '_> {
     /// Handles the current parser value for one plan node. `depth` is shared by
     /// planned descent, skipped regions, and selected subtrees so extraction
     /// enforces the full parser's single nesting budget.
-    fn value<'de, R: Reader<'de>>(
+    fn value<R: Reader<'de>>(
         &mut self,
         parser: &mut Parser<R>,
         strbuf: &mut Vec<u8>,
@@ -297,8 +311,11 @@ impl Extractor<'_, '_> {
             for slot in n.slots.iter() {
                 self.out[*slot as usize] = Some(value.clone());
             }
+            // Only owned container values can have planned descendants.
             if n.has_children {
-                self.descend_value(&value, node);
+                if let Extracted::Value(v) = &value {
+                    self.descend_value(v, node);
+                }
             }
             return Ok(());
         }
@@ -314,7 +331,7 @@ impl Extractor<'_, '_> {
         }
     }
 
-    fn object<'de, R: Reader<'de>>(
+    fn object<R: Reader<'de>>(
         &mut self,
         parser: &mut Parser<R>,
         strbuf: &mut Vec<u8>,
@@ -386,7 +403,7 @@ impl Extractor<'_, '_> {
         }
     }
 
-    fn array<'de, R: Reader<'de>>(
+    fn array<R: Reader<'de>>(
         &mut self,
         parser: &mut Parser<R>,
         strbuf: &mut Vec<u8>,
@@ -467,7 +484,7 @@ impl Extractor<'_, '_> {
     fn fill(&mut self, value: &Value, node: u32) {
         let n = &self.plan.nodes[node as usize];
         for slot in n.slots.iter() {
-            self.out[*slot as usize] = Some(value.clone());
+            self.out[*slot as usize] = Some(Extracted::Value(value.clone()));
         }
         if n.has_children {
             self.descend_value(value, node);
@@ -487,16 +504,13 @@ fn last_key<'v>(value: &'v Value, key: &str) -> Option<&'v Value> {
     }
 }
 
-/// Parse the value the parser is positioned at into a standalone `Value`.
-///
-/// A scalar is built directly, so extracting a number, string or literal
-/// allocates nothing beyond the string itself; only a container needs a
-/// document arena.
+/// Parses the current value in place. Scalars are built directly, unescaped
+/// strings borrow the input, and only containers need an arena.
 fn parse_value_in_place<'de, R: Reader<'de>>(
     parser: &mut Parser<R>,
     strbuf: &mut Vec<u8>,
     depth: usize,
-) -> Result<Value> {
+) -> Result<Extracted<'de>> {
     match parser.skip_space_peek() {
         Some(b'{') | Some(b'[') => {
             let mut shared = Arc::new(Shared::default());
@@ -505,23 +519,27 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
             let mut parsed = Value::new();
             parsed.parse_without_padding(smut, strbuf, parser, depth)?;
             let _ = Arc::get_mut(&mut shared);
-            Ok(parsed)
+            Ok(Extracted::Value(parsed))
         }
         Some(b'"') => {
             parser.read.eat(1);
-            let s = parser.parse_str(strbuf)?;
-            Ok(Value::copy_str(&s))
+            match parser.parse_str(strbuf)? {
+                // Borrow unescaped input; copy parser scratch before it is reused.
+                Reference::Borrowed(s) => Ok(Extracted::Str(s)),
+                Reference::Copied(s) => Ok(Extracted::Value(Value::copy_str(s))),
+            }
         }
         Some(c @ b'-') | Some(c @ b'0'..=b'9') => {
             let start = parser.read.index();
             parser.read.eat(1);
             match parser.parse_number(c)? {
-                ParserNumber::Unsigned(u) => Ok(Value::new_u64(u)),
-                ParserNumber::Signed(i) => Ok(Value::new_i64(i)),
+                ParserNumber::Unsigned(u) => Ok(Extracted::Value(Value::new_u64(u))),
+                ParserNumber::Signed(i) => Ok(Extracted::Value(Value::new_i64(i))),
                 ParserNumber::Float(f) => {
                     // Preserve negative zero across every decode path.
                     let token = parser.read.slice_unchecked(start, parser.read.index());
                     Value::new_f64(restore_neg_zero(f, token))
+                        .map(Extracted::Value)
                         .ok_or_else(|| parser.error(ErrorCode::InvalidNumber))
                 }
             }
@@ -529,9 +547,9 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
         Some(_) => {
             let (slice, _) = parser.skip_one(true)?;
             match slice {
-                b"true" => Ok(Value::new_bool(true)),
-                b"false" => Ok(Value::new_bool(false)),
-                b"null" => Ok(Value::new_null()),
+                b"true" => Ok(Extracted::Value(Value::new_bool(true))),
+                b"false" => Ok(Extracted::Value(Value::new_bool(false))),
+                b"null" => Ok(Extracted::Value(Value::new_null())),
                 _ => Err(parser.error(ErrorCode::InvalidJsonValue)),
             }
         }

@@ -14,6 +14,7 @@
 #   * negative-zero restoration only at float conversion sites
 #   * reusable multi-path extraction with optional structural skipping and
 #     indexed construction for wide plan nodes
+#   * borrowed unescaped strings in extraction results
 #   * shared nesting enforcement for validated structural skips
 #   * `skip_one_value_at` skips without materialising the skipped bytes, for
 #     the callers that discard them

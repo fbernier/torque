@@ -6,8 +6,10 @@ use crate::nif_util::{
 };
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
-use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
-use rustler::{schedule, Binary, Encoder, Env, ListIterator, NifResult, ResourceArc, Term};
+use rustler::sys::{enif_make_list_from_array, enif_make_sub_binary, ERL_NIF_TERM};
+use rustler::{
+    schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
+};
 use sonic_rs::JsonValueTrait;
 
 const GET_MANY_STACK: usize = 64;
@@ -631,17 +633,78 @@ fn extract_compiled<'a>(
     acc.into_list(env)
 }
 
+/// Builds a string term, borrowing from `input` when requested and safe.
+#[inline]
+fn extracted_str_term(
+    env: Env,
+    input_term: ERL_NIF_TERM,
+    input: &[u8],
+    s: &str,
+    borrow: bool,
+) -> ERL_NIF_TERM {
+    if borrow {
+        if let Some(offset) = (s.as_ptr() as usize).checked_sub(input.as_ptr() as usize) {
+            if let Some(room) = input.len().checked_sub(offset) {
+                if s.len() <= room {
+                    return unsafe {
+                        enif_make_sub_binary(env.as_c_arg(), input_term, offset, s.len())
+                    };
+                }
+            }
+        }
+    }
+    let mut binary = NewBinary::new(env, s.len());
+    binary.as_mut_slice().copy_from_slice(s.as_bytes());
+    let term: Term = binary.into();
+    term.as_c_arg()
+}
+
+/// Inputs at or under this are borrowed from whatever is taken out of them.
+/// A binary this size is a single allocation whose cost is about what the refc
+/// bookkeeping for one extracted string is, so refusing to pin it buys nothing
+/// and costs a copy. The request-shaped documents this path is tuned on - a
+/// 1.9 KB OpenRTB bid request - sit well inside it.
+const BORROW_ANY_INPUT: usize = 4096;
+
+/// Otherwise, extracted strings must cover this fraction of the input.
+const BORROW_INPUT_FRACTION: usize = 4;
+
+/// Whether extracted strings should point into the caller's binary.
+///
+/// A sub-binary keeps the whole input alive for as long as any string cut from
+/// it survives. That is the trade `decode/1` makes and worth making there,
+/// since a decoded document holds most of its input anyway. One-shot
+/// extraction is the opposite shape - it exists to answer a few paths and drop
+/// the document - and a 100-byte user agent taken from a 400 KB feed pinned
+/// all 400 KB of it, which `process_info(:binary)` reports and a bidder
+/// running a million of these a second pays for.
+///
+/// ERTS copies a slice of 64 bytes or less onto the process heap, so only
+/// longer strings can pin anything at all; what is left is a per-call
+/// question, answered once for the batch rather than per string so that a
+/// result list is either all borrowed or all copied.
+///
+/// `borrowed_len` is called only for an input large enough for the answer to
+/// depend on it, so the request-shaped documents this path is tuned on never
+/// walk their results twice.
+#[inline]
+fn borrow_input(input_len: usize, borrowed_len: impl FnOnce() -> usize) -> bool {
+    input_len <= BORROW_ANY_INPUT
+        || borrowed_len().saturating_mul(BORROW_INPUT_FRACTION) >= input_len
+}
+
 /// Parses once and returns the result term with the number of bytes reached.
 /// Selected values are built directly; other regions are parsed or skipped
 /// according to the compiled validation policy.
 #[inline]
 fn do_parse_get_many_nil<'a>(
     env: Env<'a>,
+    input_term: ERL_NIF_TERM,
     bytes: &[u8],
     compiled: &CompiledPaths,
     nodes: &mut usize,
 ) -> (Term<'a>, usize) {
-    use sonic_rs::extract::{Keys, Validate};
+    use sonic_rs::extract::{Extracted, Keys, Validate};
 
     let validate = if compiled.validate {
         Validate::Yes
@@ -657,10 +720,28 @@ fn do_parse_get_many_nil<'a>(
     match sonic_rs::extract::extract(bytes, &compiled.plan, validate, keys) {
         Ok(values) => {
             let nil_raw = atoms::nil().as_c_arg();
+            // Decided once for the batch, so a result list is either all
+            // borrowed or all copied.
+            let borrow = borrow_input(bytes.len(), || {
+                values
+                    .iter()
+                    .map(|v| match v {
+                        Some(Extracted::Str(s)) => s.len(),
+                        _ => 0,
+                    })
+                    .sum()
+            });
             let mut acc = TermAcc::with_hint(values.len());
             for v in values.iter() {
                 let t = match v {
-                    Some(v) => value_to_term(env, v, MAX_DEPTH, nodes)
+                    // A string the parser never had to unescape is still in the
+                    // caller's binary, so the term can point at it rather than
+                    // pay a copy into a `Value` and another out of it - as long
+                    // as keeping the input behind it is worth that.
+                    Some(Extracted::Str(s)) => {
+                        extracted_str_term(env, input_term, bytes, s, borrow)
+                    }
+                    Some(Extracted::Value(v)) => value_to_term(env, v, MAX_DEPTH, nodes)
                         .map(|t| t.as_c_arg())
                         .unwrap_or(nil_raw),
                     None => nil_raw,
@@ -680,11 +761,13 @@ fn do_parse_get_many_nil<'a>(
 #[rustler::nif]
 fn parse_get_many_nil<'a>(
     env: Env<'a>,
-    json: Binary,
+    json: Binary<'a>,
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut nodes = 0usize;
-    let (result, scanned) = do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes);
+    let input_term = json.to_term(env).as_c_arg();
+    let (result, scanned) =
+        do_parse_get_many_nil(env, input_term, json.as_slice(), &compiled, &mut nodes);
     // Bytes cover the parse, nodes the extraction; one hint covers both.
     consume_timeslice_mixed(env, scanned, nodes);
     result
@@ -693,11 +776,12 @@ fn parse_get_many_nil<'a>(
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_get_many_nil_dirty<'a>(
     env: Env<'a>,
-    json: Binary,
+    json: Binary<'a>,
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut nodes = 0usize;
-    do_parse_get_many_nil(env, json.as_slice(), &compiled, &mut nodes).0
+    let input_term = json.to_term(env).as_c_arg();
+    do_parse_get_many_nil(env, input_term, json.as_slice(), &compiled, &mut nodes).0
 }
 
 #[inline]
