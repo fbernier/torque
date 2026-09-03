@@ -28,7 +28,6 @@ pub trait JsonVisitor<'de> {
     /// original token bytes (including any leading `-`); `as_f64` is the lossy
     /// float fallback. The default preserves historical behavior by yielding
     /// the float; visitors that want exact bignums override this.
-    #[allow(dead_code)]
     fn visit_overflow_int(&mut self, _raw: &str, as_f64: f64) -> bool {
         self.visit_f64(as_f64)
     }
@@ -66,12 +65,10 @@ pub trait JsonVisitor<'de> {
     }
 
     // Object-key hooks default to string hooks for visitors that do not distinguish them.
-    #[allow(dead_code)]
     fn visit_key(&mut self, key: &str) -> bool {
         self.visit_str(key)
     }
 
-    #[allow(dead_code)]
     fn visit_borrowed_key(&mut self, key: &'de str) -> bool {
         self.visit_borrowed_str(key)
     }

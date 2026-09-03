@@ -27,7 +27,6 @@ thread_local! {
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
 }
 
-#[derive(Debug)]
 enum EncodeError {
     UnsupportedType,
     NonFiniteFloat,
