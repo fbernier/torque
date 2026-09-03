@@ -28,7 +28,6 @@ pub trait JsonVisitor<'de> {
     /// `-`; `as_f64` is the lossy fallback, or signed infinity if the magnitude
     /// also exceeds finite f64. The default preserves the finite-float behavior
     /// and rejects nonfinite values; visitors wanting exact bignums override it.
-    #[allow(dead_code)]
     fn visit_overflow_int(&mut self, _raw: &str, as_f64: f64) -> bool {
         as_f64.is_finite() && self.visit_f64(as_f64)
     }
@@ -66,12 +65,10 @@ pub trait JsonVisitor<'de> {
     }
 
     // Object-key hooks default to string hooks for visitors that do not distinguish them.
-    #[allow(dead_code)]
     fn visit_key(&mut self, key: &str) -> bool {
         self.visit_str(key)
     }
 
-    #[allow(dead_code)]
     fn visit_borrowed_key(&mut self, key: &'de str) -> bool {
         self.visit_borrowed_str(key)
     }
