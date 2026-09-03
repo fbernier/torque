@@ -10,6 +10,9 @@ mod types;
 pub struct ParsedDocument {
     pub value: sonic_rs::Value,
     pub unique_keys: bool,
+    /// Set after document-dependent lookup work exceeds the normal-scheduler
+    /// budget.
+    pub heavy: std::sync::atomic::AtomicBool,
 }
 
 #[rustler::resource_impl]

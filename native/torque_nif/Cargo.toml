@@ -13,5 +13,7 @@ crate-type = ["cdylib"]
 rustler = { version = "0.36", features = ["big_integer"] }
 sonic-rs = "0.5"
 itoa = "1"
+# Seeded hash table for per-batch wide-object indexes.
+ahash = "0.8"
 # Schubfach float-to-decimal formatting.
 zmij = "1"

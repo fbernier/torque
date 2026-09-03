@@ -326,9 +326,6 @@ defmodule Torque.EncodeTest do
       assert {:ok, "1000000000000000.0"} = Torque.encode(1.0e15)
       assert {:ok, "1e+16"} = Torque.encode(1.0e16)
       assert {:ok, "1e-7"} = Torque.encode(1.0e-7)
-    end
-
-    test "floats nested in containers format the same way" do
       assert {:ok, ~s({"a":[1e+16,-0.0]})} = Torque.encode(%{"a" => [1.0e16, -0.0]})
     end
   end

@@ -230,7 +230,7 @@ pub fn value_to_term<'a>(
                     [MaybeUninit::uninit(); FLATMAP_LIMIT];
                 let orderable = (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&count);
                 for (i, (k, v)) in pairs.iter().enumerate() {
-                    let key = k.as_str().unwrap_or("");
+                    let key = k.as_node_str().unwrap_or("");
                     if orderable {
                         key_strs[i].write(key);
                     }
@@ -261,7 +261,7 @@ pub fn value_to_term<'a>(
                 let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 for (k, v) in pairs.iter() {
-                    keys.push(make_binary_term(env, k.as_str().unwrap_or("")).as_c_arg());
+                    keys.push(make_binary_term(env, k.as_node_str().unwrap_or("")).as_c_arg());
                     vals.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
                 let mut map: ERL_NIF_TERM = 0;

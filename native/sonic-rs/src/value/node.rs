@@ -997,11 +997,32 @@ impl Value {
     /// duplicate keys. Other values and Rust-built map objects return `None`.
     #[inline]
     pub fn as_pair_slice(&self) -> Option<&[(Value, Value)]> {
+        if self.meta.get_type() == Meta::OBJ_NODE {
+            let len = self.meta.unpack_dom_node().len as usize;
+            // SAFETY: `OBJ_NODE` stores `len` pairs owned by the live arena.
+            let pairs = unsafe { self.data.obj_pairs.as_ptr() };
+            return Some(unsafe { from_raw_parts(pairs, len) });
+        }
         match self.as_ref2() {
             ValueRefInner::Object(pairs) => Some(pairs),
             ValueRefInner::EmptyObject => Some(&[]),
             _ => None,
         }
+    }
+
+    /// Fast path for strings stored in parsed-document nodes. Reading the
+    /// pointer and length directly avoids resolving the arena header per object
+    /// key. Other string representations fall back to [`Value::as_str`].
+    #[inline(always)]
+    pub fn as_node_str(&self) -> Option<&str> {
+        if self.meta.get_type() == Meta::STR_NODE {
+            let len = self.meta.unpack_dom_node().len as usize;
+            // SAFETY: `dom_str` is the union field a `STR_NODE` writes, and the
+            // arena it points into outlives this borrow of the node.
+            let ptr = unsafe { self.data.dom_str.as_ptr() };
+            return Some(unsafe { str_from_raw_parts(ptr, len) });
+        }
+        self.as_str()
     }
 
     /// Create a new string Value from a `&'static str` with zero-copy.
@@ -1167,6 +1188,12 @@ impl Value {
     /// Returns the backing slice for a parsed array, or `None` for other values.
     #[inline]
     pub fn as_value_slice(&self) -> Option<&[Value]> {
+        if self.meta.get_type() == Meta::ARR_NODE {
+            let len = self.meta.unpack_dom_node().len as usize;
+            // SAFETY: `ARR_NODE` stores `len` values owned by the live arena.
+            let elems = unsafe { self.data.arr_elems.as_ptr() };
+            return Some(unsafe { from_raw_parts(elems, len) });
+        }
         match self.as_ref2() {
             ValueRefInner::Array(s) => Some(s),
             ValueRefInner::EmptyArray => Some(&[]),
