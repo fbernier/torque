@@ -4,6 +4,8 @@ rustler::atoms! {
     no_such_field,
     nesting_too_deep,
     nil,
+    // Requests a dirty-scheduler retry.
+    dirty_required,
     // atoms for fast identity comparison in encoder
     r#true = "true",
     r#false = "false",

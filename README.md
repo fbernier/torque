@@ -12,9 +12,10 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
   with one documented deviation: `"/"` selects the root, not the empty key)
 - Batch field extraction (`get_many/2`) with single NIF call
 - Pre-compiled pointers with fused parse + extract (`parse_get_many_nil/2`)
-- Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than 20 KB,
-  for lookups over 20 KB of pointer path, and for batches of 2048 paths or more
-  (opt-in `dirty: true` for encode)
+- Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than
+  20 KB and for lookups over 20 KB of pointer path; batch lookups measure their
+  own work and move to a dirty scheduler when they exceed a normal scheduler's
+  share (opt-in `dirty: true` for encode)
 - jiffy-compatible `{proplist}` encoding
 
 ## Installation

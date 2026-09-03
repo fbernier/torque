@@ -981,8 +981,9 @@ defmodule Torque.PointerTest do
       refute Torque.dirty_paths?(small)
       assert Torque.dirty_paths?([big])
       refute Torque.dirty_paths?([small])
-      assert Torque.dirty_paths?(%{big => 1})
-      refute Torque.dirty_paths?(%{small => 1})
+      # A map only ever reaches a lookup, so its byte rule is `dirty_lookup?/1`.
+      assert Torque.dirty_lookup?(%{big => 1})
+      refute Torque.dirty_lookup?(%{small => 1})
 
       # Spread across paths, and past the count while still short.
       assert Torque.dirty_paths?(for(_ <- 1..8, do: "/" <> String.duplicate("k", 4096)))
@@ -1016,6 +1017,80 @@ defmodule Torque.PointerTest do
                  Torque.dirty_paths?(paths),
                "#{length(paths)} paths, #{bytes} bytes"
       end
+    end
+
+    # Document-dependent overruns request a dirty retry.
+    test "a batch that overruns its budget is retried dirty" do
+      wide = Map.new(1..100_000, fn i -> {"k#{i}", i} end) |> Jason.encode!()
+      {:ok, doc} = Torque.parse(wide)
+      paths = Enum.map(1..8, &"/k#{&1 * 12_000}")
+      {ref, _, _} = handle = Torque.compile_pointers(paths)
+      expected = Enum.map(1..8, &(&1 * 12_000))
+
+      # The path set stays below caller-side dispatch thresholds.
+      assert Torque.Native.get_many_nil_compiled(doc, ref) == :dirty_required
+      assert Torque.Native.get_many_nil_compiled_dirty(doc, ref) == expected
+      assert Torque.get_many_nil(doc, handle) == expected
+      assert Torque.get_many_nil(doc, paths) == expected
+      assert Torque.get_many(doc, paths) == Enum.map(expected, &{:ok, &1})
+
+      assert Torque.get_many_defaults(doc, Map.new(paths, &{&1, :missing})) ==
+               Map.new(Enum.zip(paths, expected))
+    end
+
+    # A large but cheap path set remains on a normal scheduler.
+    test "a long but cheap batch stays on a normal scheduler" do
+      {:ok, doc} = Torque.parse(@doc_json)
+      paths = Enum.map(1..2048, fn i -> "/k#{i}" end)
+      {ref, 2048, _} = handle = Torque.compile_pointers(paths)
+
+      assert is_list(Torque.Native.get_many_nil_compiled(doc, ref))
+      assert Torque.get_many_nil(doc, handle) == List.duplicate(nil, 2048)
+      assert Torque.get_many_nil(doc, paths) == List.duplicate(nil, 2048)
+    end
+
+    # Heavy state is scoped to the parsed document. Front keys force full
+    # last-wins scans in the wide document.
+    test "one wide document does not send every later batch dirty" do
+      wide = Map.new(1..100_000, fn i -> {"k#{i}", i} end) |> Jason.encode!()
+      {:ok, heavy} = Torque.parse(wide)
+      {wide_ref, _, _} = Torque.compile_pointers(Enum.map(1..4, &"/k#{&1}"))
+      assert Torque.Native.get_many_nil_compiled(heavy, wide_ref) == :dirty_required
+
+      {:ok, small} = Torque.parse(@doc_json)
+      {ref, _, _} = Torque.compile_pointers(["/a", "/b/c"])
+      assert Torque.Native.get_many_nil_compiled(small, ref) == [1, "x"]
+    end
+
+    # Caller-driven overruns must not mark the document as heavy.
+    test "a path-set overrun does not mark the document heavy" do
+      {:ok, doc} = Torque.parse(@doc_json)
+      {big_ref, _, _} = Torque.compile_pointers(List.duplicate("/a", 40_000))
+      {small_ref, _, _} = Torque.compile_pointers(["/a"])
+
+      assert Torque.Native.get_many_nil_compiled(doc, big_ref) == :dirty_required
+      assert Torque.Native.get_many_nil_compiled(doc, small_ref) == [1]
+
+      # The public API retries the oversized batch without poisoning the
+      # document.
+      assert Torque.get_many_nil(doc, Torque.compile_pointers(List.duplicate("/a", 40_000))) ==
+               List.duplicate(1, 40_000)
+
+      assert Torque.get_many_nil(doc, ["/a", "/b/c"]) == [1, "x"]
+      assert Torque.Native.get_many_nil_compiled(doc, small_ref) == [1]
+    end
+
+    # Result count alone can require dirty dispatch.
+    test "a path set long enough to spend the budget on results starts dirty" do
+      refute Torque.dirty_lookup?(Torque.compile_pointers(List.duplicate("/a", 7999)))
+      assert Torque.dirty_lookup?(Torque.compile_pointers(List.duplicate("/a", 8000)))
+      refute Torque.dirty_lookup?(List.duplicate("/a", 7999))
+      assert Torque.dirty_lookup?(List.duplicate("/a", 8000))
+      # Distinct map keys cross the byte threshold before the count threshold.
+      refute Torque.dirty_lookup?(Map.new(1..64, &{"/k#{&1}", 0}))
+      assert Torque.dirty_lookup?(Map.new(1..8000, &{"/k#{&1}", 0}))
+
+      assert Torque.dirty_lookup?([String.duplicate("/k", 12_000)])
     end
 
     # A batch that ends in `badarg` has still done the lookups before it, and

@@ -31,32 +31,26 @@ defmodule Torque do
 
   ## Scheduler awareness
 
-  Decoding and parsing automatically dispatch inputs larger than 20 KB to a
-  dirty CPU scheduler to avoid blocking normal BEAM schedulers. Lookups
-  dispatch on what the *caller* brings instead, which is what the document's
-  size cannot report:
+  Decoding and parsing dispatch large inputs to dirty CPU schedulers so normal
+  schedulers remain responsive.
 
-    * **Paths**, because a batch builds one result per path — 100k pointers
-      against a two-byte document is 100k terms of work. At 2048 paths or more,
-      `get_many/2`, `get_many_nil/2`, `get_many_defaults/2` and
-      `parse_get_many_nil/2` go dirty.
+  Parsed-document batch lookups account for two kinds of work:
 
-    * **Path bytes**, because a pointer is walked to split it and again to
-      unescape any `~` segment. Past 20 KB of path — one long one, or several
-      adding up — `get/2`, `get/3`, `length/2` and the batch calls go dirty
-      too. The walk that decides this stops at the first answer, so it never
-      reads more than 2048 paths or 20 KB of them.
+    * **Caller work** — path bytes and result count are known before the NIF
+      runs. A batch starts dirty when either would exhaust the normal-scheduler
+      budget.
 
-  `compile_pointers/2` answers the same two questions about the list it is
-  given: a three-path set compiles in about a microsecond, which a dirty hop
-  would roughly double, and 2048 of them take 400 µs, which is not a normal
-  scheduler's to spend.
+    * **Document work** — smaller batches start on a normal scheduler with a
+      fixed budget. If a batch exceeds it, the partial result is discarded and
+      rebuilt on a dirty scheduler. A document-dependent overrun marks the
+      document as heavy, so later batches start dirty. Caller-driven overruns do
+      not mark the document.
 
-  What neither size can predict is a single huge result: `get/2` on a path
-  holding a megabyte of array converts the whole subtree on a normal
-  scheduler. It reports that work to ERTS afterwards rather than moving,
-  which adjusts the calling process's reduction budget without preempting a
-  call already made.
+  `compile_pointers/2` and `parse_get_many_nil/2` use path-set thresholds because
+  their work cannot be retried partway.
+
+  A single large result cannot be predicted before conversion. It completes on
+  the normal scheduler and reports its work to ERTS afterwards.
 
   Encoding cannot cheaply predict its output size up front, so dirty dispatch
   is opt-in there: pass `dirty: true` to `encode/2`, `encode!/2`,
@@ -81,23 +75,37 @@ defmodule Torque do
 
   @timeslice_bytes 20_480
 
-  # Batch lookup work scales with the path set, not the document. Calibrate this
-  # threshold on `get_many_defaults/2`, the most expensive batch operation.
+  # Path-set-only operations dispatch from caller-supplied size thresholds.
   @dirty_path_count 2048
 
-  # A compiled handle reports the same two quantities the raw-list walk
-  # computes, so both forms of the same path set dispatch alike.
+  # Compiled handles cache values otherwise collected by a bounded list walk.
   defguardp compiled_dirty?(count, bytes)
             when count >= @dirty_path_count or bytes > @timeslice_bytes
+
+  # Start lookup batches dirty when result construction alone exhausts the
+  # normal-scheduler budget. Keep this aligned with `NORMAL_BUDGET_NODES`.
+  @dirty_result_count 8000
+
+  # Other lookup batches start dirty only when caller work exceeds the budget.
+  defguardp long_pointers?(count, bytes)
+            when count >= @dirty_result_count or bytes > @timeslice_bytes
+
+  defmacrop retry_dirty(normal, dirty) do
+    quote do
+      case unquote(normal) do
+        :dirty_required -> unquote(dirty)
+        result -> result
+      end
+    end
+  end
 
   @typedoc """
   An opaque handle to a set of pre-compiled JSON Pointer paths, returned by
   `compile_pointers/2`. Pass it to `get_many/2`, `get_many_nil/2`, or
   `parse_get_many_nil/2` in place of a path list to skip per-call path parsing.
 
-  It carries its own path count and total path bytes, so dispatching a call to
-  a dirty scheduler costs two tuple elements rather than a walk of the paths it
-  was built from — and answers that question exactly as the raw list would.
+  It stores its path count and total path bytes so scheduler dispatch does not
+  need to traverse the original list.
   """
   @opaque pointers :: {reference(), non_neg_integer(), non_neg_integer()}
 
@@ -403,9 +411,9 @@ defmodule Torque do
 
   Raises `ArgumentError` if any path in a path list is not a valid UTF-8 binary.
 
-  Automatically uses a dirty CPU scheduler at 2048 paths or more, or past
-  20 KB of path in total: the work is one result per path plus the walk of
-  each, neither of which the document's size reports.
+  Starts on a dirty scheduler when the path set exceeds caller-side thresholds.
+  Other batches start normally and retry dirty if measured work exceeds the
+  scheduler budget.
 
   ## Examples
 
@@ -417,22 +425,28 @@ defmodule Torque do
   @spec get_many(reference(), [binary()] | pointers()) ::
           [{:ok, term()} | {:error, :no_such_field | :nesting_too_deep}]
   def get_many(doc, paths) when is_reference(doc) and is_list(paths) do
-    if many_paths?(paths) do
+    if long_paths?(paths) do
       Torque.Native.get_many_dirty(doc, paths)
     else
-      Torque.Native.get_many(doc, paths)
+      retry_dirty(
+        Torque.Native.get_many(doc, paths),
+        Torque.Native.get_many_dirty(doc, paths)
+      )
     end
   end
 
   def get_many(doc, {pointers, count, bytes})
-      when is_reference(doc) and is_reference(pointers) and compiled_dirty?(count, bytes) do
+      when is_reference(doc) and is_reference(pointers) and long_pointers?(count, bytes) do
     Torque.Native.get_many_compiled_dirty(doc, pointers)
   end
 
   def get_many(doc, {pointers, count, bytes})
       when is_reference(doc) and is_reference(pointers) and is_integer(count) and
              is_integer(bytes) do
-    Torque.Native.get_many_compiled(doc, pointers)
+    retry_dirty(
+      Torque.Native.get_many_compiled(doc, pointers),
+      Torque.Native.get_many_compiled_dirty(doc, pointers)
+    )
   end
 
   @doc """
@@ -452,8 +466,9 @@ defmodule Torque do
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary.
 
-  Automatically uses a dirty CPU scheduler at 2048 paths or more, or past 20 KB
-  of path in total - both counted from the handle when given one.
+  Starts on a dirty scheduler when the path set exceeds caller-side thresholds.
+  Other batches start normally and retry dirty if measured work exceeds the
+  scheduler budget.
 
   ## Examples
 
@@ -469,35 +484,49 @@ defmodule Torque do
   @doc group: :parse_get
   @spec get_many_nil(reference(), [binary()] | pointers()) :: [term()]
   def get_many_nil(doc, paths) when is_reference(doc) and is_list(paths) do
-    if many_paths?(paths) do
+    if long_paths?(paths) do
       Torque.Native.get_many_nil_dirty(doc, paths)
     else
-      Torque.Native.get_many_nil(doc, paths)
+      retry_dirty(
+        Torque.Native.get_many_nil(doc, paths),
+        Torque.Native.get_many_nil_dirty(doc, paths)
+      )
     end
   end
 
   def get_many_nil(doc, {pointers, count, bytes})
-      when is_reference(doc) and is_reference(pointers) and compiled_dirty?(count, bytes) do
+      when is_reference(doc) and is_reference(pointers) and long_pointers?(count, bytes) do
     Torque.Native.get_many_nil_compiled_dirty(doc, pointers)
   end
 
   def get_many_nil(doc, {pointers, count, bytes})
       when is_reference(doc) and is_reference(pointers) and is_integer(count) and
              is_integer(bytes) do
-    Torque.Native.get_many_nil_compiled(doc, pointers)
+    retry_dirty(
+      Torque.Native.get_many_nil_compiled(doc, pointers),
+      Torque.Native.get_many_nil_compiled_dirty(doc, pointers)
+    )
   end
 
   @doc false
-  # Exposed for scheduler-dispatch tests; normal and dirty calls return the same values.
+  # Exposed for tests of path-set-only dispatch. No map clause: the only call
+  # that takes a map is `get_many_defaults/2`, a lookup, which is
+  # `dirty_lookup?/1`'s question.
   def dirty_paths?(paths) when is_list(paths), do: many_paths?(paths)
-  def dirty_paths?(defaults) when is_map(defaults), do: many_default_paths?(defaults)
   def dirty_paths?(path) when is_binary(path), do: byte_size(path) > @timeslice_bytes
 
   def dirty_paths?({_pointers, count, bytes}) when is_integer(count) and is_integer(bytes),
     do: compiled_dirty?(count, bytes)
 
-  # Stop once either the path count or cumulative path bytes require dirty
-  # dispatch. The bounded walk avoids traversing an already oversized list.
+  @doc false
+  # Exposed for tests of lookup-side caller thresholds.
+  def dirty_lookup?(paths) when is_list(paths), do: long_paths?(paths)
+  def dirty_lookup?(defaults) when is_map(defaults), do: long_default_paths?(defaults)
+
+  def dirty_lookup?({_pointers, count, bytes}) when is_integer(count) and is_integer(bytes),
+    do: long_pointers?(count, bytes)
+
+  # Stop at the first path-count or byte threshold.
   defp many_paths?(paths) do
     many_paths?(paths, @dirty_path_count, 0)
   end
@@ -511,6 +540,22 @@ defmodule Torque do
   end
 
   defp many_paths?([_ | rest], left, bytes), do: many_paths?(rest, left - 1, bytes)
+
+  # Lookup-specific caller thresholds: result count or path bytes. Stop at the
+  # first threshold.
+  defp long_paths?(paths) do
+    long_paths?(paths, @dirty_result_count, 0)
+  end
+
+  defp long_paths?(_paths, 0, _bytes), do: true
+  defp long_paths?([], _left, _bytes), do: false
+
+  defp long_paths?([path | rest], left, bytes) when is_binary(path) do
+    bytes = bytes + byte_size(path)
+    bytes > @timeslice_bytes or long_paths?(rest, left - 1, bytes)
+  end
+
+  defp long_paths?([_ | rest], left, bytes), do: long_paths?(rest, left - 1, bytes)
 
   @doc """
   Pre-compiles a list of JSON Pointer paths into a reusable handle.
@@ -637,23 +682,24 @@ defmodule Torque do
   @spec get_many_defaults(reference(), %{binary() => term()}) ::
           %{binary() => term()}
   def get_many_defaults(doc, defaults)
-      when is_reference(doc) and is_map(defaults) and map_size(defaults) >= @dirty_path_count do
+      when is_reference(doc) and is_map(defaults) and map_size(defaults) >= @dirty_result_count do
     Torque.Native.get_many_defaults_dirty(doc, defaults)
   end
 
   def get_many_defaults(doc, defaults) when is_reference(doc) and is_map(defaults) do
-    if many_default_paths?(defaults) do
+    if default_path_bytes?(:maps.next(:maps.iterator(defaults)), 0) do
       Torque.Native.get_many_defaults_dirty(doc, defaults)
     else
-      Torque.Native.get_many_defaults(doc, defaults)
+      retry_dirty(
+        Torque.Native.get_many_defaults(doc, defaults),
+        Torque.Native.get_many_defaults_dirty(doc, defaults)
+      )
     end
   end
 
-  # `map_size/1` answers the path-count question outright, so all that is left
-  # is the byte sum. Walk the map forward and stop at the threshold rather than
-  # allocating the whole key list to measure it.
-  defp many_default_paths?(defaults) do
-    map_size(defaults) >= @dirty_path_count or
+  # Apply the lookup-specific result-count and path-byte thresholds.
+  defp long_default_paths?(defaults) do
+    map_size(defaults) >= @dirty_result_count or
       default_path_bytes?(:maps.next(:maps.iterator(defaults)), 0)
   end
 

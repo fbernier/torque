@@ -37,59 +37,105 @@ const INDEXED_MEMBERS_PER_NODE: usize = 2;
 /// Bytes of key material per reduction node charged.
 const KEY_BYTES_PER_NODE: usize = 5;
 
-/// Raw work counters for one NIF call.
+/// Work accumulated by a batch lookup.
 ///
-/// Lookup cost is counted in the units the work is done in — comparisons,
-/// key bytes, indexed members — and converted to built-term units once, when
-/// the call reports. Converting per lookup discarded every remainder: a batch
-/// of 2047 scans over 31-member objects charged nothing at all for its 63k
-/// comparisons, because each one rounded to zero on its own.
+/// Counters remain in native units until reporting so fractional work carries
+/// across paths. Not `Copy`: an accumulator is threaded by `&mut` and a silent
+/// copy would drop the work made through it.
 #[derive(Default)]
 pub struct Work {
-    /// Terms built and results emitted. Already exact, never rounded.
+    /// Terms built from document values.
     pub nodes: usize,
+    /// Results emitted by the batch.
+    results: usize,
     /// Key comparisons made by linear scans.
     compared: usize,
     /// Members hashed into an index.
     indexed_members: usize,
-    /// Key and pointer bytes read: compared, hashed, or split.
-    bytes: usize,
+    /// Bytes read from document keys.
+    member_bytes: usize,
+    /// Bytes read from caller-supplied pointers and lookup keys.
+    path_bytes: usize,
 }
 
 impl Work {
-    /// Built-term units for everything counted so far.
+    /// Converts all counters to scheduler work units.
     #[inline]
     fn nodes(&self) -> usize {
+        self.results + self.document_work() + self.path_bytes / KEY_BYTES_PER_NODE
+    }
+
+    /// Converts document-dependent counters to scheduler work units.
+    #[inline]
+    fn document_work(&self) -> usize {
         self.nodes
             + self.compared / MEMBERS_PER_NODE
             + self.indexed_members / INDEXED_MEMBERS_PER_NODE
-            + self.bytes / KEY_BYTES_PER_NODE
+            + self.member_bytes / KEY_BYTES_PER_NODE
     }
 
-    /// Charges `members` key comparisons that read `bytes` of key.
+    /// Records one emitted result.
+    #[inline]
+    fn result(&mut self) {
+        self.results += 1;
+    }
+
+    /// Records a linear scan.
     #[inline]
     fn scanned(&mut self, members: usize, bytes: usize) {
         self.compared += members;
-        self.bytes += bytes;
+        self.member_bytes += bytes;
     }
 
-    /// Charges indexing `members` whose keys hash `bytes`.
+    /// Records index construction.
     #[inline]
     fn indexed(&mut self, members: usize, bytes: usize) {
         self.indexed_members += members;
-        self.bytes += bytes;
+        self.member_bytes += bytes;
     }
 
-    /// Charges reading `bytes` of a lookup key or a JSON Pointer.
+    /// Records bytes read from a caller-supplied pointer or lookup key.
     #[inline]
     fn key_bytes(&mut self, bytes: usize) {
-        self.bytes += bytes;
+        self.path_bytes += bytes;
     }
 }
 
-/// Report term-building work from the get family to the scheduler. The
-/// pointer lookup itself is sub-microsecond, but `value_to_term` cost is
-/// proportional to the extracted subtree, which only the node counter sees.
+/// Maximum work allowed on a normal scheduler before retrying dirty.
+const NORMAL_BUDGET_NODES: usize = REDUCTION_COUNT / 2 * NODES_PER_REDUCTION;
+
+/// Allows a dirty-scheduler batch to run to completion.
+const UNBOUNDED_BUDGET: usize = usize::MAX;
+
+/// Runs a batch within the normal-scheduler budget.
+///
+/// Returns `dirty_required` when the document is already marked heavy or the
+/// batch exceeds its budget. Only document-dependent overruns mark the
+/// document.
+#[inline]
+fn budgeted<'a>(
+    env: Env<'a>,
+    doc: &ParsedDocument,
+    batch: impl FnOnce(&mut Work, usize) -> NifResult<Option<Term<'a>>>,
+) -> NifResult<Term<'a>> {
+    if doc.heavy.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(atoms::dirty_required().to_term(env));
+    }
+    let mut work = Work::default();
+    let built = batch(&mut work, NORMAL_BUDGET_NODES);
+    consume_timeslice_nodes(env, work.nodes());
+    match built? {
+        Some(term) => Ok(term),
+        None => {
+            if work.document_work() > NORMAL_BUDGET_NODES {
+                doc.heavy.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(atoms::dirty_required().to_term(env))
+        }
+    }
+}
+
+/// Reports lookup work to the scheduler.
 #[inline]
 fn consume_timeslice_nodes(env: Env, nodes: usize) {
     if nodes >= TIMESLICE_MIN_NODES {
@@ -896,8 +942,13 @@ fn do_parse(
     bytes: &[u8],
     unique_keys: bool,
 ) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
-    sonic_rs::from_slice::<sonic_rs::Value>(bytes)
-        .map(|value| ResourceArc::new(ParsedDocument { value, unique_keys }))
+    sonic_rs::from_slice::<sonic_rs::Value>(bytes).map(|value| {
+        ResourceArc::new(ParsedDocument {
+            value,
+            unique_keys,
+            heavy: std::sync::atomic::AtomicBool::new(false),
+        })
+    })
 }
 
 /// Estimated work for rejected input. Every byte is validated as UTF-8, while
@@ -1032,16 +1083,15 @@ fn get_one_result<'v, I: ObjectIndex<'v>>(
     }
 }
 
-/// Look every path up and build the result list. Shared by the normal and
-/// dirty NIFs: which scheduler runs it is the caller's decision, made from the
-/// path count, and the work is the same either way.
+/// Builds tagged results until the batch completes or exceeds its budget.
 #[inline]
 fn do_get_many<'a>(
     env: Env<'a>,
     doc: &ParsedDocument,
     paths: ListIterator<'a>,
     work: &mut Work,
-) -> NifResult<Term<'a>> {
+    budget: usize,
+) -> NifResult<Option<Term<'a>>> {
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
         err: atoms::error().as_c_arg(),
@@ -1052,7 +1102,7 @@ fn do_get_many<'a>(
     let mut memo = LazyMemo::new(doc.unique_keys);
 
     for path_term in paths {
-        // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
+        // Invalid path terms are reported as `badarg`.
         let path: &str = path_term.decode()?;
         acc.push(get_one_result(
             env,
@@ -1062,10 +1112,12 @@ fn do_get_many<'a>(
             work,
             &mut memo,
         ));
-        // Charge every emitted result; `value_to_term` counts only container children.
-        work.nodes += 1;
+        work.result();
+        if work.nodes() > budget {
+            return Ok(None);
+        }
     }
-    Ok(acc.into_list(env))
+    Ok(Some(acc.into_list(env)))
 }
 
 #[rustler::nif]
@@ -1074,11 +1126,10 @@ fn get_many<'a>(
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut work = Work::default();
-    // Preserve work completed before an invalid path returns `badarg`.
-    let result = do_get_many(env, &doc, paths, &mut work);
-    consume_timeslice_nodes(env, work.nodes());
-    result
+    // Preserve work completed before an invalid path.
+    budgeted(env, &doc, |work, budget| {
+        do_get_many(env, &doc, paths, work, budget)
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -1088,7 +1139,8 @@ fn get_many_dirty<'a>(
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
     let mut work = Work::default();
-    do_get_many(env, &doc, paths, &mut work)
+    Ok(do_get_many(env, &doc, paths, &mut work, UNBOUNDED_BUDGET)?
+        .expect("an unbounded batch never overruns"))
 }
 
 /// Implements `get_many_defaults/2` without an intermediate result list. Keys
@@ -1100,7 +1152,8 @@ fn do_get_many_defaults<'a>(
     doc: &ParsedDocument,
     defaults: Term<'a>,
     work: &mut Work,
-) -> NifResult<Term<'a>> {
+    budget: usize,
+) -> NifResult<Option<Term<'a>>> {
     let count = defaults.map_size()?;
     let nil_raw = atoms::nil().as_c_arg();
     let entries = MapEntries::new(env, defaults).ok_or(rustler::Error::BadArg)?;
@@ -1110,8 +1163,7 @@ fn do_get_many_defaults<'a>(
     let mut memo = LazyMemo::new(doc.unique_keys);
 
     for (key, default) in entries {
-        // A non-binary (or non-UTF-8) key is a caller bug, the same one the
-        // path list version reports.
+        // Map keys follow the same validation rules as path lists.
         let path: &str = key.decode()?;
         let found = pointer_lookup(&doc.value, path, &mut memo, work)
             .and_then(|value| value_to_term(env, value, MAX_DEPTH, &mut work.nodes))
@@ -1119,17 +1171,17 @@ fn do_get_many_defaults<'a>(
             .filter(|term| *term != nil_raw);
         keys.push(key.as_c_arg());
         vals.push(found.unwrap_or_else(|| default.as_c_arg()));
-        // One result per key, whether it came from the document or from the
-        // caller's default, counted as it is made so a later bad key does not
-        // erase the ones before it.
-        work.nodes += 1;
+        // Record each result before checking the budget.
+        work.result();
+        if work.nodes() > budget {
+            return Ok(None);
+        }
     }
     let mut map: ERL_NIF_TERM = 0;
-    // SAFETY: keys and vals hold `count` initialised terms each, and the keys
-    // came from a map, so they are already unique.
+    // SAFETY: both arrays contain `count` terms and map keys are unique.
     let built = unsafe { map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) };
     if built {
-        Ok(unsafe { Term::new(env, map) })
+        Ok(Some(unsafe { Term::new(env, map) }))
     } else {
         Err(rustler::Error::BadArg)
     }
@@ -1141,11 +1193,10 @@ fn get_many_defaults<'a>(
     doc: ResourceArc<ParsedDocument>,
     defaults: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut work = Work::default();
-    // Report work even when a later invalid path returns `badarg`.
-    let result = do_get_many_defaults(env, &doc, defaults, &mut work);
-    consume_timeslice_nodes(env, work.nodes());
-    result
+    // Preserve work completed before an invalid path.
+    budgeted(env, &doc, |work, budget| {
+        do_get_many_defaults(env, &doc, defaults, work, budget)
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -1155,7 +1206,10 @@ fn get_many_defaults_dirty<'a>(
     defaults: Term<'a>,
 ) -> NifResult<Term<'a>> {
     let mut work = Work::default();
-    do_get_many_defaults(env, &doc, defaults, &mut work)
+    Ok(
+        do_get_many_defaults(env, &doc, defaults, &mut work, UNBOUNDED_BUDGET)?
+            .expect("an unbounded batch never overruns"),
+    )
 }
 
 #[inline]
@@ -1330,7 +1384,8 @@ fn extract_compiled<'a>(
     value: &sonic_rs::Value,
     compiled: &CompiledPaths,
     work: &mut Work,
-) -> Term<'a> {
+    budget: usize,
+) -> Option<Term<'a>> {
     let nil_raw = atoms::nil().as_c_arg();
     let mut acc = TermAcc::with_hint(compiled.paths.len());
     let mut memo = LazyMemo::new(compiled.unique_keys);
@@ -1342,9 +1397,12 @@ fn extract_compiled<'a>(
             None => nil_raw,
         };
         acc.push(r);
+        work.result();
+        if work.nodes() > budget {
+            return None;
+        }
     }
-    work.nodes += acc.len();
-    acc.into_list(env)
+    Some(acc.into_list(env))
 }
 
 /// Extracts compiled paths with the tagged results returned by `get_many/2`.
@@ -1354,7 +1412,8 @@ fn extract_compiled_results<'a>(
     value: &sonic_rs::Value,
     compiled: &CompiledPaths,
     work: &mut Work,
-) -> Term<'a> {
+    budget: usize,
+) -> Option<Term<'a>> {
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
         err: atoms::error().as_c_arg(),
@@ -1372,9 +1431,12 @@ fn extract_compiled_results<'a>(
             None => make_tuple2(env, result_atoms.err, result_atoms.nsf).as_c_arg(),
         };
         acc.push(result);
+        work.result();
+        if work.nodes() > budget {
+            return None;
+        }
     }
-    work.nodes += acc.len();
-    acc.into_list(env)
+    Some(acc.into_list(env))
 }
 
 /// Builds a string term, borrowing from `input` when requested and safe.
@@ -1472,7 +1534,7 @@ fn do_parse_get_many_nil<'a>(
                 };
                 acc.push(t);
             }
-            work.nodes += acc.len();
+            work.results += acc.len();
             (
                 make_tuple2(env, atoms::ok().as_c_arg(), acc.into_list(env).as_c_arg()),
                 bytes.len(),
@@ -1552,11 +1614,12 @@ fn get_many_compiled<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
     compiled: ResourceArc<CompiledPaths>,
-) -> Term<'a> {
-    let mut work = Work::default();
-    let result = extract_compiled_results(env, &doc.value, &compiled, &mut work);
-    consume_timeslice_nodes(env, work.nodes());
-    result
+) -> NifResult<Term<'a>> {
+    budgeted(env, &doc, |work, budget| {
+        Ok(extract_compiled_results(
+            env, &doc.value, &compiled, work, budget,
+        ))
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -1566,7 +1629,8 @@ fn get_many_compiled_dirty<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut work = Work::default();
-    extract_compiled_results(env, &doc.value, &compiled, &mut work)
+    extract_compiled_results(env, &doc.value, &compiled, &mut work, UNBOUNDED_BUDGET)
+        .expect("an unbounded batch never overruns")
 }
 
 #[rustler::nif]
@@ -1574,11 +1638,10 @@ fn get_many_nil_compiled<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
     compiled: ResourceArc<CompiledPaths>,
-) -> Term<'a> {
-    let mut work = Work::default();
-    let result = extract_compiled(env, &doc.value, &compiled, &mut work);
-    consume_timeslice_nodes(env, work.nodes());
-    result
+) -> NifResult<Term<'a>> {
+    budgeted(env, &doc, |work, budget| {
+        Ok(extract_compiled(env, &doc.value, &compiled, work, budget))
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -1588,7 +1651,8 @@ fn get_many_nil_compiled_dirty<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut work = Work::default();
-    extract_compiled(env, &doc.value, &compiled, &mut work)
+    extract_compiled(env, &doc.value, &compiled, &mut work, UNBOUNDED_BUDGET)
+        .expect("an unbounded batch never overruns")
 }
 
 #[inline]
@@ -1597,13 +1661,14 @@ fn do_get_many_nil<'a>(
     doc: &ParsedDocument,
     paths: ListIterator<'a>,
     work: &mut Work,
-) -> NifResult<Term<'a>> {
+    budget: usize,
+) -> NifResult<Option<Term<'a>>> {
     let nil_raw = atoms::nil().as_c_arg();
     let mut acc = TermAcc::new();
     let mut memo = LazyMemo::new(doc.unique_keys);
 
     for path_term in paths {
-        // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
+        // Invalid path terms are reported as `badarg`.
         let path: &str = path_term.decode()?;
         let r = match pointer_lookup(&doc.value, path, &mut memo, work) {
             Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut work.nodes) {
@@ -1613,12 +1678,14 @@ fn do_get_many_nil<'a>(
             None => nil_raw,
         };
         acc.push(r);
-        // Per result, so a batch that ends in `badarg` still reports what it
-        // built before that.
-        work.nodes += 1;
+        // Record each result before checking the budget.
+        work.result();
+        if work.nodes() > budget {
+            return Ok(None);
+        }
     }
 
-    Ok(acc.into_list(env))
+    Ok(Some(acc.into_list(env)))
 }
 
 #[rustler::nif]
@@ -1627,13 +1694,10 @@ fn get_many_nil<'a>(
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut work = Work::default();
-    // Charged before the `?`: a bad path part way through a batch does not
-    // undo the lookups already made, and reporting them is what keeps a long
-    // batch that ends in `badarg` from being free.
-    let result = do_get_many_nil(env, &doc, paths, &mut work);
-    consume_timeslice_nodes(env, work.nodes());
-    result
+    // Preserve work completed before an invalid path.
+    budgeted(env, &doc, |work, budget| {
+        do_get_many_nil(env, &doc, paths, work, budget)
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -1643,7 +1707,10 @@ fn get_many_nil_dirty<'a>(
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
     let mut work = Work::default();
-    do_get_many_nil(env, &doc, paths, &mut work)
+    Ok(
+        do_get_many_nil(env, &doc, paths, &mut work, UNBOUNDED_BUDGET)?
+            .expect("an unbounded batch never overruns"),
+    )
 }
 
 #[cfg(test)]
