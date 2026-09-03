@@ -497,7 +497,7 @@ fn last_key<'v>(value: &'v Value, key: &str) -> Option<&'v Value> {
     match value.as_pair_slice() {
         Some(pairs) => pairs
             .iter()
-            .rfind(|(k, _)| k.as_str() == Some(key))
+            .rfind(|(k, _)| k.as_node_str() == Some(key))
             .map(|(_, v)| v),
         // Hash-map-backed values cannot contain duplicate keys.
         None => value.get(key),

@@ -22,6 +22,9 @@
 #   * `skip_member` takes scalar container members without a recursive frame
 #   * `Read` caches the pinned input's slice pointer instead of resolving it
 #     through the `PinnedInput` enum on every `peek`/`at`/`eat`/`remain`
+#   * `as_pair_slice`/`as_value_slice` read the node directly, like the
+#     existing `as_node_str`, skipping the arena-header walk and its
+#     release-mode canary assert for a `Shared` the unpack never reads
 #
 # Upstream disables clippy for this crate. Tests cover Torque-owned patches
 # because the linter cannot report on them.

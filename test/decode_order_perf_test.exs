@@ -35,57 +35,40 @@ defmodule Torque.DecodeOrderPerfTest do
     {Enum.at(Enum.sort(ratios), 2), ratios}
   end
 
-  test "a key in the document's final bytes still allows reordering" do
+  test "unsafe key shapes do not disable ancestor ordering" do
     keys = for i <- 1..32, do: "k#{String.pad_leading(Integer.to_string(i), 2, "0")}"
-
-    # The trailing member's value is one byte, so the last key sits inside the
-    # document's final eight bytes — where a wide prefix load would read past
-    # the end. The long-value document is the control.
     short = for k <- keys, do: {k, "1"}
     long = for k <- keys, do: {k, "1234567890"}
 
-    {short_ratio, short_samples} =
-      order_ratio(obj(Enum.sort(short)), obj(Enum.sort(short, :desc)))
-
-    {long_ratio, long_samples} = order_ratio(obj(Enum.sort(long)), obj(Enum.sort(long, :desc)))
-
-    assert long_ratio < @control_ceiling,
-           "reordering looks disabled for both documents, not just the short one: " <>
-             "control #{Float.round(long_ratio, 2)}x\n" <>
-             "  long: #{inspect(Enum.map(long_samples, &Float.round(&1, 2)))}"
-
-    assert short_ratio < long_ratio * 1.6,
-           "short trailing value disabled reordering: #{Float.round(short_ratio, 2)}x " <>
-             "vs control #{Float.round(long_ratio, 2)}x\n" <>
-             "  short: #{inspect(Enum.map(short_samples, &Float.round(&1, 2)))}\n" <>
-             "  long:  #{inspect(Enum.map(long_samples, &Float.round(&1, 2)))}"
-  end
-
-  test "an escaped key in a child object does not disable its ancestors" do
-    build = fn nested_key, order ->
+    build_nested = fn nested_key, order ->
       pairs = for i <- 1..31, do: {"k#{String.pad_leading(Integer.to_string(i), 2, "0")}", "1"}
-      pairs = [{"k99", ~s({"#{nested_key}":1})} | pairs]
-      obj(order.(pairs)) <> "        "
+      obj(order.([{"k99", ~s({"#{nested_key}":1})} | pairs])) <> "        "
     end
 
     asc = &Enum.sort_by(&1, fn {k, _} -> k end)
     desc = &Enum.sort_by(&1, fn {k, _} -> k end, :desc)
 
-    {escaped_ratio, escaped_samples} =
-      order_ratio(build.("a\\u0062c", asc), build.("a\\u0062c", desc))
+    cases = [
+      {"key in the document's final bytes", obj(Enum.sort(short)), obj(Enum.sort(short, :desc)),
+       obj(Enum.sort(long)), obj(Enum.sort(long, :desc))},
+      {"escaped key in a child object", build_nested.("a\\u0062c", asc),
+       build_nested.("a\\u0062c", desc), build_nested.("abc", asc), build_nested.("abc", desc)}
+    ]
 
-    {plain_ratio, plain_samples} = order_ratio(build.("abc", asc), build.("abc", desc))
+    for {label, subject_term, subject_other, control_term, control_other} <- cases do
+      {subject_ratio, subject_samples} = order_ratio(subject_term, subject_other)
+      {control_ratio, control_samples} = order_ratio(control_term, control_other)
 
-    assert plain_ratio < @control_ceiling,
-           "reordering looks disabled for both documents, not just the escaped one: " <>
-             "control #{Float.round(plain_ratio, 2)}x\n" <>
-             "  plain: #{inspect(Enum.map(plain_samples, &Float.round(&1, 2)))}"
+      assert control_ratio < @control_ceiling,
+             "reordering disabled for the #{label} control: #{Float.round(control_ratio, 2)}x\n" <>
+               "  control: #{inspect(Enum.map(control_samples, &Float.round(&1, 2)))}"
 
-    assert escaped_ratio < plain_ratio * 1.6,
-           "nested escaped key disabled parent reordering: #{Float.round(escaped_ratio, 2)}x " <>
-             "vs control #{Float.round(plain_ratio, 2)}x\n" <>
-             "  escaped: #{inspect(Enum.map(escaped_samples, &Float.round(&1, 2)))}\n" <>
-             "  plain:   #{inspect(Enum.map(plain_samples, &Float.round(&1, 2)))}"
+      assert subject_ratio < control_ratio * 1.6,
+             "#{label} disabled reordering: #{Float.round(subject_ratio, 2)}x " <>
+               "vs control #{Float.round(control_ratio, 2)}x\n" <>
+               "  subject: #{inspect(Enum.map(subject_samples, &Float.round(&1, 2)))}\n" <>
+               "  control: #{inspect(Enum.map(control_samples, &Float.round(&1, 2)))}"
+    end
   end
 
   test "extracting a subtree keeps its ordering advantage" do

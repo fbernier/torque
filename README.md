@@ -13,7 +13,8 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
 - Batch field extraction (`get_many/2`) with single NIF call
 - Pre-compiled pointers with fused parse + extract (`parse_get_many_nil/2`)
 - Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than 20 KB,
-  and for batch lookups past 2048 paths (opt-in `dirty: true` for encode)
+  for lookups over 20 KB of pointer path, and for batches of 2048 paths or more
+  (opt-in `dirty: true` for encode)
 - jiffy-compatible `{proplist}` encoding
 
 ## Installation
@@ -109,9 +110,19 @@ pointers = Torque.compile_pointers(["/id", "/site/domain", "/imp/0/banner/w"], u
 ```
 
 Missing fields and JSON `null` both become `nil`. The handle also works with an
-already-parsed document via `Torque.get_many_nil(doc, pointers)`. It is opaque:
-a resource reference plus the number of paths it holds, which is what sends a
+already-parsed document via `Torque.get_many(doc, pointers)` when tagged
+results are needed, or `Torque.get_many_nil(doc, pointers)` otherwise. It is
+opaque: a resource reference plus the number of paths it holds, which sends a
 large path set to a dirty scheduler without walking the list at every call.
+
+Unescaped strings borrow from inputs backed by at most 4 KB, or when the
+returned strings occupy at least a quarter of the backing allocation. Larger
+inputs copy those strings so a small result cannot retain the full input. The
+policy uses `:binary.referenced_byte_size/1`, so a small slice of a large
+receive buffer is deliberately treated as large. Use `:binary.copy/1` on the
+document slice first when one document-sized copy is cheaper than copying each
+selected string.
+
 
 By default a malformed document is reported wherever the fault is, exactly as
 `parse/2` reports it, even when the fault sits in a region no path selects.

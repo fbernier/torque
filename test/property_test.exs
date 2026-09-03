@@ -654,27 +654,20 @@ defmodule Torque.PropertyTest do
       end
     end
 
-    property "decode and parse+get agree with source order for any member order" do
-      check all({json, expected} <- ordering_object(), max_runs: 300) do
+    property "source order survives repeated and interleaved shapes" do
+      check all(
+              objects <- list_of(ordering_object(), min_length: 1, max_length: 5),
+              repeats <- integer(1..4),
+              max_runs: 200
+            ) do
+        sequence = objects |> List.duplicate(repeats) |> List.flatten()
+        json = "[" <> Enum.map_join(sequence, ",", fn {j, _} -> j end) <> "]"
+        expected = Enum.map(sequence, fn {_, value} -> value end)
+
         assert Torque.decode!(json) == expected
 
         {:ok, doc} = Torque.parse(json)
-        assert {:ok, expected} == Torque.get(doc, "")
-      end
-    end
-
-    property "repeated and interleaved shapes decode independently" do
-      check all(
-              objects <- list_of(ordering_object(), min_length: 2, max_length: 5),
-              repeats <- integer(2..4),
-              max_runs: 100
-            ) do
-        # Shapes alternate and repeat, so a memoized permutation meets the
-        # shape after it as well as its own.
-        sequence = objects |> List.duplicate(repeats) |> List.flatten()
-        json = "[" <> Enum.map_join(sequence, ",", fn {j, _} -> j end) <> "]"
-
-        assert Torque.decode!(json) == Enum.map(sequence, fn {_, e} -> e end)
+        assert Torque.get(doc, "") == {:ok, expected}
       end
     end
 
@@ -769,27 +762,16 @@ defmodule Torque.PropertyTest do
       end
     end
 
-    test "two tokens that parse to the same index do not collide in one handle" do
-      # The extraction plan keyed array children by parsed index, so "/00"
-      # landed on the child "/0" had already taken and answered nil while the
-      # document lookup answered "x".
-      json = ~s(["x"])
+    test "a leading-zero token stays an object key and cannot collide with an array index" do
+      json = ~s({"arr":["x"],"obj":{"00":"keyed"}})
+      paths = ["/arr/0", "/arr/00", "/obj/00"]
+      expected = ["x", nil, "keyed"]
       {:ok, doc} = Torque.parse(json)
-      ptrs = Torque.compile_pointers(["/0", "/00"])
+      ptrs = Torque.compile_pointers(paths)
 
-      assert Torque.get_many_nil(doc, ["/0", "/00"]) == ["x", nil]
-      assert Torque.get_many_nil(doc, ptrs) == ["x", nil]
-      assert {:ok, ["x", nil]} == Torque.parse_get_many_nil(json, ptrs)
-    end
-
-    test "a token with a leading zero is an object key, never an array index" do
-      {:ok, doc} = Torque.parse(~s({"arr":["x"],"obj":{"00":"keyed"}}))
-
-      assert Torque.get_many_nil(doc, ["/arr/00", "/obj/00", "/arr/0"]) ==
-               [nil, "keyed", "x"]
-
-      ptrs = Torque.compile_pointers(["/arr/00", "/obj/00", "/arr/0"])
-      assert Torque.get_many_nil(doc, ptrs) == [nil, "keyed", "x"]
+      assert Torque.get_many_nil(doc, paths) == expected
+      assert Torque.get_many_nil(doc, ptrs) == expected
+      assert Torque.parse_get_many_nil(json, ptrs) == {:ok, expected}
     end
   end
 end

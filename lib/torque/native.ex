@@ -32,6 +32,7 @@ defmodule Torque.Native do
   def parse_opts(_json, _unique_keys), do: :erlang.nif_error(:nif_not_loaded)
   def parse_opts_dirty(_json, _unique_keys), do: :erlang.nif_error(:nif_not_loaded)
   def get(_doc, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def get_dirty(_doc, _path), do: :erlang.nif_error(:nif_not_loaded)
   def get_many(_doc, _paths), do: :erlang.nif_error(:nif_not_loaded)
   def get_many_dirty(_doc, _paths), do: :erlang.nif_error(:nif_not_loaded)
   def decode(_json), do: :erlang.nif_error(:nif_not_loaded)
@@ -45,9 +46,20 @@ defmodule Torque.Native do
   def get_many_defaults(_doc, _defaults), do: :erlang.nif_error(:nif_not_loaded)
   def get_many_defaults_dirty(_doc, _defaults), do: :erlang.nif_error(:nif_not_loaded)
   def compile_paths(_paths, _unique_keys, _validate), do: :erlang.nif_error(:nif_not_loaded)
+
+  def compile_paths_dirty(_paths, _unique_keys, _validate),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def get_many_compiled(_doc, _compiled), do: :erlang.nif_error(:nif_not_loaded)
+  def get_many_compiled_dirty(_doc, _compiled), do: :erlang.nif_error(:nif_not_loaded)
+
   def get_many_nil_compiled(_doc, _compiled), do: :erlang.nif_error(:nif_not_loaded)
   def get_many_nil_compiled_dirty(_doc, _compiled), do: :erlang.nif_error(:nif_not_loaded)
-  def parse_get_many_nil(_json, _compiled), do: :erlang.nif_error(:nif_not_loaded)
-  def parse_get_many_nil_dirty(_json, _compiled), do: :erlang.nif_error(:nif_not_loaded)
+  def parse_get_many_nil(_json, _compiled, _alloc_len), do: :erlang.nif_error(:nif_not_loaded)
+
+  def parse_get_many_nil_dirty(_json, _compiled, _alloc_len),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def array_length(_doc, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def array_length_dirty(_doc, _path), do: :erlang.nif_error(:nif_not_loaded)
 end
