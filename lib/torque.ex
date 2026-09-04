@@ -207,7 +207,7 @@ defmodule Torque do
   end
 
   def encode(term, opts) do
-    if Keyword.validate!(opts, dirty: false)[:dirty] do
+    if dirty!(opts) do
       Torque.Native.encode_dirty(term)
     else
       Torque.Native.encode(term)
@@ -258,7 +258,7 @@ defmodule Torque do
   end
 
   def encode_to_iodata(term, opts) do
-    dirty = Keyword.validate!(opts, dirty: false)[:dirty]
+    dirty = dirty!(opts)
 
     try do
       if dirty do
@@ -287,6 +287,8 @@ defmodule Torque do
   @doc group: :encode
   @spec encode_to_iodata!(term(), keyword()) :: binary()
   def encode_to_iodata!(term, opts \\ []), do: encode_to_iodata(term, opts)
+
+  defp dirty!(opts), do: Keyword.validate!(opts, dirty: false)[:dirty]
 
   # --- Parse + Get ---
 
@@ -446,17 +448,16 @@ defmodule Torque do
   end
 
   def get_many(doc, {pointers, count, bytes})
-      when is_reference(doc) and is_reference(pointers) and long_pointers?(count, bytes) do
-    Torque.Native.get_many_compiled_dirty(doc, pointers)
-  end
-
-  def get_many(doc, {pointers, count, bytes})
       when is_reference(doc) and is_reference(pointers) and is_integer(count) and
              is_integer(bytes) do
-    retry_dirty(
-      Torque.Native.get_many_compiled(doc, pointers),
+    if long_pointers?(count, bytes) do
       Torque.Native.get_many_compiled_dirty(doc, pointers)
-    )
+    else
+      retry_dirty(
+        Torque.Native.get_many_compiled(doc, pointers),
+        Torque.Native.get_many_compiled_dirty(doc, pointers)
+      )
+    end
   end
 
   @doc """
@@ -505,17 +506,16 @@ defmodule Torque do
   end
 
   def get_many_nil(doc, {pointers, count, bytes})
-      when is_reference(doc) and is_reference(pointers) and long_pointers?(count, bytes) do
-    Torque.Native.get_many_nil_compiled_dirty(doc, pointers)
-  end
-
-  def get_many_nil(doc, {pointers, count, bytes})
       when is_reference(doc) and is_reference(pointers) and is_integer(count) and
              is_integer(bytes) do
-    retry_dirty(
-      Torque.Native.get_many_nil_compiled(doc, pointers),
+    if long_pointers?(count, bytes) do
       Torque.Native.get_many_nil_compiled_dirty(doc, pointers)
-    )
+    else
+      retry_dirty(
+        Torque.Native.get_many_nil_compiled(doc, pointers),
+        Torque.Native.get_many_nil_compiled_dirty(doc, pointers)
+      )
+    end
   end
 
   @doc false
@@ -536,36 +536,20 @@ defmodule Torque do
   def dirty_lookup?({_pointers, count, bytes}) when is_integer(count) and is_integer(bytes),
     do: long_pointers?(count, bytes)
 
-  # Stop at the first path-count or byte threshold.
-  defp many_paths?(paths) do
-    many_paths?(paths, @dirty_path_count, 0)
-  end
+  # Stop at the first path-count or byte threshold. `many_paths?/1` spends the
+  # path-set budget, `long_paths?/1` the lookup result budget.
+  defp many_paths?(paths), do: paths_over?(paths, @dirty_path_count, 0)
+  defp long_paths?(paths), do: paths_over?(paths, @dirty_result_count, 0)
 
-  defp many_paths?(_paths, 0, _bytes), do: true
-  defp many_paths?([], _left, _bytes), do: false
+  defp paths_over?(_paths, 0, _bytes), do: true
+  defp paths_over?([], _left, _bytes), do: false
 
-  defp many_paths?([path | rest], left, bytes) when is_binary(path) do
+  defp paths_over?([path | rest], left, bytes) when is_binary(path) do
     bytes = bytes + byte_size(path)
-    bytes > @timeslice_bytes or many_paths?(rest, left - 1, bytes)
+    bytes > @timeslice_bytes or paths_over?(rest, left - 1, bytes)
   end
 
-  defp many_paths?([_ | rest], left, bytes), do: many_paths?(rest, left - 1, bytes)
-
-  # Lookup-specific caller thresholds: result count or path bytes. Stop at the
-  # first threshold.
-  defp long_paths?(paths) do
-    long_paths?(paths, @dirty_result_count, 0)
-  end
-
-  defp long_paths?(_paths, 0, _bytes), do: true
-  defp long_paths?([], _left, _bytes), do: false
-
-  defp long_paths?([path | rest], left, bytes) when is_binary(path) do
-    bytes = bytes + byte_size(path)
-    bytes > @timeslice_bytes or long_paths?(rest, left - 1, bytes)
-  end
-
-  defp long_paths?([_ | rest], left, bytes), do: long_paths?(rest, left - 1, bytes)
+  defp paths_over?([_ | rest], left, bytes), do: paths_over?(rest, left - 1, bytes)
 
   @doc """
   Pre-compiles a list of JSON Pointer paths into a reusable handle.
@@ -664,15 +648,15 @@ defmodule Torque do
   @spec parse_get_many_nil(binary(), pointers()) ::
           {:ok, [term()]} | {:error, binary() | :nesting_too_deep}
   def parse_get_many_nil(json, {pointers, count, bytes})
-      when is_binary(json) and is_reference(pointers) and
-             (byte_size(json) > @timeslice_bytes or compiled_dirty?(count, bytes)) do
-    Torque.Native.parse_get_many_nil_dirty(json, pointers, :binary.referenced_byte_size(json))
-  end
-
-  def parse_get_many_nil(json, {pointers, count, bytes})
       when is_binary(json) and is_reference(pointers) and is_integer(count) and
              is_integer(bytes) do
-    Torque.Native.parse_get_many_nil(json, pointers, :binary.referenced_byte_size(json))
+    alloc_len = :binary.referenced_byte_size(json)
+
+    if byte_size(json) > @timeslice_bytes or compiled_dirty?(count, bytes) do
+      Torque.Native.parse_get_many_nil_dirty(json, pointers, alloc_len)
+    else
+      Torque.Native.parse_get_many_nil(json, pointers, alloc_len)
+    end
   end
 
   @doc """
@@ -684,12 +668,6 @@ defmodule Torque do
 
   More ergonomic than the two-call `get_many_nil/2` + `Enum.map` pattern
   when consumers need defaults at the call site.
-
-  Equivalent to:
-
-      get_many_nil(doc, Map.keys(defaults))
-      |> then(&Enum.zip(Map.keys(defaults), &1))
-      |> Map.new(fn {p, nil} -> {p, Map.get(defaults, p)}; pv -> pv end)
 
   Note: a parsed JSON `null` at the path is indistinguishable from a missing
   field (same as `get_many_nil/2`) — both substitute the default.
@@ -703,13 +681,8 @@ defmodule Torque do
   @doc group: :parse_get
   @spec get_many_defaults(reference(), %{binary() => term()}) ::
           %{binary() => term()}
-  def get_many_defaults(doc, defaults)
-      when is_reference(doc) and is_map(defaults) and map_size(defaults) >= @dirty_result_count do
-    Torque.Native.get_many_defaults_dirty(doc, defaults)
-  end
-
   def get_many_defaults(doc, defaults) when is_reference(doc) and is_map(defaults) do
-    if default_path_bytes?(:maps.next(:maps.iterator(defaults)), 0) do
+    if long_default_paths?(defaults) do
       Torque.Native.get_many_defaults_dirty(doc, defaults)
     else
       retry_dirty(

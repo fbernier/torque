@@ -72,15 +72,21 @@ struct Node {
     indices: Vec<(usize, u32)>,
     /// Result slots ending at this node.
     slots: Vec<u32>,
+}
+
+impl Node {
     /// Whether a path continues below this node.
-    has_children: bool,
+    #[inline]
+    fn has_children(&self) -> bool {
+        !self.keys.is_empty()
+    }
 }
 
 /// Immutable extraction plan built from an ordered path set.
 #[derive(Debug)]
 pub struct ExtractPlan {
     nodes: Vec<Node>,
-    slots: usize,
+    slot_count: usize,
     /// Construction-only indexes for wide nodes. Boxed because most nodes
     /// remain unindexed.
     #[allow(clippy::box_collection)]
@@ -100,7 +106,7 @@ impl ExtractPlan {
     pub fn new() -> Self {
         Self {
             nodes: vec![Node::default()],
-            slots: 0,
+            slot_count: 0,
             index: vec![None],
         }
     }
@@ -111,15 +117,14 @@ impl ExtractPlan {
     ///
     /// Borrowed segments avoid an intermediate path allocation.
     pub fn add_path<'s>(&mut self, segs: impl ExactSizeIterator<Item = Seg<'s>>) {
-        let slot = self.slots as u32;
-        self.slots += 1;
+        let slot = self.slot_count as u32;
+        self.slot_count += 1;
         if segs.len() > MAX_PARSE_DEPTH {
             return;
         }
 
         let mut cur = 0usize;
         for seg in segs {
-            self.nodes[cur].has_children = true;
             cur = match seg {
                 Seg::Key(k) => self.child_for_key(cur, k),
                 Seg::Index { idx, key } => {
@@ -202,21 +207,22 @@ pub fn extract<'de, Input: JsonInput<'de>>(
     let reader = Read::new(slice, false);
     let mut parser = Parser::new(reader);
 
-    let mut out: Vec<Option<Extracted<'de>>> = (0..plan.slots).map(|_| None).collect();
+    let checked = validate == Validate::Yes;
+    let mut out: Vec<Option<Extracted<'de>>> = vec![None; plan.slot_count];
     // Escaped strings share this scratch buffer. Documents without escapes do
     // not allocate it.
     let mut strbuf = Vec::new();
     let mut ex = Extractor {
         plan,
         out: &mut out,
-        checked: validate == Validate::Yes,
+        checked,
         first_wins: keys == Keys::Unique,
         stamps: Vec::new(),
         generation: 0,
     };
     ex.value(&mut parser, &mut strbuf, 0, 0)?;
 
-    if validate == Validate::Yes {
+    if checked {
         // Match full parsing's trailing-content check.
         parser.parse_trailing()?;
     }
@@ -312,7 +318,7 @@ impl<'de> Extractor<'_, '_, 'de> {
                 self.out[*slot as usize] = Some(value.clone());
             }
             // Only owned container values can have planned descendants.
-            if n.has_children {
+            if n.has_children() {
                 if let Extracted::Value(v) = &value {
                     self.descend_value(v, node);
                 }
@@ -486,7 +492,7 @@ impl<'de> Extractor<'_, '_, 'de> {
         for slot in n.slots.iter() {
             self.out[*slot as usize] = Some(Extracted::Value(value.clone()));
         }
-        if n.has_children {
+        if n.has_children() {
             self.descend_value(value, node);
         }
     }
@@ -512,7 +518,7 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
     depth: usize,
 ) -> Result<Extracted<'de>> {
     match parser.skip_space_peek() {
-        Some(b'{') | Some(b'[') => {
+        Some(b'{' | b'[') => {
             let mut shared = Arc::new(Shared::default());
             // Expose the arena provenance before packing its node into `Value`.
             let smut: &mut Shared = unsafe { &mut *(Arc::as_ptr(&shared) as *mut _) };
@@ -529,7 +535,7 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
                 Reference::Copied(s) => Ok(Extracted::Value(Value::copy_str(s))),
             }
         }
-        Some(c @ b'-') | Some(c @ b'0'..=b'9') => {
+        Some(c @ (b'-' | b'0'..=b'9')) => {
             let start = parser.read.index();
             parser.read.eat(1);
             match parser.parse_number(c)? {

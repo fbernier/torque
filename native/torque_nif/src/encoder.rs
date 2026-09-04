@@ -62,6 +62,9 @@ fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8], report_timeslice: bool) -> Term<'
     binary.into()
 }
 
+/// ERTS caps an atom at 255 characters; the Latin-1 read appends a NUL.
+const ATOM_NAME_MAX: usize = 256;
+
 /// Read an atom's name into a stack buffer without heap allocation.
 ///
 /// Latin-1, because `ERL_NIF_UTF8` is a NIF 2.17 (OTP 26) addition and this
@@ -72,7 +75,7 @@ fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8], report_timeslice: bool) -> Term<'
 unsafe fn atom_to_stack_buf(
     env_raw: *mut ErlNifEnv,
     term_raw: ERL_NIF_TERM,
-    buf: &mut [u8; 256],
+    buf: &mut [u8; ATOM_NAME_MAX],
 ) -> Option<&[u8]> {
     let mut len: c_uint = 0;
     if enif_get_atom_length(
@@ -98,8 +101,9 @@ unsafe fn atom_to_stack_buf(
     Some(&buf[..len as usize])
 }
 
-/// External term format tags for a UTF-8 atom: `SMALL_ATOM_UTF8_EXT` carries a
-/// one-byte length, `ATOM_UTF8_EXT` a two-byte big-endian one.
+/// External term format: a version tag, then `SMALL_ATOM_UTF8_EXT` carrying a
+/// one-byte name length or `ATOM_UTF8_EXT` a two-byte big-endian one.
+const ETF_VERSION: u8 = 131;
 const SMALL_ATOM_UTF8_EXT: u8 = 119;
 const ATOM_UTF8_EXT: u8 = 118;
 
@@ -122,15 +126,10 @@ fn write_wide_atom_name(
     let mut bin = unsafe { bin.assume_init() };
     let bytes = unsafe { std::slice::from_raw_parts(bin.data, bin.size) };
 
-    // `131`, tag, length, name.
     let name = match bytes {
-        [131, SMALL_ATOM_UTF8_EXT, len, rest @ ..] if rest.len() >= *len as usize => {
-            Some(&rest[..*len as usize])
-        }
-        [131, ATOM_UTF8_EXT, hi, lo, rest @ ..]
-            if rest.len() >= u16::from_be_bytes([*hi, *lo]) as usize =>
-        {
-            Some(&rest[..u16::from_be_bytes([*hi, *lo]) as usize])
+        [ETF_VERSION, SMALL_ATOM_UTF8_EXT, len, rest @ ..] => rest.get(..*len as usize),
+        [ETF_VERSION, ATOM_UTF8_EXT, hi, lo, rest @ ..] => {
+            rest.get(..u16::from_be_bytes([*hi, *lo]) as usize)
         }
         _ => None,
     };
@@ -155,15 +154,14 @@ fn write_atom_name(
     term_raw: ERL_NIF_TERM,
     buf: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let mut atom_buf = [0u8; 256];
+    let mut atom_buf = [0u8; ATOM_NAME_MAX];
     let Some(name) = (unsafe { atom_to_stack_buf(env_raw, term_raw, &mut atom_buf) }) else {
         return write_wide_atom_name(env_raw, term_raw, buf);
     };
     if name.is_ascii() {
         crate::escape::escape_to_vec(name, buf);
     } else {
-        // Latin-1 name is at most 255 bytes, so 2x fits on the stack.
-        let mut utf8 = [0u8; 512];
+        let mut utf8 = [0u8; ATOM_NAME_MAX * 2];
         let mut n = 0usize;
         for &b in name {
             if b < 0x80 {
@@ -369,8 +367,7 @@ fn encode_binary(
         let bin = bin.assume_init();
         std::slice::from_raw_parts(bin.data, bin.size)
     };
-    crate::escape::write_json_string(slice, buf).map_err(|_| EncodeError::InvalidUtf8)?;
-    Ok(())
+    crate::escape::write_json_string(slice, buf).map_err(|_| EncodeError::InvalidUtf8)
 }
 
 #[inline]

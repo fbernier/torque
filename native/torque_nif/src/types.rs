@@ -4,7 +4,7 @@ use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
 use std::mem::MaybeUninit;
 
 use crate::atoms;
-use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
+use crate::map_order::{order_members_of, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
 use crate::nif_util::map_from_arrays;
 
 const STACK_SIZE: usize = 64;
@@ -37,19 +37,10 @@ fn reorder_object(
 ) {
     let n = keys.len();
     debug_assert_eq!(key_strs.len(), n);
-    if !(MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&n) {
-        return;
-    }
-    let mut prefixes: [MaybeUninit<u64>; FLATMAP_LIMIT] = [MaybeUninit::uninit(); FLATMAP_LIMIT];
-    for (prefix, key) in prefixes[..n].iter_mut().zip(key_strs.iter()) {
-        prefix.write(prefix_be(key.as_bytes()));
-    }
-    // SAFETY: every prefix below `n` was initialized above.
-    let prefixes = unsafe { std::slice::from_raw_parts(prefixes.as_ptr().cast(), n) };
-    let key_at = |i: usize| key_strs[i];
-    order_members(
-        prefixes,
-        |a, b| key_at(a) < key_at(b),
+    order_members_of(
+        key_strs,
+        |key| prefix_be(key.as_bytes()),
+        |a, b| key_strs[a] < key_strs[b],
         |perm| {
             let mut sorted_k: [MaybeUninit<ERL_NIF_TERM>; FLATMAP_LIMIT] =
                 [MaybeUninit::uninit(); FLATMAP_LIMIT];

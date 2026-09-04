@@ -73,6 +73,12 @@ static NEEDS_ESCAPE: [bool; 256] = build_needs_escape();
 /// Strings shorter than this use the scalar prefix path before SIMD dispatch.
 const SHORT_STRING: usize = 32;
 
+/// Widest expansion of one byte: a control byte becomes `\u00XX`.
+const MAX_ESCAPE_EXPANSION: usize = 6;
+
+/// Slack so the SIMD kernels' 16- and 32-byte stores never run past the reserve.
+const ESCAPE_SLACK: usize = 32;
+
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
 
@@ -190,7 +196,7 @@ pub(crate) fn escape_to_vec(bytes: &[u8], buf: &mut Vec<u8>) {
     if len == 0 {
         return;
     }
-    buf.reserve(len * 6 + 32);
+    buf.reserve(len * MAX_ESCAPE_EXPANSION + ESCAPE_SLACK);
     let base = buf.len();
     let written = unsafe {
         let dst = buf.as_mut_ptr().add(base);
@@ -402,7 +408,7 @@ unsafe fn escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> usize {
 #[inline]
 pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), ()> {
     let len = bytes.len();
-    buf.reserve(len * 6 + 34);
+    buf.reserve(len * MAX_ESCAPE_EXPANSION + ESCAPE_SLACK + 2);
     let base = buf.len();
     unsafe {
         let dst = buf.as_mut_ptr().add(base);

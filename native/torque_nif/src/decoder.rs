@@ -3,8 +3,8 @@ use ahash::AHashMap;
 use crate::atoms;
 use crate::native_decode;
 use crate::nif_util::{
-    make_tuple2, make_tuple3, map_from_arrays, timeslice_percent, MapEntries, BYTES_PER_REDUCTION,
-    REDUCTION_COUNT,
+    make_tuple2, make_tuple3, map_from_arrays, percent_for_reds, timeslice_percent, MapEntries,
+    BYTES_PER_REDUCTION, REDUCTION_COUNT,
 };
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
@@ -135,12 +135,20 @@ fn budgeted<'a>(
     }
 }
 
+/// Runs a batch on a dirty scheduler, where no budget can force a retry.
+#[inline]
+fn unbounded<'a>(
+    batch: impl FnOnce(&mut Work, usize) -> NifResult<Option<Term<'a>>>,
+) -> NifResult<Term<'a>> {
+    let mut work = Work::default();
+    Ok(batch(&mut work, UNBOUNDED_BUDGET)?.expect("an unbounded batch never overruns"))
+}
+
 /// Reports lookup work to the scheduler.
 #[inline]
 fn consume_timeslice_nodes(env: Env, nodes: usize) {
     if nodes >= TIMESLICE_MIN_NODES {
-        let reds = nodes / NODES_PER_REDUCTION;
-        schedule::consume_timeslice(env, ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100));
+        schedule::consume_timeslice(env, percent_for_reds(nodes / NODES_PER_REDUCTION));
     }
 }
 
@@ -161,8 +169,9 @@ fn mixed_timeslice_percent(bytes: usize, nodes: usize) -> Option<i32> {
     if bytes < TIMESLICE_MIN_BYTES && nodes < TIMESLICE_MIN_NODES {
         return None;
     }
-    let reds = bytes / BYTES_PER_REDUCTION + nodes / NODES_PER_REDUCTION;
-    Some(((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100))
+    Some(percent_for_reds(
+        bytes / BYTES_PER_REDUCTION + nodes / NODES_PER_REDUCTION,
+    ))
 }
 
 /// Charges combined byte and term work with one scheduler update.
@@ -175,7 +184,8 @@ fn consume_timeslice_mixed(env: Env, bytes: usize, nodes: usize) {
 
 /// Stack-first accumulator for per-path result terms: fills a fixed array,
 /// spilling to a heap Vec only past `GET_MANY_STACK` entries — or immediately,
-/// with exact capacity, when a larger size is known up front via `with_hint`.
+/// with exact capacity, when a larger size is known up front. A hint of zero
+/// means "unknown length", which every list-driven batch passes.
 struct TermAcc {
     stack: [ERL_NIF_TERM; GET_MANY_STACK],
     count: usize,
@@ -183,11 +193,6 @@ struct TermAcc {
 }
 
 impl TermAcc {
-    #[inline]
-    fn new() -> Self {
-        Self::with_hint(0)
-    }
-
     #[inline]
     fn with_hint(n: usize) -> Self {
         TermAcc {
@@ -485,6 +490,16 @@ struct Candidate {
     earning: Earning,
 }
 
+impl Candidate {
+    #[inline]
+    fn empty() -> Self {
+        Candidate {
+            base: std::ptr::null(),
+            earning: Earning::new(0),
+        }
+    }
+}
+
 struct MemoSlot<'v> {
     /// Address of the object's pair slice; null means unused.
     base: *const u8,
@@ -529,10 +544,7 @@ impl<'v> ObjectMemo<'v> {
         ObjectMemo {
             unique_keys,
             slots: std::array::from_fn(|_| MemoSlot::empty()),
-            candidates: [Candidate {
-                base: std::ptr::null(),
-                earning: Earning::new(0),
-            }; MEMO_SETS * MEMO_WAYS],
+            candidates: [Candidate::empty(); MEMO_SETS * MEMO_WAYS],
             clock: 0,
         }
     }
@@ -567,20 +579,19 @@ impl<'v> ObjectMemo<'v> {
         if let Some(slot) = ways.iter_mut().find(|s| s.base == base) {
             slot.used = now;
             if slot.index.is_none() {
-                if slot.earning.ready() {
-                    let (index, hashed) = Self::build_index(pairs, unique_keys);
-                    work.indexed(pairs.len(), hashed);
-                    slot.index = Some(index);
-                } else {
+                if !slot.earning.ready() {
                     // Keep scanning until both member and key-byte costs are earned.
                     return Self::scan_and_price(pairs, key, unique_keys, &mut slot.earning, work);
                 }
+                let (index, hashed) = Self::build_index(pairs, unique_keys);
+                work.indexed(pairs.len(), hashed);
+                slot.index = Some(index);
             }
             work.key_bytes(key.len());
             return slot
                 .index
                 .as_ref()
-                .unwrap_or_else(|| unreachable!("built above"))
+                .expect("built above")
                 .get(key)
                 .map(|i| &pairs[*i as usize].1);
         }
@@ -621,10 +632,7 @@ impl<'v> ObjectMemo<'v> {
         let (index, hashed) = Self::build_index(pairs, unique_keys);
         work.indexed(pairs.len(), hashed);
         work.key_bytes(key.len());
-        candidates[slot] = Candidate {
-            base: std::ptr::null(),
-            earning: Earning::new(0),
-        };
+        candidates[slot] = Candidate::empty();
 
         // Prefer the least advanced unindexed way; otherwise evict the LRU index.
         let ways = &mut self.slots[set];
@@ -647,18 +655,16 @@ impl<'v> ObjectMemo<'v> {
                 .enumerate()
                 .min_by_key(|(_, s)| s.used)
                 .map(|(i, _)| i)
-                .unwrap_or_else(|| unreachable!("MEMO_WAYS is not zero")),
+                .expect("MEMO_WAYS is not zero"),
         };
         let victim = &mut ways[victim];
         victim.base = base;
         victim.used = now;
         victim.earning = Earning::new(target);
         victim.earning.credit = target;
-        victim.index = Some(index);
         victim
             .index
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("just built"))
+            .insert(index)
             .get(key)
             .map(|i| &pairs[*i as usize].1)
     }
@@ -787,36 +793,38 @@ impl<'v> ObjectMemo<'v> {
         key: &str,
         unique_keys: bool,
     ) -> Scanned<'v> {
+        if unique_keys {
+            Self::walk_counting(pairs.iter(), key)
+        } else {
+            Self::walk_counting(pairs.iter().rev(), key)
+        }
+    }
+
+    /// One direction of `scan_long`: stops at the first equal-length match and
+    /// reports the comparisons and key bytes it reached.
+    #[inline]
+    fn walk_counting<I>(members: I, key: &str) -> Scanned<'v>
+    where
+        I: Iterator<Item = &'v (sonic_rs::Value, sonic_rs::Value)>,
+    {
         let mut compared = 0usize;
         let mut compared_bytes = 0usize;
-        let mut hit = None;
-        if unique_keys {
-            for (k, v) in pairs.iter() {
-                compared += 1;
-                if let Some(name) = k.as_node_str() {
-                    if name.len() == key.len()
-                        && Self::eq_counting(name.as_bytes(), key.as_bytes(), &mut compared_bytes)
-                    {
-                        hit = Some(v);
-                        break;
-                    }
-                }
-            }
-        } else {
-            for (k, v) in pairs.iter().rev() {
-                compared += 1;
-                if let Some(name) = k.as_node_str() {
-                    if name.len() == key.len()
-                        && Self::eq_counting(name.as_bytes(), key.as_bytes(), &mut compared_bytes)
-                    {
-                        hit = Some(v);
-                        break;
-                    }
+        for (k, v) in members {
+            compared += 1;
+            if let Some(name) = k.as_node_str() {
+                if name.len() == key.len()
+                    && Self::eq_counting(name.as_bytes(), key.as_bytes(), &mut compared_bytes)
+                {
+                    return Scanned {
+                        hit: Some(v),
+                        compared,
+                        compared_bytes,
+                    };
                 }
             }
         }
         Scanned {
-            hit,
+            hit: None,
             compared,
             compared_bytes,
         }
@@ -873,29 +881,14 @@ fn descend<'v, I: ObjectIndex<'v>>(
     let mut out_len = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'~' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'1' => {
-                    tmp[out_len] = b'/';
-                    out_len += 1;
-                    i += 2;
-                }
-                b'0' => {
-                    tmp[out_len] = b'~';
-                    out_len += 1;
-                    i += 2;
-                }
-                _ => {
-                    tmp[out_len] = bytes[i];
-                    out_len += 1;
-                    i += 1;
-                }
-            }
-        } else {
-            tmp[out_len] = bytes[i];
-            out_len += 1;
-            i += 1;
-        }
+        let (byte, step) = match (bytes[i], bytes.get(i + 1)) {
+            (b'~', Some(b'1')) => (b'/', 2),
+            (b'~', Some(b'0')) => (b'~', 2),
+            (byte, _) => (byte, 1),
+        };
+        tmp[out_len] = byte;
+        out_len += 1;
+        i += step;
     }
     // SAFETY: the input is valid UTF-8 and substitutions emit only ASCII.
     let unescaped = unsafe { std::str::from_utf8_unchecked(&tmp[..out_len]) };
@@ -986,61 +979,46 @@ fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<'a> {
     }
 }
 
-#[rustler::nif]
-fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    let (result, scanned) = match do_parse(json.as_slice(), false) {
+/// Parses into a document handle, reporting the result term and the bytes reached.
+#[inline]
+fn parse_result<'a>(env: Env<'a>, json: &[u8], unique_keys: bool) -> (Term<'a>, usize) {
+    match do_parse(json, unique_keys) {
         Ok(resource) => (
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
             json.len(),
         ),
         Err(e) => (parse_error_term(env, &e), bytes_scanned(&e, json.len())),
-    };
+    }
+}
+
+#[rustler::nif]
+fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
+    let (result, scanned) = parse_result(env, json.as_slice(), false);
     consume_timeslice_bytes(env, scanned);
     result
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_dirty<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false) {
-        Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-        Err(e) => parse_error_term(env, &e),
-    }
+    parse_result(env, json.as_slice(), false).0
 }
 
 #[rustler::nif]
 fn parse_opts<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
-    let (result, scanned) = match do_parse(json.as_slice(), unique_keys) {
-        Ok(resource) => (
-            make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-            json.len(),
-        ),
-        Err(e) => (parse_error_term(env, &e), bytes_scanned(&e, json.len())),
-    };
+    let (result, scanned) = parse_result(env, json.as_slice(), unique_keys);
     consume_timeslice_bytes(env, scanned);
     result
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_opts_dirty<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys) {
-        Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
-        Err(e) => parse_error_term(env, &e),
-    }
+    parse_result(env, json.as_slice(), unique_keys).0
 }
 
 #[inline]
 fn do_get<'a>(env: Env<'a>, doc: &ParsedDocument, path: &str, work: &mut Work) -> Term<'a> {
-    let ok_raw = atoms::ok().as_c_arg();
-    let err_raw = atoms::error().as_c_arg();
-    let nsf_raw = atoms::no_such_field().as_c_arg();
-    let ntd_raw = atoms::nesting_too_deep().as_c_arg();
-    match pointer_lookup(&doc.value, path, &mut NoIndex::new(doc.unique_keys), work) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut work.nodes) {
-            Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
-            None => make_tuple2(env, err_raw, ntd_raw),
-        },
-        None => make_tuple2(env, err_raw, nsf_raw),
-    }
+    let found = pointer_lookup(&doc.value, path, &mut NoIndex::new(doc.unique_keys), work);
+    ResultAtoms::new().tag(env, found, &mut work.nodes)
 }
 
 #[rustler::nif]
@@ -1065,22 +1043,68 @@ struct ResultAtoms {
     ntd: ERL_NIF_TERM,
 }
 
-#[inline]
-fn get_one_result<'v, I: ObjectIndex<'v>>(
-    env: Env,
-    doc: &'v ParsedDocument,
-    path: &str,
-    atoms: &ResultAtoms,
-    work: &mut Work,
-    memo: &mut I,
-) -> ERL_NIF_TERM {
-    match pointer_lookup(&doc.value, path, memo, work) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut work.nodes) {
-            Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
-            None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
-        },
-        None => make_tuple2(env, atoms.err, atoms.nsf).as_c_arg(),
+impl ResultAtoms {
+    #[inline]
+    fn new() -> Self {
+        ResultAtoms {
+            ok: atoms::ok().as_c_arg(),
+            err: atoms::error().as_c_arg(),
+            nsf: atoms::no_such_field().as_c_arg(),
+            ntd: atoms::nesting_too_deep().as_c_arg(),
+        }
     }
+
+    /// Tags one lookup the way `get/2` and `get_many/2` report it.
+    #[inline]
+    fn tag<'a>(
+        &self,
+        env: Env<'a>,
+        found: Option<&sonic_rs::Value>,
+        nodes: &mut usize,
+    ) -> Term<'a> {
+        match found {
+            Some(value) => match value_to_term(env, value, MAX_DEPTH, nodes) {
+                Some(term) => make_tuple2(env, self.ok, term.as_c_arg()),
+                None => make_tuple2(env, self.err, self.ntd),
+            },
+            None => make_tuple2(env, self.err, self.nsf),
+        }
+    }
+}
+
+/// Builds one lookup's term, substituting nil for missing and over-nested values.
+#[inline]
+fn nil_or_term(
+    env: Env,
+    found: Option<&sonic_rs::Value>,
+    nil_raw: ERL_NIF_TERM,
+    nodes: &mut usize,
+) -> ERL_NIF_TERM {
+    found
+        .and_then(|value| value_to_term(env, value, MAX_DEPTH, nodes))
+        .map_or(nil_raw, |term| term.as_c_arg())
+}
+
+/// Emits one result term per path, stopping as soon as the batch exceeds `budget`.
+#[inline]
+fn collect_results<'a, P: Iterator>(
+    env: Env<'a>,
+    paths: P,
+    hint: usize,
+    work: &mut Work,
+    budget: usize,
+    mut one: impl FnMut(P::Item, &mut Work) -> NifResult<ERL_NIF_TERM>,
+) -> NifResult<Option<Term<'a>>> {
+    let mut acc = TermAcc::with_hint(hint);
+    for path in paths {
+        acc.push(one(path, work)?);
+        // Record each result before checking the budget.
+        work.result();
+        if work.nodes() > budget {
+            return Ok(None);
+        }
+    }
+    Ok(Some(acc.into_list(env)))
 }
 
 /// Builds tagged results until the batch completes or exceeds its budget.
@@ -1092,32 +1116,14 @@ fn do_get_many<'a>(
     work: &mut Work,
     budget: usize,
 ) -> NifResult<Option<Term<'a>>> {
-    let result_atoms = ResultAtoms {
-        ok: atoms::ok().as_c_arg(),
-        err: atoms::error().as_c_arg(),
-        nsf: atoms::no_such_field().as_c_arg(),
-        ntd: atoms::nesting_too_deep().as_c_arg(),
-    };
-    let mut acc = TermAcc::new();
+    let result_atoms = ResultAtoms::new();
     let mut memo = LazyMemo::new(doc.unique_keys);
-
-    for path_term in paths {
+    collect_results(env, paths, 0, work, budget, |path_term, work| {
         // Invalid path terms are reported as `badarg`.
         let path: &str = path_term.decode()?;
-        acc.push(get_one_result(
-            env,
-            doc,
-            path,
-            &result_atoms,
-            work,
-            &mut memo,
-        ));
-        work.result();
-        if work.nodes() > budget {
-            return Ok(None);
-        }
-    }
-    Ok(Some(acc.into_list(env)))
+        let found = pointer_lookup(&doc.value, path, &mut memo, work);
+        Ok(result_atoms.tag(env, found, &mut work.nodes).as_c_arg())
+    })
 }
 
 #[rustler::nif]
@@ -1138,9 +1144,7 @@ fn get_many_dirty<'a>(
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut work = Work::default();
-    Ok(do_get_many(env, &doc, paths, &mut work, UNBOUNDED_BUDGET)?
-        .expect("an unbounded batch never overruns"))
+    unbounded(|work, budget| do_get_many(env, &doc, paths, work, budget))
 }
 
 /// Implements `get_many_defaults/2` without an intermediate result list. Keys
@@ -1205,11 +1209,7 @@ fn get_many_defaults_dirty<'a>(
     doc: ResourceArc<ParsedDocument>,
     defaults: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut work = Work::default();
-    Ok(
-        do_get_many_defaults(env, &doc, defaults, &mut work, UNBOUNDED_BUDGET)?
-            .expect("an unbounded batch never overruns"),
-    )
+    unbounded(|work, budget| do_get_many_defaults(env, &doc, defaults, work, budget))
 }
 
 #[inline]
@@ -1385,24 +1385,21 @@ fn extract_compiled<'a>(
     compiled: &CompiledPaths,
     work: &mut Work,
     budget: usize,
-) -> Option<Term<'a>> {
+) -> NifResult<Option<Term<'a>>> {
     let nil_raw = atoms::nil().as_c_arg();
-    let mut acc = TermAcc::with_hint(compiled.paths.len());
     let mut memo = LazyMemo::new(compiled.unique_keys);
-    for segs in compiled.paths.iter() {
-        let r = match pointer_lookup_compiled(value, segs, &mut memo, work) {
-            Some(v) => value_to_term(env, v, MAX_DEPTH, &mut work.nodes)
-                .map(|t| t.as_c_arg())
-                .unwrap_or(nil_raw),
-            None => nil_raw,
-        };
-        acc.push(r);
-        work.result();
-        if work.nodes() > budget {
-            return None;
-        }
-    }
-    Some(acc.into_list(env))
+    let paths = compiled.paths.iter();
+    collect_results(
+        env,
+        paths,
+        compiled.paths.len(),
+        work,
+        budget,
+        |segs, work| {
+            let found = pointer_lookup_compiled(value, segs, &mut memo, work);
+            Ok(nil_or_term(env, found, nil_raw, &mut work.nodes))
+        },
+    )
 }
 
 /// Extracts compiled paths with the tagged results returned by `get_many/2`.
@@ -1413,30 +1410,21 @@ fn extract_compiled_results<'a>(
     compiled: &CompiledPaths,
     work: &mut Work,
     budget: usize,
-) -> Option<Term<'a>> {
-    let result_atoms = ResultAtoms {
-        ok: atoms::ok().as_c_arg(),
-        err: atoms::error().as_c_arg(),
-        nsf: atoms::no_such_field().as_c_arg(),
-        ntd: atoms::nesting_too_deep().as_c_arg(),
-    };
-    let mut acc = TermAcc::with_hint(compiled.paths.len());
+) -> NifResult<Option<Term<'a>>> {
+    let result_atoms = ResultAtoms::new();
     let mut memo = LazyMemo::new(compiled.unique_keys);
-    for segs in compiled.paths.iter() {
-        let result = match pointer_lookup_compiled(value, segs, &mut memo, work) {
-            Some(v) => match value_to_term(env, v, MAX_DEPTH, &mut work.nodes) {
-                Some(term) => make_tuple2(env, result_atoms.ok, term.as_c_arg()).as_c_arg(),
-                None => make_tuple2(env, result_atoms.err, result_atoms.ntd).as_c_arg(),
-            },
-            None => make_tuple2(env, result_atoms.err, result_atoms.nsf).as_c_arg(),
-        };
-        acc.push(result);
-        work.result();
-        if work.nodes() > budget {
-            return None;
-        }
-    }
-    Some(acc.into_list(env))
+    let paths = compiled.paths.iter();
+    collect_results(
+        env,
+        paths,
+        compiled.paths.len(),
+        work,
+        budget,
+        |segs, work| {
+            let found = pointer_lookup_compiled(value, segs, &mut memo, work);
+            Ok(result_atoms.tag(env, found, &mut work.nodes).as_c_arg())
+        },
+    )
 }
 
 /// Builds a string term, borrowing from `input` when requested and safe.
@@ -1616,9 +1604,7 @@ fn get_many_compiled<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> NifResult<Term<'a>> {
     budgeted(env, &doc, |work, budget| {
-        Ok(extract_compiled_results(
-            env, &doc.value, &compiled, work, budget,
-        ))
+        extract_compiled_results(env, &doc.value, &compiled, work, budget)
     })
 }
 
@@ -1627,10 +1613,8 @@ fn get_many_compiled_dirty<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
     compiled: ResourceArc<CompiledPaths>,
-) -> Term<'a> {
-    let mut work = Work::default();
-    extract_compiled_results(env, &doc.value, &compiled, &mut work, UNBOUNDED_BUDGET)
-        .expect("an unbounded batch never overruns")
+) -> NifResult<Term<'a>> {
+    unbounded(|work, budget| extract_compiled_results(env, &doc.value, &compiled, work, budget))
 }
 
 #[rustler::nif]
@@ -1640,7 +1624,7 @@ fn get_many_nil_compiled<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> NifResult<Term<'a>> {
     budgeted(env, &doc, |work, budget| {
-        Ok(extract_compiled(env, &doc.value, &compiled, work, budget))
+        extract_compiled(env, &doc.value, &compiled, work, budget)
     })
 }
 
@@ -1649,10 +1633,8 @@ fn get_many_nil_compiled_dirty<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
     compiled: ResourceArc<CompiledPaths>,
-) -> Term<'a> {
-    let mut work = Work::default();
-    extract_compiled(env, &doc.value, &compiled, &mut work, UNBOUNDED_BUDGET)
-        .expect("an unbounded batch never overruns")
+) -> NifResult<Term<'a>> {
+    unbounded(|work, budget| extract_compiled(env, &doc.value, &compiled, work, budget))
 }
 
 #[inline]
@@ -1664,28 +1646,13 @@ fn do_get_many_nil<'a>(
     budget: usize,
 ) -> NifResult<Option<Term<'a>>> {
     let nil_raw = atoms::nil().as_c_arg();
-    let mut acc = TermAcc::new();
     let mut memo = LazyMemo::new(doc.unique_keys);
-
-    for path_term in paths {
+    collect_results(env, paths, 0, work, budget, |path_term, work| {
         // Invalid path terms are reported as `badarg`.
         let path: &str = path_term.decode()?;
-        let r = match pointer_lookup(&doc.value, path, &mut memo, work) {
-            Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut work.nodes) {
-                Some(term) => term.as_c_arg(),
-                None => nil_raw,
-            },
-            None => nil_raw,
-        };
-        acc.push(r);
-        // Record each result before checking the budget.
-        work.result();
-        if work.nodes() > budget {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(acc.into_list(env)))
+        let found = pointer_lookup(&doc.value, path, &mut memo, work);
+        Ok(nil_or_term(env, found, nil_raw, &mut work.nodes))
+    })
 }
 
 #[rustler::nif]
@@ -1706,11 +1673,7 @@ fn get_many_nil_dirty<'a>(
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut work = Work::default();
-    Ok(
-        do_get_many_nil(env, &doc, paths, &mut work, UNBOUNDED_BUDGET)?
-            .expect("an unbounded batch never overruns"),
-    )
+    unbounded(|work, budget| do_get_many_nil(env, &doc, paths, work, budget))
 }
 
 #[cfg(test)]
@@ -2157,10 +2120,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_scan_that_rejects_at_the_first_byte_does_not_buy_an_index() {
-        let key_len = 8192;
-        let members = 256;
+    /// Object whose keys share a long prefix and differ in their last six bytes.
+    fn shared_prefix_doc(members: usize, key_len: usize) -> (sonic_rs::Value, String) {
         let prefix = "c".repeat(key_len - 7);
         let json = format!(
             "{{{}}}",
@@ -2169,11 +2130,31 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        (sonic_rs::from_str(&json).expect("valid document"), prefix)
+    }
+
+    /// Object holding far more key bytes than an index is allowed to hash.
+    fn huge_key_doc(members: usize, key_len: usize) -> sonic_rs::Value {
+        let prefix = "q".repeat(key_len);
+        let json = format!(
+            "{{{}}}",
+            (0..members)
+                .map(|i| format!("\"{prefix}{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        sonic_rs::from_str(&json).expect("valid document")
+    }
+
+    #[test]
+    fn a_scan_that_rejects_at_the_first_byte_does_not_buy_an_index() {
+        let key_len = 8192;
+        let members = 256;
         assert!(
             members * key_len > INDEX_KEY_BYTES,
             "fixture is under the cap"
         );
-        let doc: sonic_rs::Value = sonic_rs::from_str(&json).expect("valid document");
+        let (doc, prefix) = shared_prefix_doc(members, key_len);
         let scans = index_after_visits(members) * 3;
 
         let mut memo = ObjectMemo::new(false);
@@ -2200,15 +2181,7 @@ mod tests {
     fn a_scan_counts_the_bytes_its_comparisons_reached() {
         let key_len = LONG_KEY_BYTES + 44;
         let members = 64;
-        let prefix = "c".repeat(key_len - 7);
-        let json = format!(
-            "{{{}}}",
-            (0..members)
-                .map(|i| format!("\"a{prefix}{i:06}\":{i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let doc: sonic_rs::Value = sonic_rs::from_str(&json).expect("valid document");
+        let (doc, prefix) = shared_prefix_doc(members, key_len);
         let pairs = doc.as_pair_slice().expect("object");
 
         let rejected = ObjectMemo::scan_long(pairs, &format!("z{prefix}999999"), false);
@@ -2284,15 +2257,7 @@ mod tests {
     fn a_candidate_that_has_earned_its_index_survives_a_newcomer() {
         let key_len = 8192;
         let members = 256;
-        let prefix = "c".repeat(key_len - 7);
-        let json = format!(
-            "{{{}}}",
-            (0..members)
-                .map(|i| format!("\"a{prefix}{i:06}\":{i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let earner: sonic_rs::Value = sonic_rs::from_str(&json).expect("valid document");
+        let (earner, prefix) = shared_prefix_doc(members, key_len);
         let base = base_of(&earner);
         let needle = format!("z{prefix}999999");
         let mut memo = ObjectMemo::new(false);
@@ -2390,15 +2355,7 @@ mod tests {
     fn an_oversized_candidate_remembers_what_it_costs() {
         let key_len = 16 * 1024;
         let members = 128;
-        let prefix = "q".repeat(key_len);
-        let json = format!(
-            "{{{}}}",
-            (0..members)
-                .map(|i| format!("\"{prefix}{i}\":{i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let big: sonic_rs::Value = sonic_rs::from_str(&json).expect("valid document");
+        let big = huge_key_doc(members, key_len);
         let base = base_of(&big);
         let mut memo = ObjectMemo::new(false);
 
@@ -2493,19 +2450,11 @@ mod tests {
     fn an_object_of_large_keys_is_scanned_rather_than_indexed() {
         let key_len = 16 * 1024;
         let members = 128;
-        let prefix = "q".repeat(key_len);
-        let json = format!(
-            "{{{}}}",
-            (0..members)
-                .map(|i| format!("\"{prefix}{i}\":{i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
         assert!(
             members * key_len > INDEX_KEY_BYTES,
             "fixture is under the cap"
         );
-        let doc: sonic_rs::Value = sonic_rs::from_str(&json).expect("valid document");
+        let doc = huge_key_doc(members, key_len);
         let mut memo = ObjectMemo::new(false);
 
         let budget = ObjectMemo::scan_budget(members) / members as u64 + 4;
