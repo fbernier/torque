@@ -194,6 +194,8 @@ The six SIMD kernels (`escape_*` / `validate_escape_*` × NEON/AVX2/SSE2) spell 
 
 Binary map keys are probed with `enif_inspect_binary` before the type is asked for, since that call already answers "is this a binary" and a type-first dispatch made every binary key pay two cross-DSO calls to learn what one of them returns. Atom keys reach the type switch behind a failed probe and are *still* faster than type-first — 73.3 against 74.8 µs on a 200-record atom-keyed map, next to 45.2 against 49.4 for the binary-keyed one — because `enif_term_type` is a full tag switch and skipping it on the common path buys more than the probe costs on the other. Integer keys pay the probe too and are rare by construction, existing only to be stringified.
 
+Atom names are read Latin-1, because `ERL_NIF_UTF8` is a NIF 2.17 (OTP 26) addition and `nif_versions` still claims 2.15. `enif_get_atom_length` does not transcode: it *fails* for a name holding any character above U+00FF, which made `:"🚀"` and `:日本語` return `:unsupported_type` while `:café` encoded — atoms are Unicode by construction, so that was a wrong answer, not a limitation. Those names come from `enif_term_to_binary` instead: an atom that is not Latin-1 representable always serialises as `SMALL_ATOM_UTF8_EXT` or `ATOM_UTF8_EXT`, whose payload is the UTF-8 name. That costs a binary per atom, so only the names the Latin-1 read rejects take it, and a 200-record atom-keyed map is unchanged at 46-47 µs. Raising the floor to NIF 2.17 would replace both paths with one `ERL_NIF_UTF8` read and a 1020-byte buffer (255 characters × 4), at the cost of dropping OTP 22-25.
+
 
 ### Scheduler Awareness
 
