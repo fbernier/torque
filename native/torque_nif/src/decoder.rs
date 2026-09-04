@@ -865,7 +865,6 @@ fn escapes_valid(segment: &str) -> bool {
     true
 }
 
-
 /// Follows one pointer segment.
 #[inline]
 fn descend<'v, I: ObjectIndex<'v>>(
