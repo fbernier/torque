@@ -26,19 +26,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - run: mix deps.get
-      - run: mix format --check-formatted
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-
-      # The vendored crate carries its own `[workspace]`, so none of the above
-      # reaches it. Its root also disables every lint for upstream code, which
-      # is why the clippy run below needs no `-D warnings`: the Torque-owned
-      # module re-enables and denies them itself, and nothing else here would
-      # report anything.
-      - run: cargo fmt --manifest-path native/sonic-rs/Cargo.toml --check
-      - run: cargo clippy --manifest-path native/sonic-rs/Cargo.toml --lib
+      - run: make deps
+      # Every format and lint check, including the vendored crate's own
+      # workspace. The Makefile owns the command set so this cannot drift.
+      - run: make lint
 
   test:
     name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
@@ -69,9 +60,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - run: mix deps.get
-      - run: mix compile --warnings-as-errors
-      - run: mix test
+      - run: make deps
+      - run: make strict
+      - run: make test
 
   # Run unsafe pointer-range and unaligned prefix-load paths on the same arm64
   # architecture used for release artifacts, not only through cross-compilation.
@@ -88,12 +79,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - run: mix deps.get
+      - run: make deps
       # Rust unit tests directly cover the architecture-sensitive prefix loads.
       - run: cargo test --workspace
-      - run: mix test
-        env:
-          TORQUE_BUILD: "true"
+      - run: make test
 
   # Wall-clock regressions run separately from the functional matrix.
   #
@@ -113,10 +102,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - run: mix deps.get
-      - run: mix test
-        env:
-          TORQUE_BUILD: "true"
+      - run: make deps
+      - run: make test
 
   # Run key-order throughput checks on current ERTS; functional tests cannot
   # observe this correctness-neutral optimization.
@@ -133,7 +120,5 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - run: mix deps.get
-      - run: mix test --only perf
-        env:
-          TORQUE_BUILD: "true"
+      - run: make deps
+      - run: make test-perf

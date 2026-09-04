@@ -4,47 +4,56 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Test Commands
 
+**The `Makefile` is the source of truth; `make help` lists every target.** It
+exports `TORQUE_BUILD=true` once, so no invocation can forget it, and CI calls
+the same targets rather than its own copies of the commands.
+
 ```bash
-TORQUE_BUILD=true mix deps.get     # fetch deps + force local Rust build
-TORQUE_BUILD=true mix compile      # build (includes Rust NIF compilation)
-TORQUE_BUILD=true mix test         # functional tests
-TORQUE_BUILD=true mix test --include perf   # full suite, including :perf
-mix test test/pointer_test.exs:42  # run single test by line number
-mix compile --warnings-as-errors   # build with strict warnings
-mix format                         # format Elixir code
-mix format --check-formatted       # check Elixir formatting
-mix dialyzer                       # static type analysis
-cargo fmt                          # format Rust code (run from repo root)
-cargo fmt --check                  # check Rust formatting
-cargo clippy --workspace --all-targets -- -D warnings   # Rust linter (as CI runs it)
-cargo test --workspace             # Rust unit tests
-# The vendored crate is a separate workspace, so none of the above reaches it.
-# Its root disables every lint for upstream code; `extract.rs` denies them for
-# itself, which is why no `-D warnings` is needed (and would do nothing).
-cargo fmt --manifest-path native/sonic-rs/Cargo.toml --check
-cargo clippy --manifest-path native/sonic-rs/Cargo.toml --lib
-MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks
+make check      # everything CI runs, in CI's order
+make test       # functional suite (:perf excluded by test_helper.exs)
+make test-all   # functional and :perf together
+make lint       # formats and lints, including the vendored crate's workspace
+make bench      # benchmark suite
+make pgo        # instrument, profile, rebuild optimised
+make plain      # restore a plain -O3 build afterwards
+make ab REF=... # A/B a revision against HEAD under PGO
 ```
 
-`TORQUE_BUILD=true` is required for local development to force compilation from Rust source instead of downloading precompiled binaries. Without it, `RustlerPrecompiled` will try to fetch binaries from GitHub releases. The flag is read when `Torque.Native` compiles, so `Torque.Build` (`lib/torque/build.ex`) makes it part of that module's staleness through `__mix_recompile__?/0`: without it a `_build` tree made without the variable keeps loading a downloaded NIF however later commands are invoked, which silently runs a *released* binary against local Rust changes and reports a green suite. The check cannot live in `Torque.Native`, because a module whose `on_load` fails is not loadable and Mix cannot ask it anything.
+Run a single test by line number with `mix test test/pointer_test.exs:42`, and
+anything else ad hoc through `mix`/`cargo` directly — but reach for a target
+first, because the flags each one carries are the ones that were learned the
+hard way. Adding an operational rule means adding a target, not a paragraph.
+
+`TORQUE_BUILD=true` forces compilation from Rust source instead of downloading
+precompiled binaries. Without it, `RustlerPrecompiled` fetches from GitHub
+releases. The flag is read when `Torque.Native` compiles, so `Torque.Build`
+(`lib/torque/build.ex`) makes it part of that module's staleness through
+`__mix_recompile__?/0`: without it a `_build` tree made without the variable
+keeps loading a downloaded NIF however later commands are invoked, which
+silently runs a *released* binary against local Rust changes and reports a
+green suite. The check cannot live in `Torque.Native`, because a module whose
+`on_load` fails is not loadable and Mix cannot ask it anything.
 
 ## Profile-Guided Optimisation (PGO)
 
 ```bash
-./scripts/pgo-build.sh   # instrument -> run workload -> merge -> rebuild optimised
+make pgo     # instrument -> run workload -> merge -> rebuild optimised
+make plain   # restore a plain -O3 build
 ```
 
 Produces an optimised `priv/native/torque_nif.so` (typically 5-15% faster on
 JSON-heavy work than plain `-O3`). The script builds an instrumented NIF, runs
 `bench/pgo_workload.exs` to collect branch/call-frequency data, merges the raw
 `*.profraw` counters with `llvm-profdata`, then rebuilds with `-Cprofile-use`.
-Like any `TORQUE_BUILD` build it overwrites `priv/native/torque_nif.so`. Run
-`TORQUE_BUILD=true mix compile --force` to restore a plain build: the variable
-selects the source build, and `--force` replaces the profiled artifact even when
-the sources are unchanged.
+Like any `TORQUE_BUILD` build it overwrites `priv/native/torque_nif.so`; `make
+plain` restores one. Both halves of that target matter: without the variable
+`Torque.Build.__mix_recompile__?/0` fires and rebuilds `Torque.Native` with
+`force_build: false`, downloading a released binary instead, and without
+`--force` nothing is stale so the profiled artifact stays in place.
 
-Judge a refactor's cost on a PGO build, or on instructions retired — not on a
-plain `-O3` wall clock. The cdylib is built with fat LTO in one codegen unit, so
+Judge a refactor's cost with `make ab REF=<rev>`, which builds both revisions
+with a profile and reports instructions retired next to cycles — not on a plain
+`-O3` wall clock. The cdylib is built with fat LTO in one codegen unit, so
 moving any amount of source reshuffles placement everywhere, and the resulting
 swing is the layout lottery rather than the change. A deduplication pass that
 touched no encoder arithmetic measured +2.29% cycles on an atom-keyed encode at
