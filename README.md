@@ -117,9 +117,13 @@ results are needed, or `Torque.get_many_nil(doc, pointers)` otherwise. It is
 opaque: a resource reference plus the number of paths it holds, which sends a
 large path set to a dirty scheduler without walking the list at every call.
 
+Repeated compiled paths keep their original result positions but share one
+materialized term. Result construction checks container sizes and copied string
+bytes before allocating, retrying on a dirty scheduler when necessary.
+
 Unescaped strings borrow from inputs backed by at most 4 KB, or when the
-returned strings occupy at least a quarter of the backing allocation. Larger
-inputs copy those strings so a small result cannot retain the full input. The
+uniquely materialized strings occupy at least a quarter of the backing
+allocation. Larger inputs copy those strings so a small result cannot retain the full input. The
 policy uses `:binary.referenced_byte_size/1`, so a small slice of a large
 receive buffer is deliberately treated as large. Use `:binary.copy/1` on the
 document slice first when one document-sized copy is cheaper than copying each
@@ -250,6 +254,10 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 
 ## Benchmarks
 
+The tables below are historical measurements, predating the corrected benchmark
+controls and encoder metadata preflight. They are not measurements of the current
+checkout; use `make bench` for current library comparisons and `make ab` for changes.
+
 Apple M2 Pro, OTP 29, Elixir 1.20. Both libraries are profile-guided
 optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
 **Glazer PGO** (via `OPTIMIZE=1`).
@@ -333,7 +341,9 @@ selective extraction skips materializing the whole document.
 Run benchmarks locally:
 
 ```bash
-MIX_ENV=bench mix run bench/torque_bench.exs
+make bench                 # this comparison
+make ab REF=<git-rev>      # did a change to torque help? instructions retired, per code path
+make ops                   # what `make ab` measures, and the path each operation targets
 ```
 
 ## Limitations

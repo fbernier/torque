@@ -4,47 +4,177 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Test Commands
 
+**The `Makefile` is the source of truth; `make help` lists every target.** It
+exports `TORQUE_BUILD=true` once, so no invocation can forget it, and CI calls
+the same targets rather than its own copies of the commands.
+
 ```bash
-TORQUE_BUILD=true mix deps.get     # fetch deps + force local Rust build
-TORQUE_BUILD=true mix compile      # build (includes Rust NIF compilation)
-TORQUE_BUILD=true mix test         # functional tests
-TORQUE_BUILD=true mix test --include perf   # full suite, including :perf
-mix test test/pointer_test.exs:42  # run single test by line number
-mix compile --warnings-as-errors   # build with strict warnings
-mix format                         # format Elixir code
-mix format --check-formatted       # check Elixir formatting
-mix dialyzer                       # static type analysis
-cargo fmt                          # format Rust code (run from repo root)
-cargo fmt --check                  # check Rust formatting
-cargo clippy --workspace --all-targets -- -D warnings   # Rust linter (as CI runs it)
-cargo test --workspace             # Rust unit tests
-# The vendored crate is a separate workspace, so none of the above reaches it.
-# Its root disables every lint for upstream code; `extract.rs` denies them for
-# itself, which is why no `-D warnings` is needed (and would do nothing).
-cargo fmt --manifest-path native/sonic-rs/Cargo.toml --check
-cargo clippy --manifest-path native/sonic-rs/Cargo.toml --lib
-MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks
+make check      # everything CI runs, in CI's order
+make test       # functional suite (:perf excluded by test_helper.exs)
+make test-all   # functional and :perf together
+make lint       # formats and lints, including the vendored crate's workspace
+make bench      # compare against other JSON libraries (wall clock, CI trend)
+make ab REF=... # did this change help? per code path, in instructions retired
+make ops        # what `make ab` measures, and the path each operation targets
+make fixtures   # the payloads, their size, and the regime each one pins
+make sweeps     # threshold sweeps: where a cutoff belongs
+make pgo        # instrument, profile, rebuild optimised
+make plain      # restore a plain -O3 build afterwards
 ```
 
-`TORQUE_BUILD=true` is required for local development to force compilation from Rust source instead of downloading precompiled binaries. Without it, `RustlerPrecompiled` will try to fetch binaries from GitHub releases. The flag is read when `Torque.Native` compiles, so `Torque.Build` (`lib/torque/build.ex`) makes it part of that module's staleness through `__mix_recompile__?/0`: without it a `_build` tree made without the variable keeps loading a downloaded NIF however later commands are invoked, which silently runs a *released* binary against local Rust changes and reports a green suite. The check cannot live in `Torque.Native`, because a module whose `on_load` fails is not loadable and Mix cannot ask it anything.
+Run a single test by line number with `mix test test/pointer_test.exs:42`, and
+anything else ad hoc through `mix`/`cargo` directly — but reach for a target
+first, because the flags each one carries are the ones that were learned the
+hard way. Adding an operational rule means adding a target, not a paragraph.
+
+`TORQUE_BUILD=true` forces compilation from Rust source instead of downloading
+precompiled binaries. Without it, `RustlerPrecompiled` fetches from GitHub
+releases. The flag is read when `Torque.Native` compiles, so `Torque.Build`
+(`lib/torque/build.ex`) makes it part of that module's staleness through
+`__mix_recompile__?/0`: without it a `_build` tree made without the variable
+keeps loading a downloaded NIF however later commands are invoked, which
+silently runs a *released* binary against local Rust changes and reports a
+green suite. The check cannot live in `Torque.Native`, because a module whose
+`on_load` fails is not loadable and Mix cannot ask it anything.
+
+## Benchmarking
+
+Three questions, three tools. Reaching for the wrong one is how a layout swing
+becomes a claim.
+
+| Question | Tool | Unit |
+|---|---|---|
+| Did this change help? | `make ab REF=<rev>` | instructions retired, per code path |
+| How do we compare to other libraries? | `make bench` | wall clock, and the CI trend |
+| Where should this cutoff go? | `make sweeps NAME=<sweep>` | a crossover, not a verdict |
+
+Historical measurements below predate review corrections to these fixtures.
+Binary term order is lexicographic, memo-fit shapes must occupy distinct hash
+slots, and short-string fixtures must actually remain below `SHORT_STRING`.
+The corrected controls verify emitted order, occupied slots and first-special
+byte positions. Library extraction comparisons share one typed path selection
+and verify equal results. Re-measure affected paths before attributing changes
+using the older numbers.
+
+All three run on one payload set, `bench/fixtures.exs`, which is also what the
+PGO training workload trains on. Three properties, each closing a way the old
+fixtures went blind:
+
+- **Order is explicit.** Payloads are built by `Bench.Json` from ordered pair
+  lists, never by `Jason.encode!`. A map's iteration order is Erlang term
+  order, which is the one order `enif_make_map_from_arrays` sorts for free — so
+  a fixture round-tripped through an encoder measures the case `map_order.rs`
+  cannot improve and reports "no change" whatever happens to it. Term-ordered
+  fixtures still exist; they are labelled CONTROL, and they are there to *not*
+  move.
+
+- **Regime is checked.** Each fixture declares the facts the code it targets
+  branches on — wider than `WIDE_OBJECT_MEMBERS`, shorter than `SHORT_STRING`,
+  over the dirty-dispatch threshold — and `Bench.Thresholds` reads those
+  constants out of the source that defines them. Raise a constant and the
+  fixture built around it fails by name instead of quietly measuring the path
+  next door. `make fixtures` prints every payload with its size, its target and
+  its measured regime.
+
+- **Coverage is a contract.** `bench/ops.exs` is the registry of named
+  single-operation workloads `make ab` measures, one per code path per payload
+  shape (`make ops` lists them with what each targets). Adding a tuned path to
+  the NIF means adding a line there, and it is then in every future A/B. Ops
+  carry a `verify` that runs once before measurement, so an op cannot silently
+  measure a failed lookup or a missing extraction.
+
+`scripts/ab.sh` builds both revisions with PGO — which is how torque ships, and
+what makes instructions-vs-cycles readable — copies **this checkout's** workload
+into both worktrees, calibrates repetitions once and uses the same count on both
+sides, and measures each operation against a baseline that builds the same
+fixtures and then stops. A `mix run` spends ~5.2e9 instructions booting the BEAM
+before any JSON is touched; subtracting a matched baseline removes that exactly
+rather than approximately. perf's own run-to-run standard deviation is carried
+through the subtraction, so each row is reported against its own resolution:
+
+```
+decode-schema     2094118400     1832770048   -12.48%   BETTER  -12.48% work (>1.4%)
+encode-ascii-long 1889002240     1884101632    -0.26%   =       within 1.9%
+get-wide           882145792      921804800    +4.50%   WORSE    +4.50% work (>2.1%)
+```
+
+`WEAK` means the operation cannot resolve better than 6% and must not be read as
+a zero — raise `AB_TARGET_MS` or name fewer operations. `LAYOUT` means cycles
+moved while instructions did not, which is placement rather than work. `FAILED`
+means the operation does not run on one side, which is expected when comparing
+across a revision that predates an API; the rest of the sweep still reports.
+A CONTROL operation that moves is flagged: it exercises the surrounding code
+without entering the changed branch, so it is evidence about the measurement.
+
+The registry exists because the previous workload was five operations over two
+payloads in a bash heredoc — three-member records with alphabetical keys and
+nine-byte clean-ASCII strings, which is simultaneously the term-order control,
+the escape control, and below `MIN_ORDERED_MEMBERS`. Every hand-tuned path in
+the Architecture section below was invisible to it.
+
+Measurement runs with BEAM busy-wait off (`+sbwt none +sbwtdcpu none +sbwtdio
+none`). Idle scheduler threads spin, and a spin loop retires instructions and
+burns cycles that perf charges to the process without any work being done — and
+it is not a constant, because it scales with how long *another* thread is busy.
+An operation that dispatches to a dirty scheduler on one revision and runs
+inline on the other is therefore compared against a different amount of
+spinning. The same 16.7 KB encode measured IPC 2.83 inline and 1.61 forced
+dirty at identical wall clock: a 76% cycles difference that is entirely other
+threads waiting. That is what made `encode-utf8` report "+68% cycles,
+instructions flat" against v0.2.6 — not a regression, and with busy-wait off
+the same operation reports −3.4% work. Switching it off also drops the fixture
+baseline from 5.2e9 to 3.0e9 instructions and 11.1e9 to 2.0e9 cycles, so the
+subtraction carries much less noise: rows that resolved to 2-4% resolve to
+0.2-0.3%.
+
+```bash
+make ab REF=v0.2.6                                    # every operation
+make ab REF=HEAD~3 OPS="encode-utf8 encode-ascii-short"
+make ab REF=HEAD~3 AB_TARGET_MS=2000                  # for a close call
+```
 
 ## Profile-Guided Optimisation (PGO)
 
 ```bash
-./scripts/pgo-build.sh   # instrument -> run workload -> merge -> rebuild optimised
+make pgo     # instrument -> run workload -> merge -> rebuild optimised
+make plain   # restore a plain -O3 build
 ```
 
 Produces an optimised `priv/native/torque_nif.so` (typically 5-15% faster on
 JSON-heavy work than plain `-O3`). The script builds an instrumented NIF, runs
 `bench/pgo_workload.exs` to collect branch/call-frequency data, merges the raw
 `*.profraw` counters with `llvm-profdata`, then rebuilds with `-Cprofile-use`.
-Like any `TORQUE_BUILD` build it overwrites `priv/native/torque_nif.so`. Run
-`TORQUE_BUILD=true mix compile --force` to restore a plain build: the variable
-selects the source build, and `--force` replaces the profiled artifact even when
-the sources are unchanged.
+`priv/native/` is shared across `MIX_ENV`s, so profile in the environment the
+measurement runs in: `MIX_ENV=bench ./scripts/pgo-build.sh`. Profiling under one
+env and benchmarking under another makes mix rebuild the NIF *without*
+`-Cprofile-use` on first use of the second env, silently replacing the profiled
+artifact — same path, different bytes, and every number after that is a plain
+`-O3` build wearing a PGO label. `scripts/ab.sh` hashes the `.so` after
+profiling and again after measuring, and fails if they differ.
 
-Judge a refactor's cost on a PGO build, or on instructions retired — not on a
-plain `-O3` wall clock. The cdylib is built with fat LTO in one codegen unit, so
+Like any `TORQUE_BUILD` build it overwrites `priv/native/torque_nif.so`; `make
+plain` restores one. Both halves of that target matter: without the variable
+`Torque.Build.__mix_recompile__?/0` fires and rebuilds `Torque.Native` with
+`force_build: false`, downloading a released binary instead, and without
+`--force` nothing is stale so the profiled artifact stays in place.
+
+`bench/pgo_workload.exs` drives the same op registry the benchmarks do, so the
+profile trains the code the measurements exercise. It used to carry its own
+hand-written JSON, which drifted: a path could be tuned against a payload the
+profile never reached, then measured on a build whose layout was optimised for
+something else. It is **weighted**, not uniform — a profile is a claim about
+what production does, and the registry is deliberately corner-heavy (bignums,
+512-member objects, atoms above U+00FF, nesting at the parser limit). Each op
+is `:hot`, `:warm` or `:cover`; the corners still run, because a branch LLVM
+never sees executed is assumed cold and laid out accordingly. Repetition counts
+are rounded to a power of two so two builds of the same revision train on the
+same iteration count rather than on whatever the machine was doing that minute,
+and an op that does not run on the revision being built is skipped rather than
+fatal.
+
+Judge a refactor's cost with `make ab REF=<rev>`, which builds both revisions
+with a profile and reports instructions retired next to cycles — not on a plain
+`-O3` wall clock. The cdylib is built with fat LTO in one codegen unit, so
 moving any amount of source reshuffles placement everywhere, and the resulting
 swing is the layout lottery rather than the change. A deduplication pass that
 touched no encoder arithmetic measured +2.29% cycles on an atom-keyed encode at
@@ -64,6 +194,10 @@ Notes:
   rustflags rather than merging, so the script re-states `-C target-cpu=native`.
   Keep `BASE_RUSTFLAGS` in `scripts/pgo-build.sh` in sync with that config.
 - Point the script at a different workload with `WORKLOAD=path/to.exs`.
+  `scripts/ab.sh` uses `AB_WORKLOAD` for its own raw mode, so the two do not
+  collide, and passes `TORQUE_SOURCE_ROOT` so a worktree build reads its
+  fixture thresholds from the invoking checkout rather than from the revision
+  under measurement.
 
 The release workflow (`release.yml`) applies the same profile → rebuild step to
 the targets it builds on a native runner (`aarch64-apple-darwin`,
@@ -133,7 +267,7 @@ Skipping sheds two costs of its own. `skip_one_at` is split so the slice it retu
 
    The index is an `AHashMap`, not a `HashMap`: keys come from the document, so the hasher needs a runtime-random seed, but SipHash is not the only thing that provides one and it doubled the build. Switching halved break-even and made every batch size faster than scanning per path — 3 paths 28.2 → 4.2 µs, 64 paths 30.8 → 24.4, 2048 paths 122.8 → 113.5, 16384 paths 827.8 → 725.6.
 
-2. **Compiled pointers** — for a *fixed* set of paths extracted from every document, `compile_pointers/2` pre-parses the pointer strings once into a `CompiledPaths` resource (`PathSeg::Key` / `PathSeg::Num{idx,key}`, with `~`-unescaping and array-index-vs-object-key resolution done up front) and prepares them into a `sonic_rs::extract::ExtractPlan`. `parse_get_many_nil/2` walks the document once through that plan (`native/sonic-rs/src/extract.rs`): values are built only where a path ends, everything else is skipped, and no `Value` DOM is materialized — so cost tracks document size, not content. Against the full-parse implementation it replaced: 2.3× on a 440 KB feed with three paths, 1.3× on a 500 B request; `validate: false` (SIMD skip instead of parsing the unselected regions) makes those 6.1× and 1.8×. The handle carries `unique_keys` and `validate`; `get_many_nil/2` still answers from a parsed document via `pointer_lookup_compiled`, and both resolve duplicate keys last-wins (first-wins under `unique_keys`). Validated extraction reports a fault anywhere in the document, including regions no path selects. sonic-rs's own lazy `get_many`/`PointerTree` is deliberately **not** used: it drops fields when a key repeats and stops validating after its last hit.
+2. **Compiled pointers** — for a *fixed* set of paths extracted from every document, `compile_pointers/2` pre-parses the pointer strings once into a `CompiledPaths` resource (`PathSeg::Key` / `PathSeg::Num{idx,key}`, with `~`-unescaping and array-index-vs-object-key resolution done up front) and prepares them into a `sonic_rs::extract::ExtractPlan`. `parse_get_many_nil/2` walks the document once through that plan (`native/sonic-rs/src/extract.rs`): values are built only where a path ends, everything else is skipped, and no unselected `Value` DOM is materialized. Selected containers still use an arena before term conversion. Against the full-parse implementation it replaced: 2.3× on a 440 KB feed with three paths, 1.3× on a 500 B request; `validate: false` (SIMD skip instead of parsing the unselected regions) makes those 6.1× and 1.8×. The handle carries `unique_keys` and `validate`; `get_many_nil/2` still answers from a parsed document via `pointer_lookup_compiled`, and both resolve duplicate keys last-wins (first-wins under `unique_keys`). Validated extraction reports a fault anywhere in the document, including regions no path selects. sonic-rs's own lazy `get_many`/`PointerTree` is deliberately **not** used: it drops fields when a key repeats and stops validating after its last hit.
 
    For an already-parsed document, both `get_many/2` and `get_many_nil/2` accept the compiled handle and walk its `paths`; the former preserves tagged missing/depth errors, while the latter substitutes `nil`. Both take `unique_keys` from the handle and dispatch from its stored path count and path bytes.
 
@@ -147,6 +281,17 @@ Skipping sheds two costs of its own. `skip_one_at` is split so the slice it retu
 
    `ExtractPlan` retains `AHashMap` indexes for wide object-key nodes. Numeric edges have their own construction index so deduplication does not scan an ever-growing list; `finish` sorts them for a forward array walk. Unfinished plans, including plans extended after `finish`, use indexed lookup on wide numeric nodes and bounded scans on narrow ones. `add_path` accepts borrowed `Seg<'_>` values and copies only keys added to the plan. The operation registry measures both object and numeric compilation inside the repeated loop, separately from extraction using prepared handles.
 
+   Each terminal has one canonical result slot. `extract_unique` populates only
+   those slots; the NIF materializes each terminal once and reuses its immutable
+   term in every requested position. The ordinary Rust `extract` API expands
+   aliases back into owned values. Duplicate-key invalidation clears canonical
+   terminals before conversion, and input borrowing counts unique strings, not
+   the number of repeated selections.
+   Plans without aliases select a separate monomorphized conversion path; they
+   do not check canonical identities per result. Fused conversion reserves the
+   known output-list cost once and checks the remaining budget before payload
+   allocation, recording only completed positions when a retry is required.
+
    Extraction hands back `Extracted::Str` for a string with no escapes: a slice of the input, which `parse_get_many_nil` turns into a sub-binary of the caller's JSON rather than copying it into a `Value` and out again. That is what `decode/1` has always done with string values, and it is worth the same here — on a 1.9 KB OpenRTB request, 22 string fields went from 3.10 µs to 2.05 µs, and a string field now costs less than a number field (25 ns against 28 ns) because a sub-binary is cheaper than building an integer term. Escaped strings still copy: their bytes live in the parser's scratch buffer, which the next string overwrites.
 
    Whether to point at the input is decided per call, in `borrow_input`, not taken unconditionally. A sub-binary keeps the whole input alive behind it, and one-shot extraction is the one path whose purpose is to answer a few paths and drop the document: a 100-byte user agent taken from a 400 KB feed held all 400 KB, which `:binary.referenced_byte_size/1` reports and `test/pointer_test.exs` pins in both directions — a small input is borrowed from, a large one is not. So the input is borrowed from when it is at or under `BORROW_ANY_INPUT` (4 KB — a single allocation, about what one refc binary's bookkeeping costs, and where the request-shaped documents this path is tuned on sit), or when the strings being kept are at least a `BORROW_INPUT_FRACTION` of it and copying them out would save little.
@@ -154,6 +299,20 @@ Skipping sheds two costs of its own. `skip_one_at` is split so the slice it retu
    The size that decides it is the **allocation**, not the binary handed in. A `binary_part/3` of a 400 KB refc binary is 630 bytes long and keeps all 400 KB alive, so measuring the slice borrowed the parent behind a 100-byte field — the exact case the policy exists to prevent. There is no NIF entry point for that size (`enif_inspect_binary` reports the slice), so `parse_get_many_nil/2` passes `:binary.referenced_byte_size/1` in and the NIF uses the logical length only for the offset check that decides a string is inside the input at all. On OTP 28+ ERTS copies a slice of 64 bytes or less onto the process heap, which the policy does not lean on: 26 and 27 build a real sub-binary at any size and CI runs all four.
 
 3. **Full decode** — `decode/1` builds Erlang terms directly during the SIMD parse by implementing sonic-rs's native `JsonVisitor` (`native_decode.rs`): single pass, no intermediate `Value`, zero-copy sub-binaries for unescaped strings, and a per-call key cache that decodes a key repeated across objects (the common array-of-records shape) to one shared term (median −3–4%, p99 −16%, decoded-term heap −37% on record-shaped payloads).
+
+   Key-cache slots mix the final eight bytes for names longer than eight bytes,
+   while equality still checks every remaining byte. Prefix and length alone
+   made equal-length schema names differing after byte eight evict each other.
+   Selected-container conversion copies its first 64 keys before allocating the
+   shared key cache, keeping request-sized conversions free of its setup cost.
+   Raw terms and borrowed key pointers never survive that call's lifetime.
+
+   Full decode recovers integer-only tokens when sonic-number reports a
+   finite-float overflow. Default visitors still reject nonfinite fallbacks.
+   Normal decoding bounds cumulative overflow-integer conversion work by the
+   sum of squared digit counts (`NORMAL_INTEGER_WORK`); expensive conversion
+   retries dirty before building the bignum. This does not relax float grammar
+   or finite-number validation in DOM parsing and extraction.
 
 ### Map Key Ordering
 
@@ -188,15 +347,41 @@ can silently switch itself off are pinned by regression tests in
 `test/decode_order_perf_test.exs` and `map_order.rs`. Read those and the
 module's doc comments before changing it.
 
-Keep all four key-order benchmark groups. "Decode — object key order" varies
-member order, since every other payload in that file is `Jason.encode!` output
-and only exercises the free case. "Decode — object shape variety" varies how
-many distinct shapes a document cycles through, which is what the memo is keyed
-on. "Decode — member count sweep" and "Extract — member count sweep" are where
-the threshold comes from, the second sweeping key style as well because keys
-that share a prefix make ERTS's comparator work harder and shift the
-crossover. "Extract subtree — object key order" runs the same orders through
-`value_to_term`, the other caller, which no other group reaches.
+Keep the key-order groups, and keep the term-ordered member of each. "Decode —
+object key order" varies member order across the same bytes; its `[term]` row
+is the control, the order ERTS sorts for free, and it is there to *not* move.
+"Decode — object shape variety" varies how many distinct shapes a document
+cycles through, which is what the memo is keyed on. "Extract subtree — object
+key order" runs the same orders through `value_to_term`, the other caller,
+which no other group reaches. The thresholds themselves come from
+`make sweeps NAME=members` and `NAME=extract-members`, the second sweeping key
+style as well because keys that share a prefix make ERTS's comparator work
+harder and shift the crossover.
+
+The bookkeeping is not free for objects that never use it. Ordering metadata is
+collected per key and per object frame, but an object's width is not known
+until it closes, so objects outside `MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT`
+collect it and throw it away. Measured against v0.2.6 with `make ab`, that is
+`decode-utf8` +7.3%, `decode-deep` +7.1%, `decode-escapes` +4.7% and
+`decode-numbers` +1.9% — payloads dominated by single-member objects, 900 of
+them in the string fixtures and 121 nested in the deep one. All four attribute
+to the commit that introduced this ordering, 168a8e0: measured from it against
+HEAD they are -0.2%, +1.5%, +0.1% and -3.6%. It buys `decode-schema` -22.4%,
+`decode-reversed` -26.7%, `decode-shapes-fit` -51.7% and `get-subtree` -26.8%,
+which is the trade, and a
+deliberate one — but it is a trade, not a free win, and the operations that pay
+for it are in the registry so it stays visible.
+
+Do not try to buy it back by making `order_members_of` `#[inline(never)]` or by
+moving its prefix scratch out of the caller. Both were measured. `#[inline]`
+does hoist the callee's stack slots into `visit_object_end` whether or not the
+width check fires, and a plain `-O3` profile puts 17% of that function in its
+prologue and epilogue, which makes the frame look like the cause. It is not:
+under PGO, shrinking the frame from 1448 to 1192 bytes moved `decode-utf8` by
++0.5% and every other decode operation by less than the measurement could
+resolve. The `-O3` numbers that suggested -13% were the layout lottery this
+repository keeps warning about. What is left in that function under PGO is
+register pressure in an inlined body, not array size.
 
 ### Encoding
 
@@ -209,7 +394,12 @@ The six SIMD kernels (`escape_*` / `validate_escape_*` × NEON/AVX2/SSE2) spell 
 
 Binary map keys are probed with `enif_inspect_binary` before the type is asked for, since that call already answers "is this a binary" and a type-first dispatch made every binary key pay two cross-DSO calls to learn what one of them returns. Atom keys reach the type switch behind a failed probe and are *still* faster than type-first — 73.3 against 74.8 µs on a 200-record atom-keyed map, next to 45.2 against 49.4 for the binary-keyed one — because `enif_term_type` is a full tag switch and skipping it on the common path buys more than the probe costs on the other. Integer keys pay the probe too and are rare by construction, existing only to be stringified.
 
-Atom names are read Latin-1, because `ERL_NIF_UTF8` is a NIF 2.17 (OTP 26) addition and `nif_versions` still claims 2.15. `enif_get_atom_length` does not transcode: it *fails* for a name holding any character above U+00FF, which made `:"🚀"` and `:日本語` return `:unsupported_type` while `:café` encoded — atoms are Unicode by construction, so that was a wrong answer, not a limitation. Those names come from `enif_term_to_binary` instead: an atom that is not Latin-1 representable always serialises as `SMALL_ATOM_UTF8_EXT` or `ATOM_UTF8_EXT`, whose payload is the UTF-8 name. That costs a binary per atom, so only the names the Latin-1 read rejects take it, and a 200-record atom-keyed map is unchanged at 46-47 µs. Raising the floor to NIF 2.17 would replace both paths with one `ERL_NIF_UTF8` read and a 1020-byte buffer (255 characters × 4), at the cost of dropping OTP 22-25.
+Atom names are read Latin-1 because `ERL_NIF_UTF8` requires NIF 2.17 while the library supports 2.15. One `enif_get_atom` call uses the fixed 256-byte buffer and returns the written length including its terminator; a separate length query is unnecessary. Embedded NULs are preserved by that returned length. Names above U+00FF fail the Latin-1 read and use the UTF-8 payload from `SMALL_ATOM_UTF8_EXT` or `ATOM_UTF8_EXT` instead. Only that fallback allocates an intermediate binary.
+
+Encoder scratch is cleared after the result or suspended partial owns its bytes.
+Allocations above `BUF_RETAIN_CAP` are released; shrinking a nonempty vector
+cannot enforce that cap after a large output. Entry-point clearing also handles
+scratch left by a caught unwind. Ordinary-sized scratch remains reusable.
 
 
 ### Scheduler Awareness
@@ -218,17 +408,28 @@ Decode/parse inputs larger than 20 KB dispatch to dirty CPU schedulers. Encoding
 
 `Torque.Native` therefore performs a bounded, preemptible metadata walk on the BEAM before calling its private normal-encoder NIFs. `byte_size/1` and integer comparisons do not copy operands. One integer of fuel charges binary bytes and 16 units per node, stopping at 20 KiB of fuel; integers outside ±2^512 dispatch immediately. The discovery budget is smaller than the output hard limit: traversing 64 KiB of metadata before restarting dirty wasted work on medium inputs. `external_size/1` is not a replacement because it does not yield on supported older OTPs. Maps use `:maps.iterator`, not list conversion. Unsupported tuples are not recursively inspected; `{proplist}` keys and values are. No undocumented ERTS term layout is read, and the NIF ABI floor remains 2.15.
 
+A map's cardinality supplies a safe lower bound before iterator construction:
+the map node plus two nodes per member must fit the remaining discovery fuel.
+Maps that cannot fit go dirty without traversing their keys and values; maps
+that might fit still take the bounded representation-safe walk.
+
 Normal encoding then measures output. Map/list roots may suspend between elements at `ENCODE_BUDGET` (20 KiB) and resume dirty from `{:suspended, partial, next}`. Nested overruns restart dirty. Binary values and keys reserve their worst-case sixfold escaped size, quotes and enclosing delimiters against `ENCODE_HARD_LIMIT` (64 KiB), rather than comparing source length. The completed or suspended buffer is checked again before returning it. Bignum conversion is bounded by the metadata guard before Rustler materialization and by remaining output capacity before decimal emission.
 
 Metadata preflight is additional work on small inputs, and conservative bounds may dispatch earlier than exact output sizing would. Previous measurements of native output checks alone do not include this cost. `dirty: true` skips both discovery stages; compare current costs with `make ab`, not historical throughput figures. Raw-dispatch tests defend bounded escaped output and valid resumption; the scheduler regression compares prebuilt aligned/unaligned binaries and small/large bignums so a post-copy refusal cannot pass as bounded discovery.
 
-A batch lookup depends on both the path set and the document shape. Parsed-document batch NIFs start on a normal scheduler under `NORMAL_BUDGET_NODES` and check `Work::nodes()` after each path. An overrun returns `dirty_required`; `retry_dirty` reruns the batch on its dirty twin with `UNBOUNDED_BUDGET`.
+A lookup depends on both the path set and the document shape. Normal parsed-document lookups use `NORMAL_BUDGET_NODES`. `Conversion` checks cumulative container nodes and binary bytes before allocating or copying, including recursive descendants. An unfinished batch or refused conversion returns `dirty_required`; `retry_dirty` reruns on the dirty twin with `UNBOUNDED_BUDGET`. A completed batch is returned even if its final lookup crossed the budget, rather than replaying work already finished.
 
-`Work` separates document-dependent counters from caller-dependent counters. Comparisons, indexed members, document key bytes and terms built by `value_to_term` contribute to `document_work()`. Emitted results and pointer bytes belong to the path set. `nodes()` includes both groups for scheduler accounting, but only a document-dependent overrun sets `ParsedDocument::heavy`. This keeps an oversized path set from permanently moving later cheap lookups on the same document to dirty schedulers.
+Within a selected subtree, conversion spends byte-denominated credit instead
+of repeatedly dividing every lookup counter at every key. Credit is derived
+once at that subtree's root, includes the carried copied-byte remainder, and
+is checked before every descendant allocation. The cold refusal path retains
+the same document-versus-caller attribution as the full `Work` calculation.
 
-Caller work that already exhausts the budget is dispatched dirty before entering the NIF. `@dirty_result_count` handles result construction, while the path-byte limit covers splitting, unescaping and lookup keys. Raw lists use bounded walks; compiled handles carry path count and bytes. `compile_pointers/2` and `parse_get_many_nil/2` keep the separate `@dirty_path_count` rule because their work cannot be retried partway.
+`Work` separates document-dependent counters from caller-dependent counters. Comparisons, indexed members, document key bytes, materialized nodes and copied result bytes contribute to `document_work()`. Emitted results and pointer bytes belong to the path set. Refused work is not charged as performed. A refused conversion marks `ParsedDocument::heavy` only when its projected document work exceeds the budget; exhaustion caused by caller work alone does not poison later cheap lookups.
 
-A single large result remains indivisible: `value_to_term` completes on the current scheduler, then `consume_timeslice_nodes` reports the work to ERTS. Batch accounting is accumulated in native units and converted once so fractional work carries across paths.
+Caller work that already exhausts the budget is dispatched dirty before entering the NIF. `@dirty_result_count` handles result construction, while the path-byte limit covers splitting, unescaping and lookup keys. Raw lists use bounded walks; compiled handles carry path count and bytes. Compilation and fused parsing retain the separate `@dirty_path_count` rule to bound setup before materialization checks.
+
+Fused extraction applies the same recursive conversion budget after parsing selected values, and reuses canonical result terms. A small input can no longer multiply into unbounded normal-scheduler output through repeated selections. Individual object lookup scans retain their existing per-path accounting; conversion budgeting does not make those scans preemptible. Counters remain in native units until final reporting so fractional work carries across paths.
 
 ### Type Conversion
 
@@ -237,7 +438,7 @@ A single large result remains indivisible: `value_to_term` completes on the curr
 | object | map with binary keys |
 | array | list |
 | string | binary |
-| integer | integer (i64/u64) |
+| integer | exact bignum in full decode; i64/u64 or finite float in DOM paths |
 | float | float |
 | true/false | true/false |
 | null | nil |
@@ -256,3 +457,9 @@ A single large result remains indivisible: `value_to_term` completes on the curr
 - `native/torque_nif/src/atoms.rs` — cached atoms (ok, error, nil, no_such_field, nesting_too_deep, unsupported_type, non_finite_float, invalid_key, malformed_proplist, invalid_utf8)
 - `native/sonic-rs/` — vendored, Torque-patched sonic-rs 0.5.8 (native `JsonVisitor` exposed + parser recursion-depth limit + document slice accessors + `extract` one-pass path extraction)
 - `native/sonic-rs/src/extract.rs` — Torque-owned: prepared `ExtractPlan` + one-pass extraction, validated or SIMD-skipped
+- `bench/fixtures.exs` — every benchmark payload, its target path, and the regime it pins; `Bench.Thresholds` reads the tuning constants out of the Rust source
+- `bench/ops.exs` — the named single-operation registry `scripts/ab.sh` measures; adding a tuned path means adding a line here
+- `bench/pgo_workload.exs` — weighted PGO training over that registry (`:hot` / `:warm` / `:cover`)
+- `bench/torque_bench.exs` — comparison against Jason/jiffy/glazer/OTP JSON, and the CI trend data
+- `bench/sweeps.exs` — parametric sweeps that set the thresholds, not regression benchmarks
+- `scripts/ab.sh` — PGO both revisions, calibrate once, subtract a matched baseline, report per-operation instructions with a resolution

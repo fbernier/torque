@@ -6,3 +6,10 @@
 **/target/
 erl_crash.dump
 /native/sonic-rs/Cargo.lock
+
+# Saved `make ab` measurements; re-render with `./scripts/ab.sh --report ab-last.tsv`
+/ab-last.tsv
+
+# Benchmark output produced by BENCH_OUTPUT=json
+/bench_comparison.json
+/bench_torque.json

@@ -1,17 +1,21 @@
-# Benchmark: Torque vs glazer, jiffy, Jason, OTP JSON
+# Torque vs glazer, jiffy, Jason, and OTP JSON.
 #
-# Run with: MIX_ENV=bench mix run bench/torque_bench.exs
-# CI JSON output: BENCH_OUTPUT=json MIX_ENV=bench mix run bench/torque_bench.exs
+#   MIX_ENV=bench mix run bench/torque_bench.exs
+#   BENCH_OUTPUT=json MIX_ENV=bench mix run bench/torque_bench.exs
 #
-# glazer is benchmarked with UTF-8 validation enabled — `validate_utf8` on
-# decode, `force_utf8` on encode (both default OFF in glazer, needs >= 0.5.15)
-# — so every library in the comparison provides the guarantee Torque always
-# does: JSON strings are valid UTF-8. Keep these options in sync with
-# bench/glazer_pgo_workload.exs so glazer's PGO profile matches the
-# benchmarked configuration.
+# Use `make ab` to compare revisions. Fixtures preserve explicit member order,
+# and glazer runs with UTF-8 validation enabled for equivalent guarantees.
 
-# CI formatter for github-action-benchmark (customBiggerIsBetter)
-if System.get_env("BENCH_OUTPUT") == "json" do
+Code.require_file("fixtures.exs", __DIR__)
+
+alias Bench.Fixtures
+alias Benchee.Formatters.Console
+
+json? = System.get_env("BENCH_OUTPUT") == "json"
+
+# CI formatter for github-action-benchmark
+
+if json? do
   defmodule CIFormatter do
     @behaviour Benchee.Formatter
 
@@ -39,265 +43,36 @@ if System.get_env("BENCH_OUTPUT") == "json" do
   Agent.start_link(fn -> "" end, name: :bench_group)
 end
 
-ci_formatters =
-  if System.get_env("BENCH_OUTPUT") == "json",
-    do: [{CIFormatter, []}],
-    else: []
+formatters =
+  [{Console, percentiles: [50, 95, 99]}] ++ if json?, do: [{CIFormatter, []}], else: []
 
-defmodule BenchGroup do
-  def set(group) do
-    if System.get_env("BENCH_OUTPUT") == "json" do
-      Agent.update(:bench_group, fn _ -> group end)
-    end
+# Durations are overridable so the suite can be smoke-run without waiting out a
+# full measurement: BENCH_TIME=1 BENCH_WARMUP=0 BENCH_MEMORY=0.
+secs = fn var, default ->
+  case System.get_env(var) do
+    nil -> default
+    value -> String.to_integer(value)
   end
 end
 
-# Sample JSON payload (~1.2KB)
-sample_json =
-  Jason.encode!(%{
-    "id" => "req-#{:rand.uniform(1_000_000)}",
-    "site" => %{
-      "domain" => "example.com",
-      "page" => "https://example.com/articles/some-article-title",
-      "ref" => "https://google.com/search?q=something",
-      "publisher" => %{"id" => "pub-12345"},
-      "cat" => ["IAB1", "IAB2-3"]
-    },
-    "device" => %{
-      "devicetype" => 2,
-      "ua" =>
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "ip" => "203.0.113.42",
-      "ipv6" => "2001:db8::1",
-      "ifa" => "cdda802e-fb9c-47ad-0794d394fbbd",
-      "os" => "Apple iOS",
-      "geo" => %{
-        "country" => "US",
-        "lat" => 40.7128,
-        "lon" => -74.006,
-        "region" => "NY",
-        "type" => 2,
-        "zip" => "10001"
-      },
-      "connectiontype" => 2,
-      "carrier" => "Verizon",
-      "language" => "en"
-    },
-    "user" => %{
-      "id" => "user-abcdef123456",
-      "buyeruid" => "buyer-xyz789",
-      "ext" => %{
-        "eids" => [
-          %{"source" => "adserver.org", "uids" => [%{"id" => "uid-tdid-1234"}]},
-          %{"source" => "criteo.com", "uids" => [%{"id" => "uid-criteo-5678"}]},
-          %{"source" => "uidapi.com", "uids" => [%{"id" => "uid2-raw-token-abcdef"}]}
-        ]
-      }
-    },
-    "imp" => [
-      %{
-        "id" => "imp-1",
-        "banner" => %{"w" => 300, "h" => 250, "pos" => 1},
-        "bidfloor" => 0.5,
-        "pmp" => %{
-          "private_auction" => 1,
-          "deals" => [
-            %{"id" => "deal-abc", "bidfloor" => 1.0},
-            %{"id" => "deal-def", "bidfloor" => 0.75}
-          ]
-        }
-      },
-      %{
-        "id" => "imp-2",
-        "video" => %{
-          "mimes" => ["video/mp4", "video/webm"],
-          "minduration" => 5,
-          "maxduration" => 30,
-          "protocols" => [2, 5],
-          "placement" => 1
-        },
-        "bidfloor" => 2.0
-      }
-    ],
-    "regs" => %{"coppa" => 0},
-    "ext" => %{"appnexus" => %{"seller_member_id" => 1410}}
-  })
+# One runner instead of eleven copies of the same eighteen-line Benchee call.
+group = fn name, note, scenarios ->
+  if json?, do: Agent.update(:bench_group, fn _ -> name end)
 
-IO.puts("JSON payload size: #{byte_size(sample_json)} bytes\n")
+  IO.puts("\n=== #{String.upcase(name)} ===")
+  if note, do: IO.puts(note)
+  IO.puts("")
 
-fields = [
-  "/id",
-  "/site/domain",
-  "/device/ip",
-  "/device/geo/country",
-  "/user/id"
-]
+  Benchee.run(scenarios,
+    warmup: secs.("BENCH_WARMUP", 2),
+    time: secs.("BENCH_TIME", 5),
+    memory_time: secs.("BENCH_MEMORY", 2),
+    percentiles: [50, 95, 99],
+    formatters: formatters
+  )
+end
 
-# Bid response for encoding benchmark
-bid_response = %{
-  id: "req-123",
-  cur: "USD",
-  seatbid: [
-    %{
-      seat: "458",
-      bid: [
-        %{
-          id: "bid-abc",
-          impid: "imp-1",
-          price: 1.5,
-          adomain: ["advertiser.com"],
-          adm: "<script src=\"https://tracker.example.com/imp?id=123\"></script>",
-          cid: "campaign-1",
-          crid: "creative-1",
-          burl: "https://tracker.example.com/win?id=123&price=${AUCTION_PRICE}",
-          iurl: "https://cdn.example.com/preview.jpg"
-        }
-      ]
-    }
-  ],
-  ext: %{protocol: "5.3"}
-}
-
-# jiffy proplist format (same data)
-bid_response_proplist =
-  {[
-     {:id, "req-123"},
-     {:cur, "USD"},
-     {:seatbid,
-      [
-        {[
-           {:seat, "458"},
-           {:bid,
-            [
-              {[
-                 {:id, "bid-abc"},
-                 {:impid, "imp-1"},
-                 {:price, 1.5},
-                 {:adomain, ["advertiser.com"]},
-                 {:adm, "<script src=\"https://tracker.example.com/imp?id=123\"></script>"},
-                 {:cid, "campaign-1"},
-                 {:crid, "creative-1"},
-                 {:burl, "https://tracker.example.com/win?id=123&price=${AUCTION_PRICE}"},
-                 {:iurl, "https://cdn.example.com/preview.jpg"}
-               ]}
-            ]}
-         ]}
-      ]}
-   ]}
-
-# Generate a synthetic ~750 KB JSON payload resembling a Twitter API response.
-# Each status entry contains a full user object, entities, and metadata (~2.4 KB/entry).
-large_json =
-  Jason.encode!(%{
-    "statuses" =>
-      Enum.map(1..320, fn i ->
-        uid = rem(i, 200)
-
-        %{
-          "metadata" => %{"result_type" => "recent", "iso_language_code" => "en"},
-          "created_at" => "Sun Aug 31 00:29:15 +0000 2014",
-          "id" => 505_874_924_000_000_000 + i,
-          "id_str" => Integer.to_string(505_874_924_000_000_000 + i),
-          "text" =>
-            "Sample tweet #{i} #elixir #benchmark @user_#{uid} lorem ipsum dolor sit amet " <>
-              "consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua",
-          "source" =>
-            "<a href=\"http://twitter.com/download/iphone\" rel=\"nofollow\">Twitter for iPhone</a>",
-          "truncated" => false,
-          "in_reply_to_status_id" => nil,
-          "in_reply_to_status_id_str" => nil,
-          "in_reply_to_user_id" => nil,
-          "in_reply_to_user_id_str" => nil,
-          "in_reply_to_screen_name" => nil,
-          "user" => %{
-            "id" => 1_000_000 + uid,
-            "id_str" => Integer.to_string(1_000_000 + uid),
-            "name" => "User Name #{uid}",
-            "screen_name" => "username_#{uid}",
-            "location" => "San Francisco, CA",
-            "description" =>
-              "Software engineer and open source contributor. Building things at the intersection of technology and creativity.",
-            "url" => nil,
-            "entities" => %{"description" => %{"urls" => []}},
-            "protected" => false,
-            "followers_count" => rem(i * 1337, 100_000),
-            "friends_count" => rem(i * 42, 5_000),
-            "listed_count" => rem(i * 7, 500),
-            "created_at" => "Mon Jan 01 00:00:00 +0000 2010",
-            "favourites_count" => rem(i * 13, 50_000),
-            "utc_offset" => nil,
-            "time_zone" => nil,
-            "geo_enabled" => false,
-            "verified" => false,
-            "statuses_count" => rem(i * 17, 10_000),
-            "lang" => "en",
-            "contributors_enabled" => false,
-            "is_translator" => false,
-            "is_translation_enabled" => false,
-            "profile_background_color" => "C0DEED",
-            "profile_background_image_url" =>
-              "http://pbs.twimg.com/profile_background_images/#{uid}/bg.png",
-            "profile_background_image_url_https" =>
-              "https://pbs.twimg.com/profile_background_images/#{uid}/bg.png",
-            "profile_background_tile" => false,
-            "profile_image_url" => "http://pbs.twimg.com/profile_images/#{uid}/photo_normal.jpeg",
-            "profile_image_url_https" =>
-              "https://pbs.twimg.com/profile_images/#{uid}/photo_normal.jpeg",
-            "profile_banner_url" => "https://pbs.twimg.com/profile_banners/#{uid}/1409318784",
-            "profile_link_color" => "0084B4",
-            "profile_sidebar_border_color" => "C0DEED",
-            "profile_sidebar_fill_color" => "DDEEF6",
-            "profile_text_color" => "333333",
-            "profile_use_background_image" => true,
-            "default_profile" => true,
-            "default_profile_image" => false,
-            "following" => false,
-            "follow_request_sent" => false,
-            "notifications" => false
-          },
-          "geo" => nil,
-          "coordinates" => nil,
-          "place" => nil,
-          "contributors" => nil,
-          "retweet_count" => rem(i * 3, 1000),
-          "favorite_count" => rem(i * 7, 2000),
-          "entities" => %{
-            "hashtags" => [
-              %{"text" => "elixir", "indices" => [15, 22]},
-              %{"text" => "benchmark", "indices" => [23, 33]}
-            ],
-            "symbols" => [],
-            "urls" => [],
-            "user_mentions" => [
-              %{
-                "screen_name" => "user_#{uid}",
-                "name" => "User #{uid}",
-                "id" => 2_000_000 + uid,
-                "id_str" => Integer.to_string(2_000_000 + uid),
-                "indices" => [34, 42]
-              }
-            ]
-          },
-          "favorited" => false,
-          "retweeted" => false,
-          "lang" => "en"
-        }
-      end),
-    "search_metadata" => %{
-      "count" => 320,
-      "completed_in" => 0.035,
-      "max_id" => 505_874_924_095_815_681,
-      "since_id" => 0,
-      "query" => "%23elixir",
-      "refresh_url" => "?since_id=505874924095815681&q=%23elixir&include_entities=1"
-    }
-  })
-
-IO.puts("Large JSON payload size: #{byte_size(large_json)} bytes\n")
-
-large_decoded_json = Torque.decode!(large_json)
-
-# Convert to proplist format (binary keys) for libraries that support it
+# jiffy's `{proplist}` shape, for the encoders that accept it.
 to_proplist = fn f, v ->
   cond do
     is_map(v) -> {Enum.map(v, fn {k, val} -> {k, f.(f, val)} end)}
@@ -306,467 +81,273 @@ to_proplist = fn f, v ->
   end
 end
 
-large_decoded_proplist = to_proplist.(to_proplist, large_decoded_json)
+proplist = &to_proplist.(to_proplist, &1)
 
-BenchGroup.set("Decode — 1.2 KB OpenRTB")
-IO.puts("=== DECODE BENCHMARK ===\n")
+request = Fixtures.fetch(:"req-small")
+feed = Fixtures.fetch(:"feed-huge")
 
-Benchee.run(
+IO.puts("request payload: #{byte_size(request.json)} bytes")
+IO.puts("feed payload:    #{byte_size(feed.json)} bytes")
+
+# ---------------------------------------------------------------------------
+# Decode
+# ---------------------------------------------------------------------------
+
+decoders = fn %{json: json} ->
   %{
-    "glazer decode" => fn -> :glazer_json.decode(sample_json, [:validate_utf8]) end,
-    "jason decode" => fn -> Jason.decode!(sample_json) end,
-    "jiffy decode" => fn -> :jiffy.decode(sample_json, [:return_maps]) end,
-    "otp json decode" => fn -> :json.decode(sample_json) end,
-    "torque decode" => fn -> Torque.decode!(sample_json) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-BenchGroup.set("Decode — 750 KB Twitter")
-IO.puts("\n=== LARGE JSON DECODE BENCHMARK ===\n")
-
-Benchee.run(
-  %{
-    "glazer decode" => fn -> :glazer_json.decode(large_json, [:validate_utf8]) end,
-    "jason decode" => fn -> Jason.decode!(large_json) end,
-    "jiffy decode" => fn -> :jiffy.decode(large_json, [:return_maps]) end,
-    "otp json decode" => fn -> :json.decode(large_json) end,
-    "torque decode" => fn -> Torque.decode!(large_json) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-# `Jason.encode!` emits BEAM map order, which is already ideal for ERTS
-# flatmaps. Schema order models non-BEAM producers; reversed order bounds the
-# insertion-sort worst case. Keep each schema stable across records so branch
-# behavior matches real producers.
-rewrite_keys = fn f, order, v ->
-  cond do
-    is_map(v) ->
-      "{" <>
-        (v
-         |> Enum.to_list()
-         |> order.()
-         |> Enum.map_join(",", fn {k, x} -> Jason.encode!(k) <> ":" <> f.(f, order, x) end)) <>
-        "}"
-
-    is_list(v) ->
-      "[" <> Enum.map_join(v, ",", &f.(f, order, &1)) <> "]"
-
-    true ->
-      Jason.encode!(v)
-  end
+    "glazer decode" => fn -> :glazer_json.decode(json, [:validate_utf8]) end,
+    "jason decode" => fn -> Jason.decode!(json) end,
+    "jiffy decode" => fn -> :jiffy.decode(json, [:return_maps]) end,
+    "otp json decode" => fn -> :json.decode(json) end,
+    "torque decode" => fn -> Torque.decode!(json) end
+  }
 end
 
-:rand.seed(:exsss, {4, 8, 15})
+group.("Decode — request", nil, decoders.(request))
+group.("Decode — feed", nil, decoders.(feed))
 
-# Reuse one deterministic permutation per key set, as a schema-driven producer does.
-schema_order = fn pairs ->
-  shape = pairs |> Enum.map(&elem(&1, 0)) |> Enum.sort()
-  cache_key = {:schema_order, shape}
+# ---------------------------------------------------------------------------
+# Encode
+# ---------------------------------------------------------------------------
 
-  permutation =
-    case Process.get(cache_key) do
-      nil ->
-        p = Enum.shuffle(shape)
-        Process.put(cache_key, p)
-        p
+encoders = fn %{term: term} ->
+  pl = proplist.(term)
 
-      p ->
-        p
+  %{
+    "jason [map() :: binary()]" => fn -> Jason.encode!(term) end,
+    "jason [map() :: iodata()]" => fn -> Jason.encode_to_iodata!(term) end,
+    "jiffy [map() :: iodata()]" => fn -> :jiffy.encode(term, [:force_utf8]) end,
+    "jiffy [proplist() :: iodata()]" => fn -> :jiffy.encode(pl, [:force_utf8]) end,
+    "otp json [map() :: iodata()]" => fn -> :json.encode(term) end,
+    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(term, [:force_utf8]) end,
+    "torque [map() :: binary()]" => fn -> Torque.encode!(term) end,
+    "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(term) end,
+    "torque [proplist() :: binary()]" => fn -> Torque.encode!(pl) end,
+    "torque [proplist() :: iodata()]" => fn -> Torque.encode_to_iodata(pl) end
+  }
+end
+
+group.("Encode — request", nil, encoders.(request))
+group.("Encode — feed", nil, encoders.(feed))
+
+# Key order and object shape. Term order is the control that cannot benefit.
+
+group.(
+  "Decode — object key order",
+  "Same members, three orders. [term] is the control: it cannot improve.",
+  Map.new(
+    [term: :"record-term", schema: :"record-schema", reversed: :"record-reversed"],
+    fn {label, id} ->
+      json = Fixtures.fetch(id).json
+      {"torque decode [#{label} order]", fn -> Torque.decode!(json) end}
     end
-
-  by_key = Map.new(pairs)
-  Enum.map(permutation, fn k -> {k, Map.fetch!(by_key, k)} end)
-end
-
-reverse_order = &Enum.sort_by(&1, fn {k, _} -> k end, :desc)
-
-sample_schema = rewrite_keys.(rewrite_keys, schema_order, Torque.decode!(sample_json))
-sample_reversed = rewrite_keys.(rewrite_keys, reverse_order, Torque.decode!(sample_json))
-large_schema = rewrite_keys.(rewrite_keys, schema_order, Torque.decode!(large_json))
-large_reversed = rewrite_keys.(rewrite_keys, reverse_order, Torque.decode!(large_json))
-
-BenchGroup.set("Decode — object key order")
-IO.puts("\n=== KEY-ORDER SENSITIVITY (same bytes, different member order) ===\n")
-
-Benchee.run(
-  %{
-    "torque decode 1.2 KB [term order]" => fn -> Torque.decode!(sample_json) end,
-    "torque decode 1.2 KB [schema order]" => fn -> Torque.decode!(sample_schema) end,
-    "torque decode 1.2 KB [reversed — worst case]" => fn -> Torque.decode!(sample_reversed) end,
-    "torque decode 750 KB [term order]" => fn -> Torque.decode!(large_json) end,
-    "torque decode 750 KB [schema order]" => fn -> Torque.decode!(large_schema) end,
-    "torque decode 750 KB [reversed — worst case]" => fn -> Torque.decode!(large_reversed) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-# Vary live object shapes while holding record count, size, and key order fixed.
-pad2 = fn n -> String.pad_leading(Integer.to_string(n), 2, "0") end
-
-shape_variety = fn ids ->
-  pad = fn n, width -> String.pad_leading(Integer.to_string(n), width, "0") end
-
-  key_sets =
-    for s <- ids do
-      for i <- 1..20, do: "#{pad.(s, 2)}_#{pad.(i, 2)}_field"
-    end
-
-  rows =
-    for r <- 1..div(600, length(ids)), keys <- key_sets do
-      Map.new(keys, fn k -> {k, "value_#{k}_#{pad.(r, 3)}"} end)
-    end
-
-  rewrite_keys.(rewrite_keys, reverse_order, %{"rows" => rows})
-end
-
-# These IDs cover distinct direct-mapped shape slots; update them if `slot_of` changes.
-one_shape = shape_variety.([19])
-eight_shapes = shape_variety.([19, 25, 1, 2, 5, 8, 12, 15])
-
-many_shapes =
-  shape_variety.([
-    19,
-    22,
-    23,
-    25,
-    26,
-    27,
-    1,
-    28,
-    29,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17
-  ])
-
-[one_shape, eight_shapes, many_shapes]
-|> Enum.map(&byte_size/1)
-|> Enum.uniq()
-|> case do
-  [_only] -> :ok
-  sizes -> raise "shape-variety fixtures must be the same size, got #{inspect(sizes)}"
-end
-
-# Sets `MIN_ORDERED_MEMBERS`; rerun before changing the flatmap threshold.
-member_sweep =
-  for n <- [2, 3, 4, 5, 8, 16, 32, 33], order <- [:term, :reversed], into: %{} do
-    pairs = for i <- 1..n, do: {"key_#{pad2.(i)}", i}
-    sorted = if order == :term, do: Enum.sort(pairs), else: Enum.sort(pairs, :desc)
-    json = "{" <> Enum.map_join(sorted, ",", fn {k, v} -> ~s("#{k}":#{v}) end) <> "}"
-
-    {"torque decode #{String.pad_leading(Integer.to_string(n), 2)} members [#{order}]",
-     fn -> Torque.decode!(json) end}
-  end
-
-BenchGroup.set("Decode — member count sweep")
-IO.puts("\n=== MEMBER COUNT SWEEP (where ordering starts to pay) ===\n")
-
-Benchee.run(member_sweep,
-  warmup: 1,
-  time: 3,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-# Exercises the `value_to_term` caller across member counts, key prefixes, and order.
-extract_sweep =
-  for n <- [4, 6, 8, 12, 32],
-      style <- [:distinct, :prefix],
-      order <- [:term, :shuffled, :reversed],
-      into: %{} do
-    keys =
-      case style do
-        :distinct -> for i <- 1..n, do: <<?a + rem(i, 26)>> <> pad2.(i) <> "x"
-        :prefix -> for i <- 1..n, do: "field_#{pad2.(i)}"
-      end
-
-    keys =
-      case order do
-        :term -> Enum.sort(keys)
-        :reversed -> Enum.sort(keys, :desc)
-        :shuffled -> Enum.shuffle(keys)
-      end
-
-    row = "{" <> Enum.map_join(keys, ",", fn k -> ~s("#{k}":"#{k}") end) <> "}"
-    json = "{\"rows\":[" <> Enum.map_join(1..200, ",", fn _ -> row end) <> "]}"
-    {:ok, doc} = Torque.parse(json)
-
-    {"torque get #{String.pad_leading(Integer.to_string(n), 2)} members [#{style}, #{order}]",
-     fn -> Torque.get(doc, "/rows") end}
-  end
-
-BenchGroup.set("Extract — member count sweep")
-IO.puts("\n=== EXTRACT MEMBER SWEEP (where ordering starts to pay in value_to_term) ===\n")
-
-Benchee.run(extract_sweep,
-  warmup: 1,
-  time: 3,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-BenchGroup.set("Decode — object shape variety")
-IO.puts("\n=== SHAPE VARIETY (same size, more distinct object shapes) ===\n")
-IO.puts("Shape-variety payload size: #{byte_size(one_shape)} bytes\n")
-
-Benchee.run(
-  %{
-    "torque decode [1 shape]" => fn -> Torque.decode!(one_shape) end,
-    "torque decode [8 shapes — one per slot]" => fn -> Torque.decode!(eight_shapes) end,
-    "torque decode [24 shapes — three per slot]" => fn -> Torque.decode!(many_shapes) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-# Sets the small-input accounting cutoff for successful and rejected parses.
-sized = fn n, kind ->
-  case kind do
-    :valid -> ~s({"a":1}) <> String.duplicate(" ", n - 7)
-    :reject_first -> "!" <> String.duplicate(" ", n - 1)
-    :reject_last -> String.duplicate(" ", n - 1) <> "!"
-  end
-end
-
-accounting_sweep =
-  for n <- [8, 68, 511, 512, 1143, 1600],
-      {kind, label} <- [
-        valid: "valid",
-        reject_first: "rejected at byte 0",
-        reject_last: "rejected at the end"
-      ],
-      n >= 8,
-      into: %{} do
-    json = sized.(n, kind)
-
-    {"torque decode #{String.pad_leading(Integer.to_string(n), 4)} B [#{label}]",
-     fn -> Torque.Native.decode(json) end}
-  end
-
-BenchGroup.set("Decode — small input accounting")
-IO.puts("\n=== SMALL INPUT ACCOUNTING (where charging stops being worth its call) ===\n")
-
-Benchee.run(accounting_sweep,
-  warmup: 1,
-  time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-BenchGroup.set("Encode — 1.2 KB OpenRTB")
-IO.puts("\n=== ENCODE BENCHMARK ===\n")
-
-Benchee.run(
-  %{
-    "jason [map() :: binary()]" => fn -> Jason.encode!(bid_response) end,
-    "jason [map() :: iodata()]" => fn -> Jason.encode_to_iodata!(bid_response) end,
-    "jiffy [map() :: iodata()]" => fn -> :jiffy.encode(bid_response) end,
-    "jiffy [proplist() :: iodata()]" => fn ->
-      :jiffy.encode(bid_response_proplist, [:force_utf8])
-    end,
-    "otp json [map() :: iodata()]" => fn -> :json.encode(bid_response) end,
-    "glazer [map() :: binary()]" => fn -> :glazer_json.encode(bid_response, [:force_utf8]) end,
-    "torque [map() :: binary()]" => fn -> Torque.encode!(bid_response) end,
-    "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(bid_response) end,
-    "torque [proplist() :: binary()]" => fn -> Torque.encode!(bid_response_proplist) end,
-    "torque [proplist() :: iodata()]" => fn -> Torque.encode_to_iodata(bid_response_proplist) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-BenchGroup.set("Encode — 750 KB Twitter")
-IO.puts("\n=== LARGE JSON ENCODE BENCHMARK ===\n")
-
-Benchee.run(
-  %{
-    "jason [map() :: binary()]" => fn -> Jason.encode!(large_decoded_json) end,
-    "jason [map() :: iodata()]" => fn -> Jason.encode_to_iodata!(large_decoded_json) end,
-    "jiffy [map() :: iodata()]" => fn -> :jiffy.encode(large_decoded_json) end,
-    "jiffy [proplist() :: iodata()]" => fn -> :jiffy.encode(large_decoded_proplist) end,
-    "otp json [map() :: iodata()]" => fn -> :json.encode(large_decoded_json) end,
-    "glazer [map() :: binary()]" => fn ->
-      :glazer_json.encode(large_decoded_json, [:force_utf8])
-    end,
-    "torque [map() :: binary()]" => fn -> Torque.encode!(large_decoded_json) end,
-    "torque [map() :: iodata()]" => fn -> Torque.encode_to_iodata(large_decoded_json) end,
-    "torque [proplist() :: binary()]" => fn -> Torque.encode!(large_decoded_proplist) end,
-    "torque [proplist() :: iodata()]" => fn -> Torque.encode_to_iodata(large_decoded_proplist) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
-)
-
-# Pre-compiled jq paths for glazer (application-time constants, like torque's
-# JSON pointer strings) — reused inside the timed function below.
-glazer_paths =
-  Enum.map(
-    [".id", ".site.domain", ".device.ip", ".device.geo.country", ".user.id"],
-    &:glazer.compile_path/1
   )
-
-BenchGroup.set("Parse — 1.2 KB OpenRTB")
-IO.puts("\n=== PARSE BENCHMARK ===\n")
-
-Benchee.run(
-  %{
-    "torque parse" => fn -> Torque.parse(sample_json) end,
-    "torque parse(unique_keys)" => fn -> Torque.parse(sample_json, unique_keys: true) end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
+  |> Map.merge(%{
+    "jason decode [schema order]" =>
+      (
+        json = Fixtures.fetch(:"record-schema").json
+        fn -> Jason.decode!(json) end
+      )
+  })
 )
 
-BenchGroup.set("Extract 5 fields — 1.2 KB OpenRTB")
-IO.puts("\n=== EXTRACT 5 FIELDS BENCHMARK ===\n")
-
-# End-to-end from raw JSON: each library does its full setup plus 5 extractions,
-# so the comparison is apples-to-apples — torque parse + get vs glazer decode +
-# find (it has no lazy handle, so it must fully decode first).
-Benchee.run(
-  %{
-    "glazer decode + find x5" => fn ->
-      d = :glazer_json.decode(sample_json, [:validate_utf8])
-      for p <- glazer_paths, do: :glazer.find(d, p)
-    end,
-    "torque parse + get x5" => fn ->
-      {:ok, doc} = Torque.parse(sample_json)
-      for f <- fields, do: Torque.get(doc, f)
-    end,
-    "torque parse + get_many" => fn ->
-      {:ok, doc} = Torque.parse(sample_json)
-      Torque.get_many(doc, fields)
-    end,
-    "torque parse(unique_keys) + get_many" => fn ->
-      {:ok, doc} = Torque.parse(sample_json, unique_keys: true)
-      Torque.get_many(doc, fields)
+group.(
+  "Decode — object shape variety",
+  "Cyclic record shapes: fit uses distinct actual hash slots; thrash replaces every slot before reuse.",
+  Map.new(
+    [
+      {"1 shape", :"shape-single"},
+      {"#{Bench.Thresholds.get(:shape_slots)} shapes — one per slot", :"shape-memo-fit"},
+      {"#{Bench.Thresholds.get(:shape_slots) * 3} shapes — three per slot, no hits",
+       :"shape-memo-thrash"}
+    ],
+    fn {label, id} ->
+      json = Fixtures.fetch(id).json
+      {"torque decode [#{label}]", fn -> Torque.decode!(json) end}
     end
-  },
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
+  )
 )
 
-BenchGroup.set("Extract subtree — object key order")
-IO.puts("\n=== EXTRACT SUBTREE, KEY ORDER (value_to_term, not the fused decoder) ===\n")
+# String shapes. Clean ASCII is the control outside escape branches.
 
-# The reordering runs on two paths: `build_map` in the fused decoder, which the
-# decode groups above cover, and `reorder_object` in `value_to_term`, which
-# nothing else here reaches. Extracting a whole subtree is what puts every
-# object in the document through it, so these parse once and pull the record
-# array back out in each member order.
-order_docs = [term: large_json, schema: large_schema, reversed: large_reversed]
+group.(
+  "Encode — string shapes",
+  "[clean] rows are the control: no escape branch, no bytewise tail.",
+  Map.new(
+    [
+      {"short clean", :"str-short-clean"},
+      {"long clean", :"str-long-clean"},
+      {"short: escape at byte 0", :"str-escape-early"},
+      {"short: late quote after clean prefix", :"str-escape-late"},
+      {"long: SIMD clean run then quotes", :"str-escape-long"},
+      {"long: non-ASCII throughout", :"str-utf8"},
+      {"short: trailing UTF-8 after clean prefix", :"str-utf8-tail"},
+      {"SHORT_STRING boundary: trailing UTF-8", :"str-utf8-boundary"}
+    ],
+    fn {label, id} ->
+      term = Fixtures.fetch(id).term
+      {"torque encode [#{label}]", fn -> Torque.encode!(term) end}
+    end
+  )
+)
 
-parsed_docs =
-  for {label, json} <- order_docs do
-    {:ok, doc} = Torque.parse(json)
-    {label, doc}
+group.(
+  "Encode — key kinds",
+  "Binary keys are probed before the type is asked for; atom names above U+00FF take a different path.",
+  Map.new(
+    [
+      {"binary keys", :"record-schema"},
+      {"atom keys", :"keys-atom"},
+      {"atom keys above U+00FF", :"keys-atom-unicode"},
+      {"integer keys", :"keys-integer"}
+    ],
+    fn {label, id} ->
+      term = Fixtures.fetch(id).term
+      {"torque encode [#{label}]", fn -> Torque.encode!(term) end}
+    end
+  )
+)
+
+# ---------------------------------------------------------------------------
+# Parse, lookup, extract
+# ---------------------------------------------------------------------------
+
+group.("Parse — request", nil, %{
+  "torque parse" => fn -> Torque.parse(request.json) end,
+  "torque parse(unique_keys)" => fn -> Torque.parse(request.json, unique_keys: true) end
+})
+
+request_paths = Fixtures.paths(request)
+compiled = Torque.compile_pointers(request_paths)
+compiled_fast = Torque.compile_pointers(request_paths, unique_keys: true, validate: false)
+
+# Glazer uses jq-style [N] array indices, not dotted numeric field names.
+# Both libraries derive all ten paths from one typed selection.
+glazer_paths =
+  Enum.map(Fixtures.request_selection(), fn segments ->
+    segments
+    |> Enum.map_join(fn
+      index when is_integer(index) -> "[#{index}]"
+      key when is_binary(key) -> ".#{key}"
+    end)
+    |> :glazer.compile_path()
+  end)
+
+extractions = %{
+  "glazer decode + find [precompiled paths]" => fn ->
+    d = :glazer_json.decode(request.json, [:validate_utf8])
+    for p <- glazer_paths, do: :glazer.find(d, p)
+  end,
+  "torque parse + get [raw pointers]" => fn ->
+    {:ok, doc} = Torque.parse(request.json)
+    for p <- request_paths, do: Torque.get(doc, p)
+  end,
+  "torque parse + get_many [raw pointers]" => fn ->
+    {:ok, doc} = Torque.parse(request.json)
+    Torque.get_many(doc, request_paths)
+  end,
+  "torque one pass [precompiled pointers]" => fn ->
+    Torque.parse_get_many_nil(request.json, compiled)
+  end,
+  "torque one pass [precompiled, validate: false]" => fn ->
+    Torque.parse_get_many_nil(request.json, compiled_fast)
   end
+}
 
-Benchee.run(
-  Map.new(parsed_docs, fn {label, doc} ->
-    {"torque get subtree [#{label} order]", fn -> Torque.get(doc, "/statuses") end}
-  end),
-  warmup: 2,
-  time: 5,
-  memory_time: 2,
-  percentiles: [50, 95, 99],
-  formatters:
-    [
-      {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
-    ] ++ ci_formatters
+expected =
+  Enum.map(Fixtures.request_selection(), fn segments ->
+    get_in(
+      request.term,
+      Enum.map(segments, fn
+        index when is_integer(index) -> Access.at(index)
+        key -> key
+      end)
+    )
+  end)
+
+normalize = fn
+  {:ok, values} ->
+    values
+
+  values when is_list(values) ->
+    Enum.map(values, fn
+      {:ok, value} -> value
+      [value] -> value
+      value -> value
+    end)
+end
+
+Enum.each(extractions, fn {label, run} ->
+  values = normalize.(run.())
+
+  unless values === expected,
+    do:
+      raise(
+        "#{label} selected different request fields: #{inspect(values)} != #{inspect(expected)}"
+      )
+end)
+
+group.(
+  "Extract fields — request",
+  "Raw JSON to the same #{length(request_paths)} fields, including arrays. Decode/parse is timed; " <>
+    "Glazer paths and Torque compiled handles are prepared once outside timing. Raw-pointer rows " <>
+    "parse their pointers per call. The validate: false row skips validation of unselected values.",
+  extractions
 )
 
-# Write accumulated CI results to JSON
-if System.get_env("BENCH_OUTPUT") == "json" do
-  results = Agent.get(:bench_results, & &1)
+# ObjectMemo behavior across object widths.
+group.(
+  "Lookup — object width",
+  "Batch lookups against a parsed document. narrow is under WIDE_OBJECT_MEMBERS: the plain scan.",
+  Map.new(
+    [
+      {"narrow", :"narrow-object"},
+      {"wide", :"wide-object"},
+      {"wide chain", :"wide-chain"},
+      {"wide siblings", :"wide-siblings"},
+      {"long keys", :"wide-long-keys"}
+    ],
+    fn {label, id} ->
+      f = Fixtures.fetch(id)
+      {:ok, doc} = Torque.parse(f.json)
+      paths = Fixtures.paths(f)
+      {"torque get_many [#{label}]", fn -> Torque.get_many_nil(doc, paths) end}
+    end
+  )
+)
 
+# Exercises value_to_term ordering; decode groups cover the fused path.
+group.(
+  "Extract subtree — object key order",
+  "value_to_term, not the fused decoder. [term] is again the control.",
+  Map.new(
+    [term: :"record-term", schema: :"record-schema", reversed: :"record-reversed"],
+    fn {label, id} ->
+      json = "{\"rows\":" <> Fixtures.fetch(id).json <> "}"
+      {:ok, doc} = Torque.parse(json)
+      {"torque get subtree [#{label} order]", fn -> Torque.get(doc, "/rows") end}
+    end
+  )
+)
+
+# CI output
+
+if json? do
+  results = Agent.get(:bench_results, & &1)
   {sha, 0} = System.cmd("git", ["rev-parse", "--short", "HEAD"])
 
-  comparison = %{
-    "commit" => String.trim(sha),
-    "date" => DateTime.utc_now() |> DateTime.to_iso8601(),
-    "results" => results
-  }
-
-  File.write!("bench_comparison.json", Jason.encode!(comparison))
+  File.write!(
+    "bench_comparison.json",
+    Jason.encode!(%{
+      "commit" => String.trim(sha),
+      "date" => DateTime.utc_now() |> DateTime.to_iso8601(),
+      "results" => results
+    })
+  )
 
   torque_results =
     results
-    |> Enum.filter(fn r -> String.starts_with?(r["name"], "torque") end)
+    |> Enum.filter(&String.starts_with?(&1["name"], "torque"))
     |> Enum.map(fn r ->
       [category, payload] = String.split(r["group"], " — ", parts: 2)
 
@@ -776,13 +357,13 @@ if System.get_env("BENCH_OUTPUT") == "json" do
         |> String.replace(~r/[\[\]()]/, "")
         |> String.trim()
 
-      trend_name =
+      name =
         case category do
           "Encode" -> "encode #{variant} (#{payload})"
           _ -> "#{variant} (#{payload})"
         end
 
-      %{"name" => trend_name, "unit" => r["unit"], "value" => r["value"]}
+      %{"name" => name, "unit" => r["unit"], "value" => r["value"]}
     end)
 
   File.write!("bench_torque.json", Jason.encode!(torque_results))

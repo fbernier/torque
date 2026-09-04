@@ -1,65 +1,72 @@
 # PGO training workload for the glazer NIF.
 #
-# Mirror of bench/pgo_workload.exs but driving glazer instead of torque, so a
-# glazer PGO build (deps/glazer c_src Makefile PGO=generate/use) collects
-# branch/call-frequency data over the same representative payloads the README
-# benchmark uses — keeping the glazer-vs-torque comparison apples-to-apples
-# (both libraries profiled against equivalent decode/encode/find workloads).
+# The counterpart to bench/pgo_workload.exs, driving glazer instead of torque,
+# so a glazer PGO build (deps/glazer c_src Makefile PGO=generate/use) collects
+# branch and call-frequency data before the comparison runs. Without it the
+# README numbers are PGO-torque against plain glazer.
 #
-# Uses the same UTF-8 validation options as bench/torque_bench.exs
-# (`validate_utf8` decode, `force_utf8` encode) so the profile matches the
-# benchmarked configuration — keep them in sync.
+# It trains on **the same bytes** the comparison measures — `bench/fixtures.exs`,
+# shared with torque's workload and with bench/torque_bench.exs. It used to
+# carry its own hand-written copies of those payloads, which is the same drift
+# that made torque's workload untrustworthy: a profile collected on one document
+# and a benchmark run on another.
+#
+# UTF-8 validation is on (`validate_utf8` decode, `force_utf8` encode, both
+# default OFF in glazer) to match how bench/torque_bench.exs calls it, so the
+# profile matches the benchmarked configuration.
 #
 # Run with an instrumented glazer.so loaded: MIX_ENV=bench mix run this file.
 
-small_json =
-  ~s({"id":"req-0001","site":{"domain":"example.com","page":"https://example.com/articles/x","cat":["IAB1","IAB2-3"],"publisher":{"id":"pub-12345"}},"device":{"devicetype":2,"ua":"Mozilla/5.0 Macintosh; Intel Mac OS X 10_15_7 Chrome/120.0.0.0","ip":"203.0.113.42","geo":{"country":"US","lat":40.7128,"lon":-74.006,"zip":"10001"},"connectiontype":2},"user":{"id":"u-abcdef","name":"cafe resume"},"imp":[{"id":"imp-1","banner":{"w":300,"h":250},"bidfloor":0.5},{"id":"imp-2","video":{"mimes":["video/mp4"],"maxduration":30},"bidfloor":2.0}],"regs":{"coppa":0},"ext":null,"test":true})
+Code.require_file("fixtures.exs", __DIR__)
 
-record = fn i ->
-  ~s({"metadata":{"result_type":"recent","iso_language_code":"en"},"id":#{505_874_924_000_000_000 + i},"id_str":"#{505_874_924_000_000_000 + i}","text":"Sample tweet #{i} lorem ipsum dolor sit amet consectetur adipiscing elit","truncated":false,"in_reply_to_status_id":null,"user":{"id":#{1_000_000 + i},"screen_name":"username_#{i}","location":"San Francisco, CA","url":null,"followers_count":#{rem(i * 1337, 100_000)},"verified":false,"lang":"en","profile_image_url":"http://pbs.twimg.com/profile_images/#{i}/photo.jpeg"},"geo":null,"retweet_count":#{rem(i * 3, 1000)},"favorite_count":#{rem(i * 7, 2000)},"entities":{"hashtags":[{"text":"elixir","indices":[15,22]}],"urls":[],"user_mentions":[{"screen_name":"user_#{i}","id":#{2_000_000 + i}}]},"favorited":false,"lang":"en"})
-end
+alias Bench.Fixtures
 
-large_json =
-  ~s({"statuses":[) <>
-    Enum.map_join(1..200, ",", record) <>
-    ~s(],"search_metadata":{"count":200,"completed_in":0.035,"max_id":505874924095815681,"query":"%23elixir"}})
+request = Fixtures.fetch(:"req-small")
+feed = Fixtures.fetch(:"feed-huge")
+records = Fixtures.fetch(:"record-schema")
+strings = Fixtures.fetch(:"str-utf8")
 
-small_term = :glazer_json.decode(small_json)
-large_term = :glazer_json.decode(large_json)
+# glazer decodes to its own term shape, so encode training has to start from
+# what glazer itself produced rather than from the fixture's Elixir term.
+request_term = :glazer_json.decode(request.json, [:validate_utf8])
+feed_term = :glazer_json.decode(feed.json, [:validate_utf8])
+records_term = :glazer_json.decode(records.json, [:validate_utf8])
 
+# jq paths equivalent to the JSON Pointers bench/torque_bench.exs extracts.
 paths =
   Enum.map(
-    [
-      ".id",
-      ".site.domain",
-      ".site.page",
-      ".device.ip",
-      ".device.geo.country",
-      ".user.id",
-      ".regs.coppa"
-    ],
+    [".id", ".site.domain", ".device.ip", ".device.geo.country", ".user.id"],
     &:glazer.compile_path/1
   )
 
-IO.puts("glazer PGO workload: small=#{byte_size(small_json)}B large=#{byte_size(large_json)}B")
+IO.puts("glazer PGO workload: request=#{byte_size(request.json)}B feed=#{byte_size(feed.json)}B")
 
 decode = fn ->
-  :glazer_json.decode(small_json, [:validate_utf8])
-  :glazer_json.decode(large_json, [:validate_utf8])
+  :glazer_json.decode(request.json, [:validate_utf8])
+  :glazer_json.decode(records.json, [:validate_utf8])
+  :glazer_json.decode(strings.json, [:validate_utf8])
 end
 
 encode = fn ->
-  :glazer_json.encode(small_term, [:force_utf8])
-  :glazer_json.encode(large_term, [:force_utf8])
+  :glazer_json.encode(request_term, [:force_utf8])
+  :glazer_json.encode(records_term, [:force_utf8])
 end
 
 find = fn ->
-  d = :glazer_json.decode(small_json, [:validate_utf8])
+  d = :glazer_json.decode(request.json, [:validate_utf8])
   Enum.each(paths, &:glazer.find(d, &1))
+end
+
+# The large payload is an order of magnitude bigger, so it gets proportionally
+# fewer iterations: this is a weighting, not a coverage checklist.
+large = fn ->
+  :glazer_json.decode(feed.json, [:validate_utf8])
+  :glazer_json.encode(feed_term, [:force_utf8])
 end
 
 Enum.each(1..5_000, fn _ -> decode.() end)
 Enum.each(1..5_000, fn _ -> encode.() end)
 Enum.each(1..10_000, fn _ -> find.() end)
+Enum.each(1..50, fn _ -> large.() end)
 
 IO.puts("glazer PGO workload complete")
