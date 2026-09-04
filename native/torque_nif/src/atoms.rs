@@ -6,6 +6,7 @@ rustler::atoms! {
     nil,
     // Requests a dirty-scheduler retry.
     dirty_required,
+    suspended,
     // atoms for fast identity comparison in encoder
     r#true = "true",
     r#false = "false",

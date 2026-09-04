@@ -82,4 +82,35 @@ defmodule Torque.SchedulerDispatchTest do
       :erlang.system_flag(:scheduler_wall_time, previous)
     end
   end
+
+  test "encoder discovery does not materialize large binaries or bignums" do
+    aligned = :binary.copy("x", 16 * 1024 * 1024)
+    packed = <<0::1, aligned::binary, 0::7>>
+    <<_::1, unaligned::binary-size(16 * 1024 * 1024), _::7>> = packed
+    huge_integer = Integer.pow(2, 4_000_000)
+    small_integer = Integer.pow(2, 100)
+
+    elapsed = fn term ->
+      # The terms are built before measurement. Use the best of three batches
+      # to avoid mistaking preemption/GC noise for representation-sized work.
+      for _ <- 1..3 do
+        :erlang.garbage_collect()
+        {us, _} = :timer.tc(fn -> for _ <- 1..128, do: Torque.Native.encode(term) end)
+        us
+      end
+      |> Enum.min()
+    end
+
+    for wrap <- [& &1, &%{&1 => 0}, &{[{"value", &1}]}] do
+      assert :dirty_required = Torque.Native.encode(wrap.(unaligned))
+
+      assert elapsed.(wrap.(unaligned)) < max(1000, 10 * elapsed.(wrap.(aligned))),
+             "unaligned binary discovery copied its 16 MiB operand"
+
+      assert :dirty_required = Torque.Native.encode(wrap.(huge_integer))
+
+      assert elapsed.(wrap.(huge_integer)) < max(1000, 10 * elapsed.(wrap.(small_integer))),
+             "bignum discovery serialized its 4-million-bit operand"
+    end
+  end
 end

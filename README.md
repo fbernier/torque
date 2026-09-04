@@ -7,7 +7,7 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
 ## Features
 
 - SIMD-accelerated decoding (AVX2 on x86, NEON on ARM)
-- Ultra-low memory encoder (64 B per encode vs ~4 KB for OTP `json`/jason)
+- Direct term encoding without an intermediate JSON representation
 - Parse-then-get API for selective field extraction via JSON Pointer (RFC 6901,
   with one documented deviation: `"/"` selects the root, not the empty key)
 - Batch field extraction (`get_many/2`) with single NIF call
@@ -15,7 +15,8 @@ Torque provides the fastest JSON encoding and decoding available in the BEAM eco
 - Automatic dirty CPU scheduler dispatch for decode/parse inputs larger than
   20 KB and for lookups over 20 KB of pointer path; batch lookups measure their
   own work and move to a dirty scheduler when they exceed a normal scheduler's
-  share (opt-in `dirty: true` for encode)
+  share; encode bounds metadata inspection and escaped output, with `dirty: true`
+  to skip discovery
 - jiffy-compatible `{proplist}` encoding
 
 ## Installation
@@ -159,10 +160,13 @@ json = Torque.encode_to_iodata(%{id: "abc"})
 {:ok, json} = Torque.encode({[{:id, "abc"}, {:price, 1.5}]})
 ```
 
-Unlike decoding, encoding cannot cheaply predict its output size, so dirty
-scheduler dispatch is opt-in. Pass `dirty: true` (accepted by `encode/2`,
-`encode!/2`, `encode_to_iodata/2`, and `encode_to_iodata!/2`) when terms are
-expected to encode to large output (more than roughly 20 KB):
+Encoding first checks representation sizes in a bounded, preemptible BEAM walk.
+This sends oversized binaries and integers dirty before the NIF can copy them.
+The normal encoder then budgets escaped output, including quotes and container
+delimiters. Map and list roots can retain partial output and resume dirty;
+other overruns restart there. Conservative size checks can dispatch before
+the output reaches the budget. Pass `dirty: true` (accepted by `encode/2`,
+`encode!/2`, `encode_to_iodata/2`, and `encode_to_iodata!/2`) to skip discovery:
 
 ```elixir
 {:ok, json} = Torque.encode(big_term, dirty: true)

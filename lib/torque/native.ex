@@ -39,9 +39,31 @@ defmodule Torque.Native do
   def get_many_dirty(_doc, _paths), do: :erlang.nif_error(:nif_not_loaded)
   def decode(_json), do: :erlang.nif_error(:nif_not_loaded)
   def decode_dirty(_json), do: :erlang.nif_error(:nif_not_loaded)
-  def encode(_term), do: :erlang.nif_error(:nif_not_loaded)
+  # The NIF API cannot query binary size without possibly copying an unaligned
+  # sub-binary. Inspect metadata on the BEAM first, where traversal is preemptible
+  # and byte_size/1 and integer comparisons do not materialize their operands.
+  # Bound the walk too: external_size/1 does not yield on supported older OTPs.
+  # Wide inputs go dirty after one discovery budget, not a hard-limit traversal.
+  # One integer of fuel avoids allocating a counter tuple for every term.
+  # Charging 16 per node also limits the walk to at most 1280 nodes.
+  @inspect_work 20_480
+  @inspect_node_cost 16
+  @inspect_integer_limit Integer.pow(2, 512)
+
+  def encode(term) do
+    if inspectable?(term), do: encode_checked(term), else: :dirty_required
+  end
+
+  defp encode_checked(_term), do: :erlang.nif_error(:nif_not_loaded)
   def encode_dirty(_term), do: :erlang.nif_error(:nif_not_loaded)
-  def encode_iodata(_term), do: :erlang.nif_error(:nif_not_loaded)
+  def encode_finish_dirty(_term, _partial, _next), do: :erlang.nif_error(:nif_not_loaded)
+  def encode_iodata_finish_dirty(_term, _partial, _next), do: :erlang.nif_error(:nif_not_loaded)
+
+  def encode_iodata(term) do
+    if inspectable?(term), do: encode_iodata_checked(term), else: :dirty_required
+  end
+
+  defp encode_iodata_checked(_term), do: :erlang.nif_error(:nif_not_loaded)
   def encode_iodata_dirty(_term), do: :erlang.nif_error(:nif_not_loaded)
   def get_many_nil(_doc, _paths), do: :erlang.nif_error(:nif_not_loaded)
   def get_many_nil_dirty(_doc, _paths), do: :erlang.nif_error(:nif_not_loaded)
@@ -64,4 +86,51 @@ defmodule Torque.Native do
 
   def array_length(_doc, _path), do: :erlang.nif_error(:nif_not_loaded)
   def array_length_dirty(_doc, _path), do: :erlang.nif_error(:nif_not_loaded)
+
+  defp inspectable?(term), do: inspect_term(term, @inspect_work) >= 0
+
+  defp inspect_term(_, fuel) when fuel < @inspect_node_cost, do: -1
+
+  defp inspect_term(term, fuel) when is_binary(term),
+    do: fuel - @inspect_node_cost - byte_size(term)
+
+  defp inspect_term(term, fuel) when is_integer(term) do
+    if term >= -@inspect_integer_limit and term <= @inspect_integer_limit,
+      do: fuel - @inspect_node_cost,
+      else: -1
+  end
+
+  defp inspect_term([head | tail], fuel),
+    do: inspect_term(tail, inspect_term(head, fuel - @inspect_node_cost))
+
+  defp inspect_term(term, fuel) when is_map(term) do
+    fuel = fuel - @inspect_node_cost
+
+    # Even empty keys and scalar values cost two nodes per entry. Reject maps
+    # that cannot fit before allocating their iterator or inspecting any member.
+    if map_size(term) * (2 * @inspect_node_cost) > fuel,
+      do: -1,
+      else: inspect_map(:maps.iterator(term), fuel)
+  end
+
+  # Only {proplist} tuples are traversed by the encoder. Unsupported tuples
+  # must not turn this guard into a walk over otherwise irrelevant terms.
+  defp inspect_term({pairs}, fuel), do: inspect_pairs(pairs, fuel - @inspect_node_cost)
+  defp inspect_term(_, fuel), do: fuel - @inspect_node_cost
+
+  defp inspect_map(_, fuel) when fuel < @inspect_node_cost, do: -1
+
+  defp inspect_map(iter, fuel) do
+    case :maps.next(iter) do
+      {key, value, next} -> inspect_map(next, inspect_term(value, inspect_term(key, fuel)))
+      :none -> fuel
+    end
+  end
+
+  defp inspect_pairs(_, fuel) when fuel < @inspect_node_cost, do: -1
+
+  defp inspect_pairs([{key, value} | tail], fuel),
+    do: inspect_pairs(tail, inspect_term(value, inspect_term(key, fuel - @inspect_node_cost)))
+
+  defp inspect_pairs(_, fuel), do: fuel
 end

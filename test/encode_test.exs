@@ -136,9 +136,7 @@ defmodule Torque.EncodeTest do
     end
 
     test "an atom above Latin-1 encodes as UTF-8 everywhere an atom is accepted" do
-      # `enif_get_atom` cannot spell these below NIF 2.17, so they used to come
-      # back `:unsupported_type` while `:café` encoded. Cover the boundary in
-      # both directions and every position an atom can occupy.
+      # Cover the Latin-1 boundary and every supported atom position.
       atoms = [
         :ok,
         :"",
@@ -169,12 +167,154 @@ defmodule Torque.EncodeTest do
     end
 
     test "the widest atom name survives the Unicode fallback" do
-      # 255 characters is the ERTS cap; in UTF-8 that is 1020 bytes, four times
-      # what the Latin-1 stack buffer holds.
+      # ERTS caps names at 255 characters, or 1020 UTF-8 bytes.
       wide = String.duplicate("🚀", 255)
       assert byte_size(wide) == 1020
       assert {:ok, json} = Torque.encode(%{String.to_atom(wide) => 1})
       assert %{^wide => 1} = Jason.decode!(json)
+    end
+
+    test "normal-scheduler encoding is bounded whatever the term's shape" do
+      # Assert on the raw NIF so the dispatch decision remains observable.
+      huge = String.duplicate("x", 2 * 1024 * 1024)
+
+      top_heavy = [
+        {"one-element list", [huge]},
+        {"nested map", %{"rows" => [huge]}},
+        {"proplist", {[{"rows", [huge]}]}},
+        {"huge element first", [huge, 1]},
+        {"bare binary", huge}
+      ]
+
+      for {label, term} <- top_heavy do
+        assert Torque.Native.encode(term) == :dirty_required,
+               "#{label} finished on a normal scheduler"
+      end
+
+      # These writers can produce unbounded output from a small term and must
+      # be sized before writing.
+      bignum = Integer.pow(2, 1_000_000)
+      huge_key = String.duplicate("k", 2 * 1024 * 1024)
+
+      unbounded_writers = [
+        {"bare bignum", bignum},
+        {"negative bignum", -bignum},
+        {"bignum in a list", [bignum]},
+        {"bignum map key", %{bignum => 1}},
+        {"binary map key", %{huge_key => 1}}
+      ]
+
+      for {label, term} <- unbounded_writers do
+        assert Torque.Native.encode(term) == :dirty_required,
+               "#{label} finished on a normal scheduler"
+      end
+
+      # Small arbitrary-precision values still encode exactly.
+      assert {:ok, small} = Torque.encode(Integer.pow(2, 100))
+      assert small == Integer.to_string(Integer.pow(2, 100))
+
+      # Proplists restart dirty because only map and list roots can resume.
+
+      refute match?(
+               {:ok, _},
+               Torque.Native.encode({Enum.map(1..6000, fn i -> {"key_number_#{i}", i} end)})
+             ),
+             "a wide proplist finished on a normal scheduler"
+
+      # Wide roots must leave the normal scheduler. Metadata preflight can
+      # dispatch before encoding; otherwise a bounded partial is retained.
+      wide = [
+        {"list", for(i <- 1..3000, do: %{"id" => i, "name" => "user_#{i}"})},
+        {"map", Map.new(1..3000, fn i -> {"key_#{i}", %{"n" => i}} end)}
+      ]
+
+      for {label, term} <- wide do
+        case Torque.Native.encode(term) do
+          :dirty_required ->
+            :ok
+
+          {:suspended, partial, next} ->
+            assert next > 0, "#{label} suspended before doing any work"
+            assert byte_size(partial) <= 64 * 1024, "#{label} handed back an unbounded partial"
+
+          other ->
+            flunk("#{label} finished on a normal scheduler: #{inspect(other, limit: 1)}")
+        end
+      end
+    end
+
+    test "map metadata rejection preserves the fuel boundary and accounts for preceding terms" do
+      fitting = Map.new(1..639, fn i -> {i, 0} end)
+      too_wide = Map.put(fitting, 640, 0)
+      nested = [String.duplicate("x", 10_000), Map.new(1..330, fn i -> {i, 0} end)]
+
+      assert {:ok, json} = Torque.Native.encode(fitting)
+      expected = Map.new(fitting, fn {key, value} -> {Integer.to_string(key), value} end)
+      assert Jason.decode!(json) == expected
+      assert Torque.Native.encode_iodata(fitting) == json
+
+      for term <- [too_wide, nested] do
+        assert Torque.Native.encode(term) == :dirty_required
+        assert Torque.Native.encode_iodata(term) == :dirty_required
+        assert Torque.encode!(term) == Torque.encode!(term, dirty: true)
+        assert Torque.encode_to_iodata(term) == Torque.encode!(term, dirty: true)
+      end
+    end
+
+    test "escaped values and keys cannot exceed the normal output budget" do
+      for size <- [12_000, 65_535, 65_536] do
+        controls = :binary.copy(<<0>>, size)
+
+        for term <- [controls, [controls, 1], %{controls => 1}, %{"a" => [controls]}] do
+          assert :dirty_required = Torque.Native.encode(term)
+          assert :dirty_required = Torque.Native.encode_iodata(term)
+          assert Torque.encode!(term) == Jason.encode!(term)
+          assert Torque.encode_to_iodata(term) == Jason.encode!(term)
+        end
+      end
+    end
+
+    test "escaped partial output resumes without losing elements or delimiters" do
+      controls = :binary.copy(<<0>>, 3000)
+      term = [controls, controls, 1]
+      assert {:suspended, partial, 2} = Torque.Native.encode(term)
+      assert byte_size(partial) <= 64 * 1024
+      assert Torque.encode!(term) == Jason.encode!(term)
+      assert Torque.encode_to_iodata(term) == Jason.encode!(term)
+    end
+
+    test "every dispatch path produces the same bytes" do
+      huge = String.duplicate("x", 2 * 1024 * 1024)
+
+      shapes = [
+        [huge],
+        %{"rows" => [huge]},
+        {[{"rows", [huge]}]},
+        for(i <- 1..3000, do: %{"id" => i, "name" => "user_#{i}"}),
+        Map.new(1..3000, fn i -> {"key_#{i}", %{"n" => i}} end),
+        {Enum.map(1..3000, fn i -> {"k#{i}", i} end)},
+        Enum.to_list(1..20_000),
+        %{"a" => 1}
+      ]
+
+      for term <- shapes do
+        assert {:ok, json} = Torque.encode(term)
+        assert {:ok, ^json} = Torque.encode(term, dirty: true)
+        assert Torque.encode_to_iodata(term) == json
+        assert Torque.encode!(term) == json
+        assert {:ok, _} = Torque.decode(json)
+      end
+    end
+
+    test "a suspend boundary landing on the first element is still well formed" do
+      # The resumed pass writes its own leading comma, so element 0 and the
+      # element the budget stops on are the two that can double or drop one.
+      pad = String.duplicate("x", 21 * 1024)
+
+      for term <- [[pad, "a", "b"], %{"0" => pad, "1" => "a"}, [pad], [1, pad, 2]] do
+        assert {:ok, json} = Torque.encode(term)
+        assert {:ok, ^term} = Torque.decode(json)
+      end
     end
 
     test "improper list returns error" do

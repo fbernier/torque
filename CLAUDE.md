@@ -214,7 +214,13 @@ Atom names are read Latin-1, because `ERL_NIF_UTF8` is a NIF 2.17 (OTP 26) addit
 
 ### Scheduler Awareness
 
-Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`.
+Decode/parse inputs larger than 20 KB dispatch to dirty CPU schedulers. Encoding needs two stages because its output size is unknown and even inspecting its input can copy: `enif_inspect_binary` materializes unaligned sub-binaries, and Rustler serializes bignum magnitudes before exposing their bit counts.
+
+`Torque.Native` therefore performs a bounded, preemptible metadata walk on the BEAM before calling its private normal-encoder NIFs. `byte_size/1` and integer comparisons do not copy operands. One integer of fuel charges binary bytes and 16 units per node, stopping at 20 KiB of fuel; integers outside ±2^512 dispatch immediately. The discovery budget is smaller than the output hard limit: traversing 64 KiB of metadata before restarting dirty wasted work on medium inputs. `external_size/1` is not a replacement because it does not yield on supported older OTPs. Maps use `:maps.iterator`, not list conversion. Unsupported tuples are not recursively inspected; `{proplist}` keys and values are. No undocumented ERTS term layout is read, and the NIF ABI floor remains 2.15.
+
+Normal encoding then measures output. Map/list roots may suspend between elements at `ENCODE_BUDGET` (20 KiB) and resume dirty from `{:suspended, partial, next}`. Nested overruns restart dirty. Binary values and keys reserve their worst-case sixfold escaped size, quotes and enclosing delimiters against `ENCODE_HARD_LIMIT` (64 KiB), rather than comparing source length. The completed or suspended buffer is checked again before returning it. Bignum conversion is bounded by the metadata guard before Rustler materialization and by remaining output capacity before decimal emission.
+
+Metadata preflight is additional work on small inputs, and conservative bounds may dispatch earlier than exact output sizing would. Previous measurements of native output checks alone do not include this cost. `dirty: true` skips both discovery stages; compare current costs with `make ab`, not historical throughput figures. Raw-dispatch tests defend bounded escaped output and valid resumption; the scheduler regression compares prebuilt aligned/unaligned binaries and small/large bignums so a post-copy refusal cannot pass as bounded discovery.
 
 A batch lookup depends on both the path set and the document shape. Parsed-document batch NIFs start on a normal scheduler under `NORMAL_BUDGET_NODES` and check `Work::nodes()` after each path. An overrun returns `dirty_required`; `retry_dirty` reruns the batch on its dirty twin with `UNBOUNDED_BUDGET`.
 
