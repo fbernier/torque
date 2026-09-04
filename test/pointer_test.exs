@@ -621,10 +621,7 @@ defmodule Torque.PointerTest do
     end
 
     test "validate: false accepts trailing content but not truncation" do
-      # Skipping relaxes the trailing-content check, which is the one way an
-      # unchecked extraction accepts what `decode/1` refuses. It does not
-      # relax truncation: a skip still has to find its closing delimiter, and
-      # the early exit under `unique_keys` ends in the same scan.
+      # Structural skipping may accept trailing content, but not truncation.
       for unique <- [false, true] do
         ptrs = Torque.compile_pointers(["/keep"], validate: false, unique_keys: unique)
 
@@ -664,10 +661,10 @@ defmodule Torque.PointerTest do
     test "a repeated key does not leave the previous value's fields behind" do
       # A later duplicate must clear descendants supplied only by the old value.
       cases = [
-        {~s({"a":{"x":1},"a":{}}), ["/a/x", "/a"], [nil, %{}]},
+        {~s({"a":{"x":1},"a":{}}), ["/a/x", "/a", "/a/x", "/a"], [nil, %{}, nil, %{}]},
         {~s({"a":{"x":1},"a":{"y":2}}), ["/a/x", "/a/y"], [nil, 2]},
         {~s({"a":{"x":1},"a":[9]}), ["/a/x", "/a/0", "/a"], [nil, 9, [9]]},
-        {~s({"a":{"x":1},"a":5}), ["/a/x", "/a"], [nil, 5]},
+        {~s({"a":{"x":1},"a":5}), ["/a/x", "/a", "/a/x", "/a"], [nil, 5, nil, 5]},
         {~s({"a":{"b":{"c":1}},"a":{"b":{}}}), ["/a/b/c"], [nil]},
         {~s({"a":[{"k":1}],"a":[{}]}), ["/a/0/k"], [nil]}
       ]
@@ -681,6 +678,7 @@ defmodule Torque.PointerTest do
               Torque.compile_pointers(paths, validate: false)
             ] do
           assert Torque.get_many_nil(doc, ptrs) == expected
+          assert Torque.get_many(doc, ptrs) == Torque.get_many(doc, paths)
           assert {:ok, expected} == Torque.parse_get_many_nil(json, ptrs)
         end
       end
@@ -688,8 +686,8 @@ defmodule Torque.PointerTest do
 
     test "unique_keys keeps the first value's fields under a repeated key" do
       json = ~s({"a":{"x":1},"a":{}})
-      paths = ["/a/x", "/a"]
-      expected = [1, %{"x" => 1}]
+      paths = ["/a/x", "/a", "/a/x", "/a"]
+      expected = [1, %{"x" => 1}, 1, %{"x" => 1}]
 
       {:ok, doc} = Torque.parse(json, unique_keys: true)
       ptrs = Torque.compile_pointers(paths, unique_keys: true)
@@ -698,10 +696,7 @@ defmodule Torque.PointerTest do
       assert {:ok, expected} == Torque.parse_get_many_nil(json, ptrs)
     end
 
-    # One object's tracking of which planned keys it has already supplied used
-    # to be a single word, so the 65th key at a node had no bit: `unique_keys`
-    # silently became last-wins there, and the unchecked early exit could never
-    # fire because its found-count could not reach the node's width.
+    # Sweep the inline seen-set boundary and the wider scratch representation.
     test "duplicate keys resolve the same way at every plan width" do
       for width <- [1, 63, 64, 65, 200] do
         keys = for i <- 1..width, do: "k#{i}"
@@ -734,8 +729,7 @@ defmodule Torque.PointerTest do
 
     test "a repeated key clears descendants at every plan width" do
       for width <- [1, 64, 65, 200] do
-        # Pad to `width` planned keys at the root so the repeated key sits past
-        # the inline word, then take a field only the dead first value supplies.
+        # Put the repeated key beyond the inline seen-set.
         pad = for i <- 1..(width - 1)//1, do: ~s("p#{i}":0)
         json = "{" <> Enum.join(pad ++ [~s("a":{"x":1}), ~s("a":{"y":2})], ",") <> "}"
         paths = Enum.map(1..(width - 1)//1, &"/p#{&1}") ++ ["/a/x"]
@@ -834,8 +828,22 @@ defmodule Torque.PointerTest do
       end
 
       # Pin the boundary with nesting split across the plan and selected value.
-      assert {:ok, _} = Torque.parse(nest.(28))
+      assert {:ok, doc} = Torque.parse(nest.(28))
       assert {:error, :nesting_too_deep} = Torque.parse(nest.(29))
+
+      # Selecting the root exercises all 128 conversion frames, including the
+      # copied-key cache, rather than just the 28 selected array frames.
+      expected = Torque.decode!(nest.(28))
+      assert Torque.get(doc, "") == {:ok, expected}
+      assert Torque.Native.get_dirty(doc, "") == {:ok, expected}
+
+      assert Torque.parse_get_many_nil(nest.(28), Torque.compile_pointers([""])) ==
+               {:ok, [expected]}
+
+      padded = nest.(28) <> String.duplicate(" ", 20_480)
+
+      assert Torque.parse_get_many_nil(padded, Torque.compile_pointers([""])) ==
+               {:ok, [expected]}
 
       for ptrs <- [strict, loose] do
         assert {:ok, [selected]} = Torque.parse_get_many_nil(nest.(28), ptrs)
@@ -890,12 +898,24 @@ defmodule Torque.PointerTest do
       assert :binary.referenced_byte_size(slice) > 400_000
       assert :binary.referenced_byte_size(extract.(slice)) == byte_size(ua)
     end
+
+    test "duplicated string selections cannot justify retaining a giant parent" do
+      ua = String.duplicate("u", 100)
+      json = ~s({"ua":"#{ua}"})
+      parent = :binary.copy(String.duplicate("p", 400_000) <> json)
+      slice = :binary.part(parent, 400_000, byte_size(json))
+      ptrs = Torque.compile_pointers(List.duplicate("/ua", 1200))
+
+      assert {:ok, values} = Torque.parse_get_many_nil(slice, ptrs)
+      assert length(values) == 1200
+      assert Enum.all?(values, &(&1 == ua))
+      assert :binary.referenced_byte_size(hd(values)) == byte_size(ua)
+    end
   end
 
   describe "compiled pointer plans" do
-    # Plan construction must index wide fan-out instead of scanning every prior
-    # child. The ratio detects quadratic growth; the ceiling catches both sides
-    # becoming slow together.
+    # The ratio detects quadratic plan construction; the ceiling catches both
+    # samples becoming slow together.
     @tag :perf
     test "compiling wide object and numeric path sets scales with size, not its square" do
       for prefix <- ["k", ""] do
@@ -963,9 +983,132 @@ defmodule Torque.PointerTest do
     end
   end
 
-  # Batch lookups index recurring wide objects while preserving scan semantics.
-  # The cache must retain multiple objects because one path set can alternate
-  # between ancestors or siblings.
+  describe "bounded result materialization" do
+    test "a small document selected repeatedly retains one container per terminal" do
+      json = "[" <> Enum.map_join(1..9000, ",", fn _ -> "0" end) <> "]"
+      assert byte_size(json) == 18_001
+      expected = List.duplicate(0, 9000)
+      # Empty and slash-only pointers are the same terminal, not just equal text.
+      paths = List.duplicate("", 1000) ++ List.duplicate("/", 1000)
+      {ref, _, _} = ptrs = Torque.compile_pointers(paths)
+      {:ok, doc} = Torque.parse(json)
+
+      assert Torque.Native.get_many_nil_compiled(doc, ref) == :dirty_required
+      assert Torque.Native.parse_get_many_nil(json, ref, byte_size(json)) == :dirty_required
+
+      results = [
+        Torque.get_many_nil(doc, ptrs),
+        Enum.map(Torque.get_many(doc, ptrs), fn {:ok, value} -> value end),
+        elem(Torque.parse_get_many_nil(json, ptrs), 1)
+      ]
+
+      for values <- results do
+        assert length(values) == 2000
+        assert Enum.all?(values, &(&1 == expected))
+        # Retained words distinguish sharing from 2000 separately built arrays
+        # without relying on wall-clock timing or the NIF's allocation internals.
+        assert :erts_debug.size(values) < 100_000
+      end
+    end
+
+    test "large string copies stop before conversion on every parsed lookup entry" do
+      value = String.duplicate("x", 2 * 1024 * 1024)
+      json = ~s({"s":"#{value}"})
+      paths = List.duplicate("/s", 64)
+      {ref, _, _} = ptrs = Torque.compile_pointers(paths)
+
+      for normal <- [
+            &Torque.Native.get(&1, "/s"),
+            &Torque.Native.get_many(&1, paths),
+            &Torque.Native.get_many_nil(&1, paths),
+            &Torque.Native.get_many_defaults(&1, %{"/s" => :missing}),
+            &Torque.Native.get_many_compiled(&1, ref),
+            &Torque.Native.get_many_nil_compiled(&1, ref)
+          ] do
+        {:ok, doc} = Torque.parse(json)
+        assert normal.(doc) == :dirty_required
+      end
+
+      {:ok, doc} = Torque.parse(json)
+      assert Torque.get(doc, "/s") == {:ok, value}
+      assert Torque.get(doc, "/s", :missing) == value
+      assert Torque.get_many_nil(doc, ptrs) == List.duplicate(value, 64)
+      assert Torque.get_many_defaults(doc, %{"/s" => :missing}) == %{"/s" => value}
+    end
+
+    test "fractional copied bytes carry across recursive strings" do
+      # Two list members plus floor(39994 / 5) copied-byte nodes fit exactly.
+      # Rounding the two copies independently would also admit one byte more.
+      suffix = String.duplicate("x", 39_993)
+      fitting = ["x", suffix]
+      oversized = ["x", suffix <> "x"]
+      {:ok, fit} = Torque.parse(Torque.encode!(fitting))
+      {:ok, over} = Torque.parse(Torque.encode!(oversized))
+
+      assert Torque.Native.get(fit, "") == {:ok, fitting}
+      assert Torque.Native.get(over, "") == :dirty_required
+      assert Torque.get(over, "") == {:ok, oversized}
+    end
+
+    test "recursive nodes and individually small strings share the conversion budget" do
+      nested = List.duplicate(List.duplicate(0, 100), 100)
+      strings = List.duplicate(String.duplicate("x", 1000), 100)
+      long_key = String.duplicate("k", 100_000)
+
+      for value <- [nested, strings, [%{long_key => 1}]] do
+        {:ok, doc} = Torque.parse(Torque.encode!(value))
+        assert Torque.Native.get(doc, "") == :dirty_required
+        assert Torque.get(doc, "") == {:ok, value}
+      end
+    end
+
+    test "completed over-budget lookups are returned and still mark document work" do
+      json = ~s({#{wide_members(100_000)}})
+      paths = ["/missing1", "/missing2", "/missing3"]
+      {ref, _, _} = Torque.compile_pointers(paths)
+      {cheap, _, _} = Torque.compile_pointers(["/k100000"])
+
+      for {normal, expected} <- [
+            {&Torque.Native.get_many_nil(&1, paths), [nil, nil, nil]},
+            {&Torque.Native.get_many(&1, paths), List.duplicate({:error, :no_such_field}, 3)},
+            {&Torque.Native.get_many_nil_compiled(&1, ref), [nil, nil, nil]},
+            {&Torque.Native.get_many_compiled(&1, ref),
+             List.duplicate({:error, :no_such_field}, 3)},
+            {&Torque.Native.get_many_defaults(&1, Map.new(paths, fn p -> {p, :missing} end)),
+             Map.new(paths, fn p -> {p, :missing} end)}
+          ] do
+        {:ok, doc} = Torque.parse(json)
+        assert normal.(doc) == expected
+        assert Torque.Native.get_many_nil_compiled(doc, cheap) == :dirty_required
+      end
+    end
+
+    test "a completed caller-only overrun does not poison later lookups" do
+      {:ok, doc} = Torque.parse("0")
+      paths = List.duplicate("", 8001)
+      assert Torque.Native.get_many_nil(doc, paths) == List.duplicate(0, 8001)
+      assert Torque.Native.get(doc, "") == {:ok, 0}
+
+      # Fetching the next entry must not mistake an invalid tail for exhaustion.
+      assert_raise ArgumentError, fn ->
+        Torque.get_many_nil(doc, paths ++ [:invalid])
+      end
+    end
+
+    test "caller work that leaves no room for a small copy does not mark the document heavy" do
+      value = String.duplicate("s", 100)
+      {:ok, doc} = Torque.parse(~s({"n":0,"s":"#{value}"}))
+      {large, _, _} = ptrs = Torque.compile_pointers(List.duplicate("/n", 7990) ++ ["/s"])
+      {small, _, _} = Torque.compile_pointers(["/n"])
+
+      assert Torque.Native.get_many_nil_compiled(doc, large) == :dirty_required
+      assert Torque.Native.get_many_nil_compiled(doc, small) == [0]
+      assert Torque.get_many_nil(doc, ptrs) == List.duplicate(0, 7990) ++ [value]
+      assert Torque.Native.get_many_nil_compiled(doc, small) == [0]
+    end
+  end
+
+  # Recurring wide objects must preserve scan semantics and multiple indexes.
   describe "wide object lookups" do
     defp wide_members(n, prefix \\ "k") do
       Enum.map_join(1..n, ",", fn i -> ~s("#{prefix}#{i}":#{i}) end)
@@ -1026,20 +1169,13 @@ defmodule Torque.PointerTest do
              "a wide ancestor cost #{Float.round(wide_parent / narrow_parent, 1)}x"
     end
 
-    # Interleaved sibling paths expose cache thrashing between objects: the
-    # memo has to hold both indexes at once, or every alternation evicts the
-    # one the next path needs.
+    # Interleaving exposes thrashing if both sibling indexes cannot coexist.
     @tag :perf
     test "two wide objects in one batch are both indexed" do
       json = ~s({"a":{#{wide_members(2000)}},"b":{#{wide_members(2000)}}})
       {:ok, doc} = Torque.parse(json)
 
-      # The control holds everything but the order constant: the same 512
-      # paths, the same two objects, the same two index builds. Measuring
-      # against a single-object batch instead compared one index build against
-      # two *plus* the alternation, so a healthy run sat at 2.8-4.3x under a
-      # 4.0 limit — a boundary, not a margin, and about one suite in six failed
-      # on it.
+      # Blocked order is the control: same paths, objects, and index builds.
       blocked = for s <- ["a", "b"], i <- 1..256, do: "/#{s}/k#{i}"
       interleaved = for i <- 1..256, s <- ["a", "b"], do: "/#{s}/k#{i}"
 
@@ -1047,12 +1183,7 @@ defmodule Torque.PointerTest do
       time.(blocked)
       time.(interleaved)
 
-      # Median of back-to-back pairs, not a ratio of separately taken minima.
-      # This suite runs 64 cases at a time, so a scheduling spike lands in
-      # whichever phase is running and moves the ratio one way; paired samples
-      # take it on both sides and the median discards the pairs it lands on.
-      # Against 16 busy cores individual pairs ranged 0.14x to 3.5x while the
-      # median stayed within 0.84-1.02.
+      # Median paired samples suppress scheduler spikes affecting one order.
       ratios =
         Enum.sort(
           for _ <- 1..15 do
@@ -1099,10 +1230,7 @@ defmodule Torque.PointerTest do
       refute Torque.dirty_paths?(Torque.compile_pointers(["/a"]))
     end
 
-    # A compiled handle must answer the dispatch question exactly as the list
-    # it was built from. Compiling removes the per-call split and unescape, not
-    # the key bytes every lookup still compares, so the handle carries both
-    # quantities the raw walk computes.
+    # Compiled handles retain the count and bytes used for raw-path dispatch.
     test "a compiled handle dispatches like the paths it was built from" do
       big = "/" <> String.duplicate("k", 20_480)
       small = "/" <> String.duplicate("k", 20_479)

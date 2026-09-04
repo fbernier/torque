@@ -43,6 +43,17 @@ Like any `TORQUE_BUILD` build it overwrites `priv/native/torque_nif.so`. Run
 selects the source build, and `--force` replaces the profiled artifact even when
 the sources are unchanged.
 
+Judge a refactor's cost on a PGO build, or on instructions retired — not on a
+plain `-O3` wall clock. The cdylib is built with fat LTO in one codegen unit, so
+moving any amount of source reshuffles placement everywhere, and the resulting
+swing is the layout lottery rather than the change. A deduplication pass that
+touched no encoder arithmetic measured +2.29% cycles on an atom-keyed encode at
+`-O3`, with instructions *down* 0.23% and frontend stalls up 30.2% — I-fetch
+starvation, not work. The same pair of builds under PGO: +0.00% cycles, and the
+record-map fixture's frontend stalls fell from +12.5% to +0.67%. `release.yml`
+already profiles `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`, so only
+the two cross-compiled targets ship plain `-O3` and can carry a swing like this.
+
 Notes:
 - rustc is LLVM-based, so PGO uses the same `llvm-profdata merge` step as a
   Clang PGO build. The merge tool's LLVM major version **must** match rustc's

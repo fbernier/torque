@@ -270,6 +270,7 @@ pub fn extract_unique<'de, Input: JsonInput<'de>>(
     let reader = Read::new(slice, false);
     let mut parser = Parser::new(reader);
 
+    let checked = validate == Validate::Yes;
     let mut out: Vec<Option<Extracted<'de>>> = vec![None; plan.result_slots.len()];
     // Escaped strings share this scratch buffer. Documents without escapes do
     // not allocate it.
@@ -277,7 +278,7 @@ pub fn extract_unique<'de, Input: JsonInput<'de>>(
     let mut ex = Extractor {
         plan,
         out: &mut out,
-        checked: validate == Validate::Yes,
+        checked,
         first_wins: keys == Keys::Unique,
         stamps: Vec::new(),
         generation: 0,
@@ -285,7 +286,7 @@ pub fn extract_unique<'de, Input: JsonInput<'de>>(
     };
     ex.value(&mut parser, &mut strbuf, 0, 0)?;
 
-    if validate == Validate::Yes {
+    if checked {
         // Match full parsing's trailing-content check.
         parser.parse_trailing()?;
     }
@@ -650,7 +651,7 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
     depth: usize,
 ) -> Result<Extracted<'de>> {
     match parser.skip_space_peek() {
-        Some(b'{') | Some(b'[') => {
+        Some(b'{' | b'[') => {
             let mut shared = Arc::new(Shared::default());
             let ptr = Arc::as_ptr(&shared);
             // Expose the original Arc allocation, including its header, before
@@ -671,7 +672,7 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
                 Reference::Copied(s) => Ok(Extracted::Value(Value::copy_str(s))),
             }
         }
-        Some(c @ b'-') | Some(c @ b'0'..=b'9') => {
+        Some(c @ (b'-' | b'0'..=b'9')) => {
             let start = parser.read.index();
             parser.read.eat(1);
             match parser.parse_number(c)? {

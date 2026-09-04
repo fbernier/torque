@@ -4,7 +4,9 @@ use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
 use std::mem::MaybeUninit;
 
 use crate::atoms;
-use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
+use crate::decoder::{Work, KEY_BYTES_PER_NODE};
+use crate::map_order::{order_members_of, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
+use crate::native_decode::KeyCache;
 use crate::nif_util::map_from_arrays;
 
 const STACK_SIZE: usize = 64;
@@ -16,12 +18,98 @@ const STACK_SIZE: usize = 64;
 /// are dispatched to: depths near 512 overflow it, so the limit is kept well below.
 pub const MAX_DEPTH: u32 = 128;
 
-#[inline]
-fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {
-    let bytes = s.as_bytes();
-    let mut binary = NewBinary::new(env, bytes.len());
-    binary.as_mut_slice().copy_from_slice(bytes);
-    binary.into()
+/// Depth errors are public lookup results; budget exhaustion requests a retry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ConversionError {
+    NestingTooDeep,
+    DirtyRequired,
+}
+
+/// Per-NIF conversion state. The lifetime ties cached key pointers to values
+/// retained for the entire call; raw terms never escape into another NIF env.
+pub(crate) struct Conversion<'a, 'v> {
+    env: Env<'a>,
+    budget: usize,
+    keys: Option<Box<KeyCache>>,
+    keys_seen: usize,
+    credit: usize,
+    values: std::marker::PhantomData<&'v sonic_rs::Value>,
+}
+
+impl<'a, 'v> Conversion<'a, 'v> {
+    #[inline]
+    pub(crate) fn new(env: Env<'a>, budget: usize) -> Self {
+        Self {
+            env,
+            budget,
+            keys: None,
+            keys_seen: 0,
+            credit: 0,
+            values: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn key(&mut self, key: &'v str, work: &mut Work) -> Result<ERL_NIF_TERM, ConversionError> {
+        // A request-sized object should not allocate and zero an entire key
+        // cache. Record arrays amortize copying the first stack-sized key set.
+        if self.keys.is_none() && self.keys_seen < STACK_SIZE {
+            self.keys_seen += 1;
+            return self.string::<true>(key, work).map(|term| term.as_c_arg());
+        }
+        // Bound hashing/comparison as well as any copy before entering the cache.
+        self.charge(0, key.len(), work)?;
+        let cache = self.keys.get_or_insert_with(|| {
+            let mut cache = Box::new(KeyCache::new());
+            cache.next_epoch();
+            cache
+        });
+        // SAFETY: all keys have the context's value lifetime, and this context
+        // belongs to one env. Misses copy, so result binaries retain no arena.
+        Ok(unsafe { cache.copied_key(self.env, key) })
+    }
+
+    #[inline]
+    fn string<const NESTED: bool>(
+        &mut self,
+        s: &str,
+        work: &mut Work,
+    ) -> Result<Term<'a>, ConversionError> {
+        if NESTED {
+            self.charge(0, s.len(), work)?;
+        } else {
+            work.materialize(0, s.len(), self.budget)?;
+        }
+        let mut binary = NewBinary::new(self.env, s.len());
+        binary.as_mut_slice().copy_from_slice(s.as_bytes());
+        Ok(binary.into())
+    }
+
+    #[inline]
+    fn charge(
+        &mut self,
+        nodes: usize,
+        bytes: usize,
+        work: &mut Work,
+    ) -> Result<(), ConversionError> {
+        if self.budget != usize::MAX {
+            let cost = nodes
+                .saturating_mul(KEY_BYTES_PER_NODE)
+                .saturating_add(bytes);
+            if cost > self.credit {
+                // The cold refusal path computes document-versus-caller
+                // attribution without putting those divisions in every key.
+                let result = work.materialize(nodes, bytes, self.budget);
+                if result.is_ok() {
+                    self.credit = work.conversion_credit(self.budget);
+                }
+                return result;
+            }
+            self.credit -= cost;
+        }
+        work.record_materialized(nodes, bytes);
+        Ok(())
+    }
 }
 
 /// Orders flatmap keys from their raw strings before ERTS sees the built terms.
@@ -37,19 +125,10 @@ fn reorder_object(
 ) {
     let n = keys.len();
     debug_assert_eq!(key_strs.len(), n);
-    if !(MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&n) {
-        return;
-    }
-    let mut prefixes: [MaybeUninit<u64>; FLATMAP_LIMIT] = [MaybeUninit::uninit(); FLATMAP_LIMIT];
-    for (prefix, key) in prefixes[..n].iter_mut().zip(key_strs.iter()) {
-        prefix.write(prefix_be(key.as_bytes()));
-    }
-    // SAFETY: every prefix below `n` was initialized above.
-    let prefixes = unsafe { std::slice::from_raw_parts(prefixes.as_ptr().cast(), n) };
-    let key_at = |i: usize| key_strs[i];
-    order_members(
-        prefixes,
-        |a, b| key_at(a) < key_at(b),
+    order_members_of(
+        key_strs,
+        |key| prefix_be(key.as_bytes()),
+        |a, b| key_strs[a] < key_strs[b],
         |perm| {
             let mut sorted_k: [MaybeUninit<ERL_NIF_TERM>; FLATMAP_LIMIT] =
                 [MaybeUninit::uninit(); FLATMAP_LIMIT];
@@ -81,7 +160,7 @@ fn dedup_built<'a>(
     keys: &[ERL_NIF_TERM],
     vals: &[ERL_NIF_TERM],
     order: Option<[u8; FLATMAP_LIMIT]>,
-) -> Option<Term<'a>> {
+) -> Term<'a> {
     let n = keys.len();
     let mut source = [0u8; FLATMAP_LIMIT];
     let source: &[u8] = match order {
@@ -107,170 +186,189 @@ fn dedup_built<'a>(
             enif_make_map_put(env.as_c_arg(), map, keys[i], vals[i], &mut new_map);
             map = new_map;
         }
-        Some(Term::new(env, map))
+        Term::new(env, map)
     }
 }
 
 /// Fallback for Rust-built `Value` objects, which use a hash map rather than a
 /// document pair slice and cannot contain duplicate keys.
 #[cold]
-fn object_from_map<'a>(
-    env: Env<'a>,
-    value: &sonic_rs::Value,
+fn object_from_map<'a, 'v>(
+    conversion: &mut Conversion<'a, 'v>,
+    value: &'v sonic_rs::Value,
     depth: u32,
-    nodes: &mut usize,
-) -> Option<Term<'a>> {
-    let obj = value.as_object()?;
+    work: &mut Work,
+) -> Result<Term<'a>, ConversionError> {
+    let obj = value.as_object().expect("object value");
+    let env = conversion.env;
     let child_depth = depth - 1;
-    *nodes += 2 * obj.len();
+    conversion.charge(2 * obj.len(), 0, work)?;
     unsafe {
         let mut map = enif_make_new_map(env.as_c_arg());
         for (k, v) in obj.iter() {
-            let key = make_binary_term(env, k).as_c_arg();
-            let val = value_to_term(env, v, child_depth, nodes)?.as_c_arg();
+            let key = conversion.key(k, work)?;
+            let val = conversion.convert::<true>(v, child_depth, work)?.as_c_arg();
             let mut new_map: ERL_NIF_TERM = 0;
             enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
             map = new_map;
         }
-        Some(Term::new(env, map))
+        Ok(Term::new(env, map))
     }
 }
 
-/// Convert a sonic-rs Value to an Erlang term.
-///
-/// `depth` is the remaining nesting budget; returns `None` when it reaches zero
-/// on an object or array, signalling that the document is too deeply nested.
-///
-/// `nodes` approximates the number of terms built, counted once per container
-/// child (object children count double for their keys), so scalar conversions
-/// cost nothing. Callers on normal schedulers use it for post-hoc timeslice
-/// accounting — conversion work is proportional to the extracted subtree, not
-/// to the pointer traversal that found it.
-#[inline]
-pub fn value_to_term<'a>(
-    env: Env<'a>,
-    value: &sonic_rs::Value,
-    depth: u32,
-    nodes: &mut usize,
-) -> Option<Term<'a>> {
-    match value.get_type() {
-        JsonType::Null => Some(atoms::nil().to_term(env)),
-        JsonType::Boolean => Some(if value.as_bool().unwrap() {
-            atoms::r#true().to_term(env)
-        } else {
-            atoms::r#false().to_term(env)
-        }),
-        JsonType::Number => {
-            if let Some(n) = value.as_i64() {
-                Some(unsafe { Term::new(env, rustler::sys::enif_make_int64(env.as_c_arg(), n)) })
-            } else if let Some(n) = value.as_u64() {
-                Some(unsafe { Term::new(env, rustler::sys::enif_make_uint64(env.as_c_arg(), n)) })
-            } else {
-                value.as_f64().map(|n| unsafe {
-                    Term::new(env, rustler::sys::enif_make_double(env.as_c_arg(), n))
-                })
-            }
-        }
-        JsonType::String => Some(make_binary_term(env, value.as_str().unwrap())),
-        JsonType::Array => {
-            if depth == 0 {
-                return None;
-            }
-            let arr = value.as_value_slice().unwrap_or(&[]);
-            let count = arr.len();
-            let child_depth = depth - 1;
-            *nodes += count;
-            if count <= STACK_SIZE {
-                let mut terms: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
-                    [MaybeUninit::uninit(); STACK_SIZE];
-                for (i, v) in arr.iter().enumerate() {
-                    terms[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
-                }
-                unsafe {
-                    Some(Term::new(
-                        env,
-                        enif_make_list_from_array(
-                            env.as_c_arg(),
-                            terms.as_ptr() as *const ERL_NIF_TERM,
-                            count as u32,
-                        ),
-                    ))
-                }
-            } else {
-                let mut terms: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
-                for v in arr.iter() {
-                    terms.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
-                }
-                unsafe {
-                    Some(Term::new(
-                        env,
-                        enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), count as u32),
-                    ))
-                }
-            }
-        }
-        JsonType::Object => {
-            if depth == 0 {
-                return None;
-            }
-            let pairs = match value.as_pair_slice() {
-                Some(pairs) => pairs,
-                None => return object_from_map(env, value, depth, nodes),
-            };
-            let count = pairs.len();
-            let child_depth = depth - 1;
-            *nodes += 2 * count;
-            if count <= STACK_SIZE {
-                let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
-                    [MaybeUninit::uninit(); STACK_SIZE];
-                let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
-                    [MaybeUninit::uninit(); STACK_SIZE];
-                // Keep raw keys for ordering instead of unpacking each `Value` twice.
-                let mut key_strs: [MaybeUninit<&str>; FLATMAP_LIMIT] =
-                    [MaybeUninit::uninit(); FLATMAP_LIMIT];
-                let orderable = (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&count);
-                for (i, (k, v)) in pairs.iter().enumerate() {
-                    let key = k.as_node_str().unwrap_or("");
-                    if orderable {
-                        key_strs[i].write(key);
-                    }
-                    keys[i].write(make_binary_term(env, key).as_c_arg());
-                    vals[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
-                }
-                let mut applied = None;
-                // SAFETY: keys and values are initialized through `count`; key strings
-                // are also initialized through `count` when `orderable` is true.
-                unsafe {
-                    let (keys, vals) = (
-                        std::slice::from_raw_parts_mut(keys.as_mut_ptr().cast(), count),
-                        std::slice::from_raw_parts_mut(vals.as_mut_ptr().cast(), count),
-                    );
-                    if orderable {
-                        let key_strs = std::slice::from_raw_parts(key_strs.as_ptr().cast(), count);
-                        reorder_object(key_strs, keys, vals, &mut applied);
-                    }
+impl<'a, 'v> Conversion<'a, 'v> {
+    /// Converts one retained value, checking cumulative work before every
+    /// container allocation and binary copy, including recursive descendants.
+    #[inline]
+    pub(crate) fn value_to_term(
+        &mut self,
+        value: &'v sonic_rs::Value,
+        depth: u32,
+        work: &mut Work,
+    ) -> Result<Term<'a>, ConversionError> {
+        self.convert::<false>(value, depth, work)
+    }
 
-                    let mut map: ERL_NIF_TERM = 0;
-                    if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
-                        Some(Term::new(env, map))
-                    } else {
-                        dedup_built(env, keys, vals, applied)
+    #[inline]
+    fn convert<const NESTED: bool>(
+        &mut self,
+        value: &'v sonic_rs::Value,
+        depth: u32,
+        work: &mut Work,
+    ) -> Result<Term<'a>, ConversionError> {
+        let env = self.env;
+        match value.get_type() {
+            JsonType::Null => Ok(atoms::nil().to_term(env)),
+            JsonType::Boolean => Ok(if value.as_bool().unwrap() {
+                atoms::r#true().to_term(env)
+            } else {
+                atoms::r#false().to_term(env)
+            }),
+            JsonType::Number => {
+                if let Some(n) = value.as_i64() {
+                    Ok(unsafe { Term::new(env, rustler::sys::enif_make_int64(env.as_c_arg(), n)) })
+                } else if let Some(n) = value.as_u64() {
+                    Ok(
+                        unsafe {
+                            Term::new(env, rustler::sys::enif_make_uint64(env.as_c_arg(), n))
+                        },
+                    )
+                } else {
+                    Ok(unsafe {
+                        Term::new(
+                            env,
+                            rustler::sys::enif_make_double(env.as_c_arg(), value.as_f64().unwrap()),
+                        )
+                    })
+                }
+            }
+            JsonType::String => self.string::<NESTED>(value.as_str().unwrap(), work),
+            JsonType::Array => {
+                if depth == 0 {
+                    return Err(ConversionError::NestingTooDeep);
+                }
+                if !NESTED {
+                    self.credit = work.conversion_credit(self.budget);
+                }
+                let arr = value.as_value_slice().unwrap_or(&[]);
+                let count = arr.len();
+                let child_depth = depth - 1;
+                self.charge(count, 0, work)?;
+                if count <= STACK_SIZE {
+                    let mut terms: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                        [MaybeUninit::uninit(); STACK_SIZE];
+                    for (i, v) in arr.iter().enumerate() {
+                        terms[i].write(self.convert::<true>(v, child_depth, work)?.as_c_arg());
+                    }
+                    unsafe {
+                        Ok(Term::new(
+                            env,
+                            enif_make_list_from_array(
+                                env.as_c_arg(),
+                                terms.as_ptr() as *const ERL_NIF_TERM,
+                                count as u32,
+                            ),
+                        ))
+                    }
+                } else {
+                    let mut terms: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
+                    for v in arr.iter() {
+                        terms.push(self.convert::<true>(v, child_depth, work)?.as_c_arg());
+                    }
+                    unsafe {
+                        Ok(Term::new(
+                            env,
+                            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), count as u32),
+                        ))
                     }
                 }
-            } else {
-                let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
-                let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
-                for (k, v) in pairs.iter() {
-                    keys.push(make_binary_term(env, k.as_node_str().unwrap_or("")).as_c_arg());
-                    vals.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
+            }
+            JsonType::Object => {
+                if depth == 0 {
+                    return Err(ConversionError::NestingTooDeep);
                 }
-                let mut map: ERL_NIF_TERM = 0;
-                unsafe {
-                    if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
-                        Some(Term::new(env, map))
-                    } else {
-                        // Only flatmaps are reordered, so these remain in document order.
-                        dedup_built(env, &keys, &vals, None)
+                if !NESTED {
+                    self.credit = work.conversion_credit(self.budget);
+                }
+                let pairs = match value.as_pair_slice() {
+                    Some(pairs) => pairs,
+                    None => return object_from_map(self, value, depth, work),
+                };
+                let count = pairs.len();
+                let child_depth = depth - 1;
+                self.charge(2 * count, 0, work)?;
+                if count <= STACK_SIZE {
+                    let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                        [MaybeUninit::uninit(); STACK_SIZE];
+                    let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
+                        [MaybeUninit::uninit(); STACK_SIZE];
+                    // Keep raw keys for ordering instead of unpacking each Value twice.
+                    let mut key_strs: [MaybeUninit<&str>; FLATMAP_LIMIT] =
+                        [MaybeUninit::uninit(); FLATMAP_LIMIT];
+                    let orderable = (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&count);
+                    for (i, (k, v)) in pairs.iter().enumerate() {
+                        let key = k.as_node_str().unwrap_or("");
+                        if orderable {
+                            key_strs[i].write(key);
+                        }
+                        keys[i].write(self.key(key, work)?);
+                        vals[i].write(self.convert::<true>(v, child_depth, work)?.as_c_arg());
+                    }
+                    let mut applied = None;
+                    // SAFETY: keys and values are initialized through count; key
+                    // strings are also initialized when orderable is true.
+                    unsafe {
+                        let (keys, vals) = (
+                            std::slice::from_raw_parts_mut(keys.as_mut_ptr().cast(), count),
+                            std::slice::from_raw_parts_mut(vals.as_mut_ptr().cast(), count),
+                        );
+                        if orderable {
+                            let key_strs =
+                                std::slice::from_raw_parts(key_strs.as_ptr().cast(), count);
+                            reorder_object(key_strs, keys, vals, &mut applied);
+                        }
+                        let mut map: ERL_NIF_TERM = 0;
+                        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
+                            Ok(Term::new(env, map))
+                        } else {
+                            Ok(dedup_built(env, keys, vals, applied))
+                        }
+                    }
+                } else {
+                    let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
+                    let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
+                    for (k, v) in pairs.iter() {
+                        keys.push(self.key(k.as_node_str().unwrap_or(""), work)?);
+                        vals.push(self.convert::<true>(v, child_depth, work)?.as_c_arg());
+                    }
+                    let mut map: ERL_NIF_TERM = 0;
+                    unsafe {
+                        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
+                            Ok(Term::new(env, map))
+                        } else {
+                            // Only flatmaps are reordered; these retain source order.
+                            Ok(dedup_built(env, &keys, &vals, None))
+                        }
                     }
                 }
             }

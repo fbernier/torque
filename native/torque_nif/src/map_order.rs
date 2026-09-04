@@ -85,7 +85,7 @@ where
 /// Reorders members into Erlang term order and calls `permute` only when needed.
 /// `prefixes.len()` must not exceed [`FLATMAP_LIMIT`].
 #[inline]
-pub fn order_members<F, P>(prefixes: &[u64], mut tie_lt: F, permute: P) -> bool
+fn order_members<F, P>(prefixes: &[u64], mut tie_lt: F, permute: P) -> bool
 where
     F: FnMut(usize, usize) -> bool,
     P: FnOnce(&[u8]),
@@ -95,6 +95,29 @@ where
     }
     permute_members(prefixes, tie_lt, permute);
     true
+}
+
+/// `order_members` for callers holding the members themselves: derives each
+/// prefix and applies the member-count bounds, so the prefix scratch lives here
+/// rather than once per conversion path.
+#[inline]
+pub fn order_members_of<T, K, F, P>(members: &[T], prefix_of: K, tie_lt: F, permute: P) -> bool
+where
+    K: Fn(&T) -> u64,
+    F: FnMut(usize, usize) -> bool,
+    P: FnOnce(&[u8]),
+{
+    let n = members.len();
+    if !(MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&n) {
+        return false;
+    }
+    let mut prefixes: [MaybeUninit<u64>; FLATMAP_LIMIT] = [MaybeUninit::uninit(); FLATMAP_LIMIT];
+    for (slot, member) in prefixes[..n].iter_mut().zip(members) {
+        slot.write(prefix_of(member));
+    }
+    // SAFETY: prefixes[..n] was initialized above.
+    let prefixes = unsafe { std::slice::from_raw_parts(prefixes.as_ptr().cast(), n) };
+    order_members(prefixes, tie_lt, permute)
 }
 
 /// Kept out of line so ordered input never touches the thread-local cache.

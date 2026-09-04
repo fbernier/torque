@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
 use crate::atoms;
-use crate::map_order::{order_members, prefix_be, FLATMAP_LIMIT, MIN_ORDERED_MEMBERS};
+use crate::map_order::{order_members_of, prefix_be, FLATMAP_LIMIT};
 use crate::nif_util::{make_tuple2, map_from_arrays};
 
 const STACK_SIZE: usize = 64;
@@ -46,6 +46,8 @@ const KEY_CACHE_BYPASS_AT: i32 = 256;
 
 #[derive(Clone, Copy)]
 struct KeyEntry {
+    /// Start of the cached key. Only full equality reads through it; the slot
+    /// also uses a bounded tail discriminator for keys longer than eight bytes.
     ptr: *const u8,
     term: ERL_NIF_TERM,
     /// First 8 key bytes, zero-padded. For keys of ≤ 8 bytes this is the whole
@@ -57,17 +59,18 @@ struct KeyEntry {
 
 /// Direct-mapped, per-call memo of object-key terms. Typical JSON repeats the
 /// same few keys across every element of an array, and each occurrence used to
-/// build a fresh term; a hit reuses the earlier one instead. Entries are keyed
-/// by pointers into the input buffer (stable for the whole call) and
-/// invalidated between calls by an epoch counter, since terms are only valid
-/// within the env of the call that made them.
+/// build a fresh term; a hit reuses the earlier one instead. Entries are matched
+/// on key content — the 8-byte prefix, the length, and a byte compare of the
+/// tail through `ptr`, which the caller keeps valid and immutable for all
+/// lookups in one call. Entries are invalidated between calls by an epoch
+/// counter, since terms are only valid within the env that made them.
 ///
 /// Cached keys are built as *copied* heap binaries rather than sub-binaries.
 /// On OTP 28+ this matches what `enif_make_sub_binary` does anyway (slices
 /// ≤ 64 bytes are copied on-heap); on older OTPs it avoids real sub-binaries
 /// that would pin the whole input binary via the decoded map's keys. The copy
-/// is once per distinct key per call — amortized by the cache.
-struct KeyCache {
+/// is once per cached key per call — amortized by the cache.
+pub(crate) struct KeyCache {
     entries: [KeyEntry; KEY_CACHE_SLOTS],
     epoch: u32,
     /// Per-call adaptivity: a miss adds 1, a hit subtracts 8. Documents shaped
@@ -80,7 +83,7 @@ struct KeyCache {
 }
 
 impl KeyCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         KeyCache {
             entries: [KeyEntry {
                 ptr: std::ptr::null(),
@@ -94,10 +97,10 @@ impl KeyCache {
         }
     }
 
-    /// Invalidate all entries for a new decode call. On the (rare) epoch
+    /// Invalidate all entries before using a new NIF env. On the (rare) epoch
     /// wraparound, hard-clear so stale entries can't alias the new epoch.
     #[inline]
-    fn next_epoch(&mut self) {
+    pub(crate) fn next_epoch(&mut self) {
         self.debit = 0;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
@@ -107,6 +110,74 @@ impl KeyCache {
             self.epoch = 1;
         }
     }
+
+    #[inline]
+    fn eligible(&self, len: usize) -> bool {
+        len != 0 && len <= KEY_CACHE_MAX_LEN && self.debit <= KEY_CACHE_BYPASS_AT
+    }
+
+    /// Copies a key into this env, reusing its term when the cache hits.
+    /// Even uncached keys are copied: returned binaries never retain the input
+    /// or a parsed document's arena.
+    ///
+    /// # Safety
+    ///
+    /// Call `next_epoch` before the first lookup in each NIF env, and use only
+    /// that env for the epoch. All supplied key bytes must remain alive and
+    /// immutable through every subsequent lookup in the epoch; their pointers
+    /// may be retained for equality checks, but are not read after invalidation.
+    #[inline]
+    pub(crate) unsafe fn copied_key(&mut self, env: Env<'_>, key: &str) -> ERL_NIF_TERM {
+        if !self.eligible(key.len()) {
+            return copy_key(env, key);
+        }
+        let prefix = prefix_be(key.as_bytes()).swap_bytes();
+        self.cached_key(env, key, prefix)
+    }
+
+    /// Same lifetime requirements as `copied_key`; additionally `key` must be
+    /// eligible and `prefix` its zero-padded, little-endian first eight bytes.
+    #[inline]
+    unsafe fn cached_key(&mut self, env: Env<'_>, key: &str, prefix: u64) -> ERL_NIF_TERM {
+        let ptr = key.as_ptr();
+        let len = key.len();
+        let mut discriminator = prefix;
+        if len > 8 {
+            // One bounded load distinguishes common-prefix names without
+            // hashing the entire key. Overlap at lengths 9..15 is intentional.
+            let tail = u64::from_le_bytes(ptr.add(len - 8).cast::<[u8; 8]>().read_unaligned());
+            discriminator ^= tail.rotate_left(17);
+        }
+        let h = (discriminator ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let entry = &mut self.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
+        if entry.epoch == self.epoch
+            && entry.prefix == prefix
+            && entry.len == len as u32
+            && (len <= 8
+                || std::slice::from_raw_parts(entry.ptr.add(8), len - 8) == &key.as_bytes()[8..])
+        {
+            self.debit -= 8;
+            return entry.term;
+        }
+        self.debit += 1;
+        // Eligible keys fit in an on-heap binary, not a refc allocation.
+        let term = copy_key(env, key);
+        *entry = KeyEntry {
+            ptr,
+            term,
+            prefix,
+            len: len as u32,
+            epoch: self.epoch,
+        };
+        term
+    }
+}
+
+#[inline]
+fn copy_key(env: Env<'_>, key: &str) -> ERL_NIF_TERM {
+    let mut binary = NewBinary::new(env, key.len());
+    binary.as_mut_slice().copy_from_slice(key.as_bytes());
+    Term::from(binary).as_c_arg()
 }
 
 /// Sort metadata captured while an object key still points into the input.
@@ -168,8 +239,10 @@ struct InputRef<'de> {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
-    /// Input length when every key offset fits in `u32`; zero disables borrowing.
-    borrow_limit: usize,
+    /// Input length when every key offset fits in `u32`; zero turns off the key
+    /// cache and key ordering, which store offsets as `u32`. String values are
+    /// still borrowed against `len`.
+    key_limit: usize,
     /// Exclusive upper bound for offsets with eight readable input bytes.
     wide_limit: usize,
     /// Prevents this reference from outliving the input allocation.
@@ -236,6 +309,33 @@ impl<'de, 'a, 'b, const BOUNDED: bool> TermBuilder<'de, 'a, 'b, BOUNDED> {
         self.values.push(term);
     }
 
+    /// Saves the enclosing container's ordering state and starts a fresh member
+    /// run.
+    #[inline]
+    fn open_frame(&mut self) {
+        self.frames.push(Frame {
+            values: self.values.len(),
+            keys: self.key_ords.len() as u32,
+            unsortable: self.unsortable,
+            members: self.members,
+        });
+        self.members = 0;
+    }
+
+    /// Replaces this frame's children with the term built from them and restores
+    /// the enclosing container's state. `unsortable` and `members` are running
+    /// totals, so rewinding them is what keeps an enclosing object judged on its
+    /// own keys — a single escaped key deep in the tree must not disqualify every
+    /// object above it, whose own key metadata is still perfectly good.
+    #[inline]
+    fn close_frame(&mut self, frame: Frame, term: ERL_NIF_TERM) {
+        self.unsortable = frame.unsortable;
+        self.members = frame.members;
+        self.key_ords.truncate(frame.keys as usize);
+        self.values.truncate(frame.values);
+        self.values.push(term);
+    }
+
     /// Sub-binary (zero-copy) when the str lives in the input buffer, else copy
     /// (escaped strings are unescaped into the parser's scratch buffer).
     #[inline]
@@ -260,7 +360,7 @@ impl<'de, 'a, 'b, const BOUNDED: bool> TermBuilder<'de, 'a, 'b, BOUNDED> {
         let mut prefix = 0u64;
         let mut offset = 0usize;
         let mut borrowed = false;
-        if let Some(at) = self.input.offset_within(s, self.input.borrow_limit) {
+        if let Some(at) = self.input.offset_within(s, self.input.key_limit) {
             offset = at;
             borrowed = true;
             // SAFETY: the key is in the input, and `wide_limit` proves whether
@@ -283,44 +383,12 @@ impl<'de, 'a, 'b, const BOUNDED: bool> TermBuilder<'de, 'a, 'b, BOUNDED> {
             }
         }
 
-        if !borrowed || len == 0 || len > KEY_CACHE_MAX_LEN || self.keys.debit > KEY_CACHE_BYPASS_AT
-        {
+        if !borrowed || !self.keys.eligible(len) {
             return self.str_term(s);
         }
-        let mut discriminator = prefix;
-        if len > 8 {
-            // Mix the end of equal-length schema keys sharing their prefix.
-            let tail =
-                unsafe { u64::from_le_bytes(ptr.add(len - 8).cast::<[u8; 8]>().read_unaligned()) };
-            discriminator ^= tail.rotate_left(17);
-        }
-        let h = (discriminator ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
-        if entry.epoch == self.keys.epoch
-            && entry.prefix == prefix
-            && entry.len == len as u32
-            && (len <= 8
-                || unsafe {
-                    std::slice::from_raw_parts(entry.ptr.add(8), len - 8)
-                        == std::slice::from_raw_parts(ptr.add(8), len - 8)
-                })
-        {
-            self.keys.debit -= 8;
-            return entry.term;
-        }
-        self.keys.debit += 1;
-        // len <= KEY_CACHE_MAX_LEN (64), so this is an on-heap binary, not refc.
-        let mut binary = NewBinary::new(self.env, len);
-        binary.as_mut_slice().copy_from_slice(s.as_bytes());
-        let term = Term::from(binary).as_c_arg();
-        *entry = KeyEntry {
-            ptr,
-            term,
-            prefix,
-            len: len as u32,
-            epoch: self.keys.epoch,
-        };
-        term
+        // SAFETY: the key's bytes are pinned in the input for this call, whose
+        // epoch began before parsing. Reuse the prefix derived for ordering.
+        unsafe { self.keys.cached_key(self.env, s, prefix) }
     }
 }
 
@@ -329,41 +397,31 @@ impl<'de, 'a, 'b, const BOUNDED: bool> TermBuilder<'de, 'a, 'b, BOUNDED> {
 fn build_map(env: Env, kv: &[ERL_NIF_TERM], ords: &[KeyOrd], base: *const u8) -> ERL_NIF_TERM {
     let pairs = kv.len() / 2;
     if pairs > STACK_SIZE {
-        let mut keys = Vec::with_capacity(pairs);
-        let mut vals = Vec::with_capacity(pairs);
-        for i in 0..pairs {
-            keys.push(kv[2 * i]);
-            vals.push(kv[2 * i + 1]);
-        }
+        let members = kv.as_chunks::<2>().0;
+        let keys: Vec<ERL_NIF_TERM> = members.iter().map(|m| m[0]).collect();
+        let vals: Vec<ERL_NIF_TERM> = members.iter().map(|m| m[1]).collect();
         return make_map(env, &keys, &vals, kv);
     }
 
     let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
     let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
-    let mut prefixes: [MaybeUninit<u64>; FLATMAP_LIMIT] = [MaybeUninit::uninit(); FLATMAP_LIMIT];
-    let permuted =
-        ords.len() == pairs && (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&pairs) && {
-            for (slot, o) in prefixes[..pairs].iter_mut().zip(ords) {
-                slot.write(o.prefix);
-            }
-            // SAFETY: prefixes[..pairs] was initialized above.
-            let prefixes = unsafe { std::slice::from_raw_parts(prefixes.as_ptr().cast(), pairs) };
-            order_members(
-                prefixes,
-                |a, b| ords[a].slow_lt(&ords[b], base),
-                |perm| {
-                    for (i, &member) in perm.iter().enumerate() {
-                        let s = member as usize;
-                        keys[i].write(kv[2 * s]);
-                        vals[i].write(kv[2 * s + 1]);
-                    }
-                },
-            )
-        };
+    let permuted = ords.len() == pairs
+        && order_members_of(
+            ords,
+            |o| o.prefix,
+            |a, b| ords[a].slow_lt(&ords[b], base),
+            |perm| {
+                for (i, &member) in perm.iter().enumerate() {
+                    let s = member as usize;
+                    keys[i].write(kv[2 * s]);
+                    vals[i].write(kv[2 * s + 1]);
+                }
+            },
+        );
     if !permuted {
-        for i in 0..pairs {
-            keys[i].write(kv[2 * i]);
-            vals[i].write(kv[2 * i + 1]);
+        for (i, member) in kv.as_chunks::<2>().0.iter().enumerate() {
+            keys[i].write(member[0]);
+            vals[i].write(member[1]);
         }
     }
 
@@ -563,74 +621,45 @@ impl<'de, 'a, 'b, const BOUNDED: bool> JsonVisitor<'de> for TermBuilder<'de, 'a,
 
     #[inline]
     fn visit_array_start(&mut self, _hint: usize) -> bool {
-        self.frames.push(Frame {
-            values: self.values.len(),
-            keys: self.key_ords.len() as u32,
-            unsortable: self.unsortable,
-            members: self.members,
-        });
-        self.members = 0;
+        self.open_frame();
         true
     }
 
     #[inline]
     fn visit_array_end(&mut self, _len: usize) -> bool {
-        let frame = match self.frames.pop() {
-            Some(f) => f,
-            None => return false,
+        let Some(frame) = self.frames.pop() else {
+            return false;
         };
         let start = frame.values;
         let count = (self.values.len() - start) as u32;
         let list = unsafe {
             enif_make_list_from_array(self.env.as_c_arg(), self.values[start..].as_ptr(), count)
         };
-        // Arrays hold no keys of their own, but an object nested inside one
-        // may have bumped `unsortable`; rewind so enclosing objects are judged
-        // only on their own keys.
-        self.unsortable = frame.unsortable;
-        self.members = frame.members;
-        self.key_ords.truncate(frame.keys as usize);
-        self.values.truncate(start);
-        self.values.push(list);
+        self.close_frame(frame, list);
         true
     }
 
     #[inline]
     fn visit_object_start(&mut self, _hint: usize) -> bool {
-        self.frames.push(Frame {
-            values: self.values.len(),
-            keys: self.key_ords.len() as u32,
-            unsortable: self.unsortable,
-            members: self.members,
-        });
-        self.members = 0;
+        self.open_frame();
         true
     }
 
     #[inline]
     fn visit_object_end(&mut self, _len: usize) -> bool {
-        let frame = match self.frames.pop() {
-            Some(f) => f,
-            None => return false,
+        let Some(frame) = self.frames.pop() else {
+            return false;
         };
         let start = frame.values;
         // An escaped key can't be borrowed for comparison, so give up on
         // reordering the object that contains it and let ERTS order that one.
-        // Only this object's own keys count: `unsortable` is a running total,
-        // so it is rewound on close, or a single escaped key deep in the tree
-        // would disqualify every object enclosing it — whose own key metadata
-        // is still perfectly good.
         let ords: &[KeyOrd] = if self.unsortable == frame.unsortable {
             &self.key_ords[frame.keys as usize..]
         } else {
             &[]
         };
         let map = build_map(self.env, &self.values[start..], ords, self.input.base);
-        self.unsortable = frame.unsortable;
-        self.members = frame.members;
-        self.key_ords.truncate(frame.keys as usize);
-        self.values.truncate(start);
-        self.values.push(map);
+        self.close_frame(frame, map);
         true
     }
 }
@@ -659,7 +688,7 @@ pub fn decode_to_term<'a, const BOUNDED: bool>(
                 term: input_term,
                 base: bytes.as_ptr(),
                 len: bytes.len(),
-                borrow_limit: if bytes.len() <= u32::MAX as usize {
+                key_limit: if bytes.len() <= u32::MAX as usize {
                     bytes.len()
                 } else {
                     0
@@ -733,7 +762,7 @@ mod tests {
             term: 0,
             base: doc.as_ptr(),
             len: doc.len(),
-            borrow_limit: doc.len(),
+            key_limit: doc.len(),
             wide_limit: doc.len().saturating_sub(7),
             _input: PhantomData,
         }
@@ -749,7 +778,7 @@ mod tests {
         for off in 0..doc.len() {
             for len in 0..=(doc.len() - off) {
                 assert_eq!(
-                    input.offset_within(at(off, len), input.borrow_limit),
+                    input.offset_within(at(off, len), input.key_limit),
                     Some(off),
                     "{off}/{len}"
                 );
@@ -757,15 +786,12 @@ mod tests {
         }
 
         assert_eq!(
-            input.offset_within(at(doc.len(), 0), input.borrow_limit),
+            input.offset_within(at(doc.len(), 0), input.key_limit),
             Some(doc.len())
         );
 
         let scratch = String::from("{\"ab\":1}");
-        assert_eq!(
-            input.offset_within(scratch.as_str(), input.borrow_limit),
-            None
-        );
+        assert_eq!(input.offset_within(scratch.as_str(), input.key_limit), None);
     }
 
     #[test]
@@ -775,7 +801,7 @@ mod tests {
             term: 0,
             base: backing[4..].as_ptr(),
             len: 8,
-            borrow_limit: 8,
+            key_limit: 8,
             wide_limit: 1,
             _input: PhantomData,
         };

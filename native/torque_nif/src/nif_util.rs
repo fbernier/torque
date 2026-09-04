@@ -42,11 +42,16 @@ pub const BYTES_PER_REDUCTION: usize = 20;
 /// Reductions per full BEAM timeslice (CONTEXT_REDS).
 pub const REDUCTION_COUNT: usize = 4000;
 
+/// Timeslice percentage (1–100) for a reduction count.
+#[inline]
+pub fn percent_for_reds(reds: usize) -> i32 {
+    ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
+}
+
 /// Compute a timeslice percentage (1–100) proportional to bytes processed.
 #[inline]
 pub fn timeslice_percent(bytes: usize) -> i32 {
-    let reds = bytes / BYTES_PER_REDUCTION;
-    ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
+    percent_for_reds(bytes / BYTES_PER_REDUCTION)
 }
 
 /// Build a map from key and value arrays.

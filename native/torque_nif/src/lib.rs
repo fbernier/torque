@@ -2,9 +2,9 @@ mod atoms;
 mod decoder;
 mod encoder;
 mod escape;
-pub(crate) mod map_order;
-pub(crate) mod native_decode;
-pub(crate) mod nif_util;
+mod map_order;
+mod native_decode;
+mod nif_util;
 mod types;
 
 pub struct ParsedDocument {
@@ -26,7 +26,8 @@ pub enum PathSeg {
 }
 
 /// Reusable JSON Pointer paths and their extraction policy. `paths` serves
-/// parsed-document lookups; `plan` serves fused parse-and-extract calls.
+/// parsed-document lookups; `plan` also identifies duplicate result terminals
+/// for both parsed-document and fused extraction without a per-call hash.
 pub struct CompiledPaths {
     pub paths: Vec<Vec<PathSeg>>,
     pub plan: sonic_rs::extract::ExtractPlan,
