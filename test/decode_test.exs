@@ -124,6 +124,47 @@ defmodule Torque.DecodeTest do
       assert ^expected = got
     end
 
+    # The decoder orders flatmap-sized objects by raw key bytes before ERTS
+    # sees them. These keys tie on their first 8 bytes, are prefixes of one
+    # another, or hold NUL and multi-byte characters.
+    test "members out of term order give the Erlang map in every order" do
+      keys = [
+        "profile_background_image_url_https",
+        "profile_background_image_url",
+        "profile_banner_url",
+        "aaaaaaaaY",
+        "aaaaaaaaX",
+        "aaaaaaaa",
+        "ab",
+        "a",
+        "\\u0000",
+        "a\\u0000b",
+        "é",
+        "日本",
+        "Z"
+      ]
+
+      for order <- [keys, Enum.reverse(keys), Enum.shuffle(keys)] do
+        json = "{" <> Enum.map_join(order, ",", &~s("#{&1}":"#{&1}")) <> "}"
+        expected = :json.decode(json)
+
+        decoded = Torque.decode!(json)
+        assert map_size(decoded) == length(keys)
+        assert ^expected = decoded
+      end
+    end
+
+    test "duplicate keys out of term order - last value wins" do
+      assert {:ok, %{"a" => 3, "b" => 2, "c" => 1, "d" => 1}} =
+               Torque.decode(~s({"d":1,"a":1,"c":1,"b":1,"a":2,"b":2,"a":3}))
+    end
+
+    test "escaped keys in an out-of-order object" do
+      json = ~s({"d":1,"\\u0063":2,"b":3,"\\u0061":4})
+      assert %{"a" => 4, "b" => 3, "c" => 2, "d" => 1} = decoded = Torque.decode!(json)
+      assert map_size(decoded) == 4
+    end
+
     test "invalid json returns error" do
       assert {:error, _reason} = Torque.decode("{invalid}")
     end
