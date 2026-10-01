@@ -97,11 +97,28 @@ jobs:
           PGO_DIR="$PWD/pgo"
           rm -rf "$PGO_DIR"; mkdir -p "$PGO_DIR"
           mix deps.get
-          # Build an instrumented NIF (generic CPU so it runs on this runner) and
-          # exercise it through the BEAM to collect a same-arch profile. The
-          # workload has no external deps, so a bare mix env suffices.
+          # Build an instrumented NIF and exercise it through the BEAM to
+          # collect a same-arch profile. The workload has no external deps, so
+          # a bare mix env suffices.
           RUSTFLAGS="-Cprofile-generate=$PGO_DIR" mix compile
-          RUSTFLAGS="-Cprofile-generate=$PGO_DIR" mix run bench/pgo_workload.exs
+          # Profile the artifact the next step ships: same `cargo build
+          # --target` (cargo hashes the target into symbol names) and same
+          # target-cpu (sonic-rs picks its AVX2 code at compile time, so a
+          # generic build profiles different functions than v3 ships).
+          RUSTFLAGS="${{ matrix.job.rustflags }}"
+          case "$RUSTFLAGS" in
+            *x86-64-v3*) NEED="avx2 bmi2 fma" ;;
+            *x86-64-v2*) NEED="sse4_2 ssse3 popcnt" ;;
+            *) NEED="" ;;
+          esac
+          for f in $NEED; do
+            grep -qw "$f" /proc/cpuinfo || { echo "::error::runner lacks $f, cannot run the instrumented NIF"; exit 1; }
+          done
+          RUSTLER_NIF_VERSION=${{ matrix.nif }} RUSTFLAGS="$RUSTFLAGS -Cprofile-generate=$PGO_DIR" \
+            cargo build --release --target ${{ matrix.job.target }} --package torque_nif
+          EXT=so; [[ "${{ matrix.job.target }}" == *darwin* ]] && EXT=dylib
+          cp "target/${{ matrix.job.target }}/release/libtorque_nif.$EXT" priv/native/torque_nif.so
+          mix run --no-compile bench/pgo_workload.exs
           # Merge with the toolchain's version-matched llvm-profdata.
           HOST="$(rustc -vV | sed -n 's/^host: //p')"
           PROFDATA="$(rustc --print sysroot)/lib/rustlib/${HOST}/bin/llvm-profdata"
@@ -124,11 +141,18 @@ jobs:
           else
             echo "Building ${{ matrix.job.target }} without PGO"
           fi
+          if [ -n "${PGO_FLAGS:-}" ]; then
+            FLAGS="$FLAGS -Cllvm-args=-pgo-warn-missing-function"
+          fi
           if [ -n "$FLAGS" ]; then export RUSTFLAGS="$FLAGS"; fi
           if [ "${{ matrix.job.use-cross }}" = "true" ]; then
             RUSTLER_NIF_VERSION=${{ matrix.nif }} cross build --release --target ${{ matrix.job.target }} --package torque_nif
           else
-            RUSTLER_NIF_VERSION=${{ matrix.nif }} cargo build --release --target ${{ matrix.job.target }} --package torque_nif
+            RUSTLER_NIF_VERSION=${{ matrix.nif }} cargo build --release --target ${{ matrix.job.target }} --package torque_nif 2>&1 | tee build.log
+          fi
+          if [ -n "${PGO_FLAGS:-}" ]; then
+            MISSES=$(grep -c "no profile data available" build.log || true)
+            echo "::notice::PGO: ${MISSES} functions without profile data (${{ matrix.job.target }}${{ matrix.job.variant && format(' {0}', matrix.job.variant) || '' }})"
           fi
 
       - name: Package artifact
