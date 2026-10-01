@@ -24,9 +24,18 @@ record = fn i ->
   ~s({"metadata":{"result_type":"recent","iso_language_code":"en"},"id":#{505_874_924_000_000_000 + i},"id_str":"#{505_874_924_000_000_000 + i}","text":"Sample tweet #{i} lorem ipsum dolor sit amet consectetur adipiscing elit","truncated":false,"in_reply_to_status_id":null,"user":{"id":#{1_000_000 + i},"screen_name":"username_#{i}","location":"San Francisco, CA","url":null,"followers_count":#{rem(i * 1337, 100_000)},"verified":false,"lang":"en","profile_image_url":"http://pbs.twimg.com/profile_images/#{i}/photo.jpeg"},"geo":null,"retweet_count":#{rem(i * 3, 1000)},"favorite_count":#{rem(i * 7, 2000)},"entities":{"hashtags":[{"text":"elixir","indices":[15,22]}],"urls":[],"user_mentions":[{"screen_name":"user_#{i}","id":#{2_000_000 + i}}]},"favorited":false,"lang":"en"})
 end
 
+# Real feeds carry much of their string data as multi-byte UTF-8, plus strings
+# that need escaping (quoted HTML attributes, line breaks). Without this shape
+# the encoder's UTF-8 and escape kernels go unprofiled.
+unicode_record = fn i ->
+  ~s({"metadata":{"result_type":"recent","iso_language_code":"ja"},"id":#{505_874_924_000_000_000 + i},"id_str":"#{505_874_924_000_000_000 + i}","text":"\\u3010\\u5b9a\\u671f\\u3011\\u65e5\\u672c\\u8a9e\\u306e\\u30c4\\u30a4\\u30fc\\u30c8 #{i} \\u3067\\u3059\\u3002\\n\\u4eca\\u65e5\\u3082\\u4e00\\u65e5\\u304a\\u75b2\\u308c\\u69d8\\u3067\\u3057\\u305f \\u2728\\ud83d\\ude0a \\"\\u5f15\\u7528\\" http:\\/\\/t.co\\/#{i}","source":"<a href=\\"http:\\/\\/twitter.com\\/download\\/iphone\\" rel=\\"nofollow\\">Twitter for iPhone<\\/a>","truncated":false,"in_reply_to_status_id":null,"user":{"id":#{1_000_000 + i},"name":"\\u3086\\u3046\\u3053 #{i}","screen_name":"yuuko_#{i}","location":"\\u6771\\u4eac\\u90fd","description":"\\u30a2\\u30cb\\u30e1\\u3068\\u30b2\\u30fc\\u30e0\\u304c\\u597d\\u304d\\u3067\\u3059\\u3002\\r\\n\\u30d5\\u30a9\\u30ed\\u30fc\\u6b53\\u8fce\\uff01\\t\\u2192 @yuuko_#{i}","url":null,"followers_count":#{rem(i * 1337, 100_000)},"verified":false,"lang":"ja"},"geo":null,"retweet_count":#{rem(i * 3, 1000)},"favorite_count":#{rem(i * 7, 2000)},"entities":{"hashtags":[{"text":"\\u65e5\\u672c","indices":[15,17]}],"urls":[],"user_mentions":[]},"favorited":false,"lang":"ja"})
+end
+
 large_json =
   ~s({"statuses":[) <>
-    Enum.map_join(1..200, ",", record) <>
+    Enum.map_join(1..200, ",", fn i ->
+      if rem(i, 2) == 0, do: record.(i), else: unicode_record.(i)
+    end) <>
     ~s(],"search_metadata":{"count":200,"completed_in":0.035,"max_id":505874924095815681,"query":"%23elixir"}})
 
 small_term = Torque.decode!(small_json)
