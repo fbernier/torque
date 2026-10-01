@@ -266,10 +266,17 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
 /// sorting on raw key bytes first leaves ERTS a linear validation pass.
 #[inline]
 fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
-    if ords.windows(2).all(|w| w[0].prefix < w[1].prefix) {
-        return None;
-    }
-    if ords.iter().any(|o| o.ptr.is_null()) {
+    // Sorted neighbours often share 8 bytes (`in_reply_to_status_id`,
+    // `in_reply_to_status_id_str`); compare those in full rather than
+    // sorting to find nothing moved.
+    let ordered = ords.windows(2).all(|w| {
+        w[0].prefix < w[1].prefix
+            || (w[0].prefix == w[1].prefix
+                && !w[0].ptr.is_null()
+                && !w[1].ptr.is_null()
+                && w[0].lt(&w[1]))
+    });
+    if ordered || ords.iter().any(|o| o.ptr.is_null()) {
         return None;
     }
     let mut perm = [0u8; FLATMAP_LIMIT];
