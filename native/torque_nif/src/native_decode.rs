@@ -16,14 +16,11 @@ use rustler::sys::{
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
 use std::cell::RefCell;
-use std::mem::MaybeUninit;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
 use crate::nif_util::{make_tuple2, map_from_arrays};
 use crate::types::MAX_DEPTH;
-
-const STACK_SIZE: usize = 64;
 
 /// Cap on the retained thread-local value stack (in terms, 8 bytes each ≈ 1 MB),
 /// so a one-off huge document doesn't pin a large allocation on a scheduler
@@ -140,6 +137,7 @@ struct Frame {
 struct DecodeBufs {
     values: Vec<ERL_NIF_TERM>,
     frames: Vec<Frame>,
+    key_terms: Vec<ERL_NIF_TERM>,
     ords: Vec<KeyOrd>,
     keys: KeyCache,
 }
@@ -153,6 +151,7 @@ thread_local! {
     static DECODE_BUFS: RefCell<DecodeBufs> = RefCell::new(DecodeBufs {
         values: Vec::with_capacity(64),
         frames: Vec::with_capacity(16),
+        key_terms: Vec::with_capacity(64),
         ords: Vec::with_capacity(64),
         keys: KeyCache::new(),
     });
@@ -183,8 +182,11 @@ struct TermBuilder<'a, 'b> {
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
     values: &'b mut Vec<ERL_NIF_TERM>,
     /// Where each currently-open container's children begin in `values`,
-    /// and its members' sort keys in `ords`.
+    /// and its members' keys in `key_terms` and `ords`.
     frames: &'b mut Vec<Frame>,
+    /// Open objects' key terms, kept apart from `values` so an object's keys
+    /// and values reach `enif_make_map_from_arrays` without being copied.
+    key_terms: &'b mut Vec<ERL_NIF_TERM>,
     ords: &'b mut Vec<KeyOrd>,
     keys: &'b mut KeyCache,
     too_deep: bool,
@@ -293,46 +295,28 @@ fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
     moved.then_some(perm)
 }
 
-/// Build a map term from interleaved `[k0, v0, k1, v1, ...]` children.
-/// De-interleaves into separate key/value arrays for `enif_make_map_from_arrays`.
+/// Build a map term from an object's keys and values, ordering its members
+/// first when ERTS would otherwise sort them itself.
 #[inline]
-fn build_map(env: Env, kv: &[ERL_NIF_TERM], ords: &[KeyOrd]) -> ERL_NIF_TERM {
-    let pairs = kv.len() / 2;
-    if (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&pairs) && ords.len() == pairs {
+fn build_map(
+    env: Env,
+    keys: &[ERL_NIF_TERM],
+    vals: &[ERL_NIF_TERM],
+    ords: &[KeyOrd],
+) -> ERL_NIF_TERM {
+    let pairs = keys.len();
+    if (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&pairs) {
         if let Some(perm) = member_order(ords) {
-            let mut keys = [0 as ERL_NIF_TERM; FLATMAP_LIMIT];
-            let mut vals = [0 as ERL_NIF_TERM; FLATMAP_LIMIT];
+            let mut k = [0 as ERL_NIF_TERM; FLATMAP_LIMIT];
+            let mut v = [0 as ERL_NIF_TERM; FLATMAP_LIMIT];
             for (slot, &i) in perm[..pairs].iter().enumerate() {
-                keys[slot] = kv[2 * i as usize];
-                vals[slot] = kv[2 * i as usize + 1];
+                k[slot] = keys[i as usize];
+                v[slot] = vals[i as usize];
             }
-            return make_map(env, &keys[..pairs], &vals[..pairs]);
+            return make_map(env, &k[..pairs], &v[..pairs]);
         }
     }
-    if pairs <= STACK_SIZE {
-        let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
-        let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
-        for i in 0..pairs {
-            keys[i].write(kv[2 * i]);
-            vals[i].write(kv[2 * i + 1]);
-        }
-        // SAFETY: keys[..pairs]/vals[..pairs] were just written.
-        unsafe {
-            make_map(
-                env,
-                std::slice::from_raw_parts(keys.as_ptr() as *const ERL_NIF_TERM, pairs),
-                std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, pairs),
-            )
-        }
-    } else {
-        let mut keys = Vec::with_capacity(pairs);
-        let mut vals = Vec::with_capacity(pairs);
-        for i in 0..pairs {
-            keys.push(kv[2 * i]);
-            vals.push(kv[2 * i + 1]);
-        }
-        make_map(env, &keys, &vals)
-    }
+    make_map(env, keys, vals)
 }
 
 #[inline]
@@ -514,7 +498,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             len,
         });
         let t = self.key_term(key, wide, prefix);
-        self.push(t);
+        self.key_terms.push(t);
         true
     }
 
@@ -566,7 +550,13 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             None => return false,
         };
         let start = frame.values;
-        let map = build_map(self.env, &self.values[start..], &self.ords[frame.ords..]);
+        let map = build_map(
+            self.env,
+            &self.key_terms[frame.ords..],
+            &self.values[start..],
+            &self.ords[frame.ords..],
+        );
+        self.key_terms.truncate(frame.ords);
         self.ords.truncate(frame.ords);
         self.values.truncate(start);
         self.values.push(map);
@@ -580,11 +570,13 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
         let DecodeBufs {
             values,
             frames,
+            key_terms,
             ords,
             keys,
         } = &mut *bufs;
         values.clear();
         frames.clear();
+        key_terms.clear();
         ords.clear();
         keys.next_epoch();
         let mut builder = TermBuilder {
@@ -596,6 +588,7 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
             },
             values,
             frames,
+            key_terms,
             ords,
             keys,
             too_deep: false,
