@@ -442,32 +442,10 @@ unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Resu
     while in_pos + 16 <= len {
         let v = vld1q_u8(src.add(in_pos));
 
-        // Non-ASCII byte detected — process chunk byte-by-byte then resume SIMD.
+        // Every byte before this chunk was ASCII, so the rest starts on a
+        // character boundary.
         if vmaxvq_u8(v) >= 0x80 {
-            let chunk_limit = in_pos + 16;
-            while in_pos < chunk_limit {
-                let b = *src.add(in_pos);
-                if b >= 0x80 {
-                    let width = validate_utf8_seq(src, in_pos, len)?;
-                    std::ptr::copy_nonoverlapping(src.add(in_pos), dst.add(out_pos), width);
-                    out_pos += width;
-                    in_pos += width;
-                } else if NEEDS_ESCAPE[b as usize] {
-                    let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
-                    std::ptr::copy_nonoverlapping(
-                        esc_bytes.as_ptr(),
-                        dst.add(out_pos),
-                        esc_len as usize,
-                    );
-                    out_pos += esc_len as usize;
-                    in_pos += 1;
-                } else {
-                    *dst.add(out_pos) = b;
-                    out_pos += 1;
-                    in_pos += 1;
-                }
-            }
-            continue;
+            return finish_non_ascii(src, in_pos, len, dst, out_pos);
         }
 
         // All ASCII — check for JSON escapes.
@@ -518,32 +496,10 @@ unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Resu
     while in_pos + 32 <= len {
         let v = _mm256_loadu_si256(src.add(in_pos) as *const __m256i);
 
-        // Non-ASCII byte detected — process chunk byte-by-byte then resume SIMD.
+        // Every byte before this chunk was ASCII, so the rest starts on a
+        // character boundary.
         if _mm256_movemask_epi8(v) != 0 {
-            let chunk_limit = in_pos + 32;
-            while in_pos < chunk_limit {
-                let b = *src.add(in_pos);
-                if b >= 0x80 {
-                    let width = validate_utf8_seq(src, in_pos, len)?;
-                    std::ptr::copy_nonoverlapping(src.add(in_pos), dst.add(out_pos), width);
-                    out_pos += width;
-                    in_pos += width;
-                } else if NEEDS_ESCAPE[b as usize] {
-                    let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
-                    std::ptr::copy_nonoverlapping(
-                        esc_bytes.as_ptr(),
-                        dst.add(out_pos),
-                        esc_len as usize,
-                    );
-                    out_pos += esc_len as usize;
-                    in_pos += 1;
-                } else {
-                    *dst.add(out_pos) = b;
-                    out_pos += 1;
-                    in_pos += 1;
-                }
-            }
-            continue;
+            return finish_non_ascii(src, in_pos, len, dst, out_pos);
         }
 
         // All ASCII — check for escapes.
@@ -602,32 +558,10 @@ unsafe fn validate_escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> Resu
     while in_pos + 16 <= len {
         let v = _mm_loadu_si128(src.add(in_pos) as *const __m128i);
 
-        // Non-ASCII byte detected — process chunk byte-by-byte then resume SIMD.
+        // Every byte before this chunk was ASCII, so the rest starts on a
+        // character boundary.
         if _mm_movemask_epi8(v) != 0 {
-            let chunk_limit = in_pos + 16;
-            while in_pos < chunk_limit {
-                let b = *src.add(in_pos);
-                if b >= 0x80 {
-                    let width = validate_utf8_seq(src, in_pos, len)?;
-                    std::ptr::copy_nonoverlapping(src.add(in_pos), dst.add(out_pos), width);
-                    out_pos += width;
-                    in_pos += width;
-                } else if NEEDS_ESCAPE[b as usize] {
-                    let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
-                    std::ptr::copy_nonoverlapping(
-                        esc_bytes.as_ptr(),
-                        dst.add(out_pos),
-                        esc_len as usize,
-                    );
-                    out_pos += esc_len as usize;
-                    in_pos += 1;
-                } else {
-                    *dst.add(out_pos) = b;
-                    out_pos += 1;
-                    in_pos += 1;
-                }
-            }
-            continue;
+            return finish_non_ascii(src, in_pos, len, dst, out_pos);
         }
 
         // All ASCII — check for escapes.
@@ -657,6 +591,27 @@ unsafe fn validate_escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> Resu
     }
 
     Ok(out_pos + validate_escape_scalar(src.add(in_pos), len - in_pos, dst.add(out_pos))?)
+}
+
+/// Validates and escapes the rest of a string from its first non-ASCII chunk.
+///
+/// Checking UTF-8 sequence by sequence while escaping ran text with frequent
+/// multi-byte characters (CJK, emoji) one byte at a time. One SIMD validation
+/// pass followed by the escape-only kernel, which copies high bytes through,
+/// keeps both at vector width.
+#[inline(never)]
+unsafe fn finish_non_ascii(
+    src: *const u8,
+    in_pos: usize,
+    len: usize,
+    dst: *mut u8,
+    out_pos: usize,
+) -> Result<usize, ()> {
+    let rest = std::slice::from_raw_parts(src.add(in_pos), len - in_pos);
+    if simdutf8::basic::from_utf8(rest).is_err() {
+        return Err(());
+    }
+    Ok(out_pos + escape_dispatch(rest.as_ptr(), rest.len(), dst.add(out_pos)))
 }
 
 // ---------------------------------------------------------------------------

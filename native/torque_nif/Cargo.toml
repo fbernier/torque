@@ -12,5 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 rustler = { version = "0.38", features = ["big_integer"] }
 sonic-rs = "0.5"
+simdutf8 = "0.1"
 itoa = "1"
 zmij = "1"
