@@ -229,7 +229,15 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         if !wide || self.keys.debit > KEY_CACHE_BYPASS_AT || len == 0 || len > KEY_CACHE_MAX_LEN {
             return self.str_term(s);
         }
-        let h = (prefix ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // Schema keys often share their first 8 bytes and length
+        // (`profile_link_color`, `profile_text_color`), so mix in the last 8
+        // too or they evict each other from the same slot.
+        let tail = if len > 8 {
+            unsafe { (ptr.add(len - 8) as *const u64).read_unaligned() }
+        } else {
+            0
+        };
+        let h = (prefix ^ (len as u64) ^ tail.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
         if entry.epoch == self.keys.epoch
             && entry.prefix == prefix
