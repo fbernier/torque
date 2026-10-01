@@ -101,7 +101,14 @@ jobs:
           # exercise it through the BEAM to collect a same-arch profile. The
           # workload has no external deps, so a bare mix env suffices.
           RUSTFLAGS="-Cprofile-generate=$PGO_DIR" mix compile
-          RUSTFLAGS="-Cprofile-generate=$PGO_DIR" mix run bench/pgo_workload.exs
+          # Profile the same `cargo build --target` artifact the next step
+          # ships. Cargo hashes the target into symbol names, so a profile from
+          # mix's host build (no --target) matches almost nothing in it.
+          RUSTLER_NIF_VERSION=${{ matrix.nif }} RUSTFLAGS="-Cprofile-generate=$PGO_DIR" \
+            cargo build --release --target ${{ matrix.job.target }} --package torque_nif
+          EXT=so; [[ "${{ matrix.job.target }}" == *darwin* ]] && EXT=dylib
+          cp "target/${{ matrix.job.target }}/release/libtorque_nif.$EXT" priv/native/torque_nif.so
+          mix run --no-compile bench/pgo_workload.exs
           # Merge with the toolchain's version-matched llvm-profdata.
           HOST="$(rustc -vV | sed -n 's/^host: //p')"
           PROFDATA="$(rustc --print sysroot)/lib/rustlib/${HOST}/bin/llvm-profdata"
