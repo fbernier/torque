@@ -4,7 +4,7 @@ defmodule Torque.CPU do
   def avx2? do
     case System.get_env("TORQUE_CPU_VARIANT") do
       "v3" -> true
-      nil -> detect("avx2", "hw.optional.avx2_0")
+      nil -> detect(~w(avx2 pclmulqdq), "hw.optional.avx2_0")
       _ -> false
     end
   end
@@ -12,26 +12,27 @@ defmodule Torque.CPU do
   def sse42? do
     case System.get_env("TORQUE_CPU_VARIANT") do
       "v2" -> true
-      nil -> detect("sse4_2", "hw.optional.sse4_2")
+      nil -> detect(~w(sse4_2), "hw.optional.sse4_2")
       _ -> false
     end
   end
 
-  defp detect(linux_flag, darwin_sysctl) do
+  # Every AVX2 Mac also has PCLMULQDQ, which has no hw.optional sysctl.
+  defp detect(linux_flags, darwin_sysctl) do
     case :os.type() do
-      {:unix, :linux} -> linux_has_flag?(linux_flag)
+      {:unix, :linux} -> linux_has_flags?(linux_flags)
       {:unix, :darwin} -> darwin_has_feature?(darwin_sysctl)
       _ -> false
     end
   end
 
-  defp linux_has_flag?(flag) do
+  defp linux_has_flags?(wanted) do
     case File.read("/proc/cpuinfo") do
       {:ok, content} ->
         content
         |> String.split("\n")
         |> Enum.any?(fn line ->
-          String.starts_with?(line, "flags") and flag in String.split(line)
+          String.starts_with?(line, "flags") and wanted -- String.split(line) == []
         end)
 
       _ ->

@@ -42,10 +42,10 @@ jobs:
           - { target: aarch64-unknown-linux-gnu,   os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-apple-darwin,         os: macos-14,     rustflags: "-C target-cpu=x86-64" }
           - { target: x86_64-apple-darwin,         os: macos-14,     rustflags: "-C target-cpu=x86-64-v2", variant: v2 }
-          - { target: x86_64-apple-darwin,         os: macos-14,     rustflags: "-C target-cpu=x86-64-v3", variant: v3 }
+          - { target: x86_64-apple-darwin,         os: macos-14,     rustflags: "-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq", variant: v3 }
           - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, rustflags: "-C target-cpu=x86-64",    pgo: true }
           - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, rustflags: "-C target-cpu=x86-64-v2", variant: v2, pgo: true }
-          - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, rustflags: "-C target-cpu=x86-64-v3", variant: v3, pgo: true }
+          - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, rustflags: "-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq", variant: v3, pgo: true }
 
     steps:
       - name: Checkout source code
@@ -107,7 +107,7 @@ jobs:
           # generic build profiles different functions than v3 ships).
           RUSTFLAGS="${{ matrix.job.rustflags }}"
           case "$RUSTFLAGS" in
-            *x86-64-v3*) NEED="avx2 bmi2 fma" ;;
+            *x86-64-v3*) NEED="avx2 bmi2 fma pclmulqdq" ;;
             *x86-64-v2*) NEED="sse4_2 ssse3 popcnt" ;;
             *) NEED="" ;;
           esac
