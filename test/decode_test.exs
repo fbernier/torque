@@ -165,6 +165,19 @@ defmodule Torque.DecodeTest do
       assert map_size(decoded) == 4
     end
 
+    # The decoder's key cache matches keys on their first and last 8 bytes and
+    # length, comparing the middle only for longer keys. These share all three
+    # and land in the same slot, so only the middle tells them apart.
+    test "repeated keys that differ only in the middle keep their own terms" do
+      keys = ["abcdefgh_one__stuvwxyz", "abcdefgh_two__stuvwxyz", "abcdefgh_six__stuvwxyz"]
+      record = "{" <> Enum.map_join(keys, ",", &~s("#{&1}":"#{&1}")) <> "}"
+      expected = Map.new(keys, &{&1, &1})
+
+      decoded = Torque.decode!("[" <> Enum.join(List.duplicate(record, 50), ",") <> "]")
+      assert length(decoded) == 50
+      assert Enum.all?(decoded, &(&1 == expected))
+    end
+
     test "invalid json returns error" do
       assert {:error, _reason} = Torque.decode("{invalid}")
     end
