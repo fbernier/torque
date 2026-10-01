@@ -38,7 +38,7 @@ On x86_64, precompiled binaries are available for three CPU feature levels:
 |---------|-------------|--------------|
 | baseline | SSE2 | `x86-64` |
 | v2 | SSE4.2, SSSE3, POPCNT | `x86-64-v2` |
-| v3 | AVX2, AVX, BMI1, BMI2, FMA | `x86-64-v3` |
+| v3 | AVX2, AVX, BMI1, BMI2, FMA, PCLMULQDQ | `x86-64-v3` + `pclmulqdq` |
 
 At compile time, Torque auto-detects the host CPU and downloads the best matching variant. To override detection (e.g., when cross-compiling for a different target):
 
