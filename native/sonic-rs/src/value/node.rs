@@ -1432,21 +1432,33 @@ impl Value {
         // Arc::increment_strong_count in pack_shared can recover it
         // via with_exposed_provenance.
         Arc::as_ptr(&shared).expose_provenance();
-        let mut buffer = Vec::with_capacity(json.len() + Self::PADDING_SIZE);
-        buffer.extend_from_slice(json);
-        buffer.extend_from_slice(&b"x\"x"[..]);
-        buffer.extend_from_slice(&[0; 61]);
+        let mut buffer = vec![0; json.len() + crate::PADDING];
+        crate::pad_into(json, &mut buffer);
 
         let smut = Arc::get_mut(&mut shared).unwrap();
-        let slice = PaddedSliceRead::new(buffer.as_mut_slice(), json);
+        let idx = self.parse_padded(&mut buffer, json, cfg, smut)?;
+        smut.set_json(buffer);
+        Ok(idx)
+    }
+
+    /// Torque patch: parses `json` from `buffer`, its copy laid out by
+    /// [`crate::pad_into`], in place. The value's strings point into `buffer`.
+    #[inline(always)]
+    pub(crate) fn parse_padded(
+        &mut self,
+        buffer: &mut [u8],
+        json: &[u8],
+        cfg: DeserializeCfg,
+        shared: &mut Shared,
+    ) -> Result<usize> {
+        let slice = PaddedSliceRead::new(buffer, json);
         let mut parser = Parser::new(slice).with_config(cfg);
-        let mut vis = DocumentVisitor::new(json.len(), smut);
+        let mut vis = DocumentVisitor::new(json.len(), shared);
         parser.parse_dom(&mut vis, None, 0)?;
         let idx = parser.read.index();
 
         // NOTE: root node should is the first node
         *self = unsafe { vis.root.as_ref().clone() };
-        smut.set_json(buffer);
         Ok(idx)
     }
 

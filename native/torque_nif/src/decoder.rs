@@ -1,15 +1,16 @@
 use crate::atoms;
-use crate::native_decode;
+use crate::native_decode::{
+    self, builder_error_term, with_term_builder, Overflow, Source, Strings, TermBuilder,
+    HEAP_BINARY_MAX,
+};
 use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
-use crate::ParsedDocument;
+use crate::{ParseBuffer, ParsedDocument};
 use rustler::sys::{
     enif_make_double, enif_make_int64, enif_make_list_cell, enif_make_list_from_array,
-    enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
+    enif_make_uint64, ERL_NIF_TERM,
 };
-use rustler::{
-    schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
-};
+use rustler::{schedule, Binary, Encoder, Env, ListIterator, NifResult, ResourceArc, Term};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
 const GET_MANY_STACK: usize = 64;
@@ -27,8 +28,9 @@ const TIMESLICE_MIN_NODES: usize = 512;
 const NODES_PER_REDUCTION: usize = 4;
 
 /// Report term-building work from the get family to the scheduler. The
-/// pointer lookup itself is sub-microsecond, but `value_to_term` cost is
-/// proportional to the extracted subtree, which only the node counter sees.
+/// pointer lookup itself is sub-microsecond, but building the result term
+/// costs in proportion to the extracted subtree, which only the node counter
+/// sees.
 #[inline]
 fn consume_timeslice_nodes(env: Env, nodes: usize) {
     if nodes >= TIMESLICE_MIN_NODES {
@@ -113,7 +115,7 @@ fn array_index(token: &str) -> Option<usize> {
 ///
 /// When `unique_keys` is true, uses sonic-rs's internal index (fast).
 /// Otherwise, does a reverse linear scan so that the last value wins,
-/// matching the duplicate-key behaviour of `value_to_term` / `build_map_dedup`.
+/// matching the duplicate-key behaviour of both term converters' maps.
 #[inline]
 fn object_get<'v>(
     value: &'v sonic_rs::Value,
@@ -218,11 +220,15 @@ fn pointer_lookup<'v>(
 }
 
 fn do_parse(
-    bytes: &[u8],
+    json: &[u8],
     unique_keys: bool,
 ) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
-    let value = sonic_rs::from_slice::<sonic_rs::Value>(bytes)?;
-    Ok(ResourceArc::new(ParsedDocument { value, unique_keys }))
+    let (value, buffer) = ParseBuffer::parse(json)?;
+    Ok(ResourceArc::new(ParsedDocument {
+        value,
+        unique_keys,
+        buffer,
+    }))
 }
 
 /// Build the `{:error, _}` term for a parse failure. The vendored sonic-rs caps
@@ -276,6 +282,127 @@ fn parse_opts_dirty<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'
     }
 }
 
+/// A selection's share of the borrow budget, by the `Value` it reached.
+type SelectionCost = (*const sonic_rs::Value, usize);
+
+/// Turns a parsed document's values into terms: directly for a small
+/// document, through the term builder for one with a parse buffer.
+enum DocTerms<'x, 'a, 'b> {
+    Direct(Env<'a>),
+    Built {
+        builder: &'x mut TermBuilder<'a, 'b>,
+        /// Selections that added to the budget, for `repeated_cost`; `None`
+        /// once the budget has been decided.
+        costs: Option<&'x mut Vec<SelectionCost>>,
+    },
+}
+
+impl DocTerms<'_, '_, '_> {
+    /// The term for `value`, or `None` when it nests deeper than `MAX_DEPTH`.
+    #[inline]
+    fn value_term(&mut self, value: &sonic_rs::Value, nodes: &mut usize) -> Option<ERL_NIF_TERM> {
+        match self {
+            DocTerms::Direct(env) => {
+                value_to_term(*env, value, MAX_DEPTH, nodes).map(|t| t.as_c_arg())
+            }
+            DocTerms::Built { builder, .. } => builder.value_term(value, nodes),
+        }
+    }
+
+    /// `value_term` for one of several selections, recording what it added
+    /// to the budget so a value several paths reach counts once.
+    #[inline]
+    fn selection_term(
+        &mut self,
+        value: &sonic_rs::Value,
+        nodes: &mut usize,
+    ) -> Option<ERL_NIF_TERM> {
+        let DocTerms::Built {
+            builder,
+            costs: Some(costs),
+        } = self
+        else {
+            return self.value_term(value, nodes);
+        };
+        let (borrowed, built) = (builder.borrowed(), *nodes);
+        let term = builder.value_term(value, nodes)?;
+        let cost = builder.borrowed() - borrowed + (*nodes - built) * BYTES_PER_NODE;
+        if cost > 0 {
+            // One allocation for a typical path list rather than three.
+            if costs.capacity() == 0 {
+                costs.reserve(16);
+            }
+            costs.push((value, cost));
+        }
+        Some(term)
+    }
+}
+
+/// Budget counted again for selections reaching a value an earlier one
+/// reached. Such a repeat builds an equal term over the same bytes, so it
+/// pins nothing more: counted, four paths to a container pinned a document
+/// one path left detached.
+#[cold]
+fn repeated_cost(costs: &mut [SelectionCost]) -> usize {
+    costs.sort_unstable_by_key(|&(value, _)| value);
+    costs
+        .windows(2)
+        .filter(|pair| pair[0].0 == pair[1].0)
+        .map(|pair| pair[1].1)
+        .sum()
+}
+
+/// Builds results from a parsed document with `build`. A buffered document's
+/// strings are borrowed unless `borrow_input` (a container counted by its
+/// nodes, a value several paths reach once) says no; then `build` reruns
+/// with copies, bounded by the results being small next to the document. A
+/// selection inside another one counts both times, an overlap the caller
+/// chose. Members a duplicate key dropped were counted too, but the input
+/// chose those, so then nothing borrows.
+#[inline]
+fn build_doc_results<'a, R>(
+    env: Env<'a>,
+    doc: &ParsedDocument,
+    nodes: &mut usize,
+    mut build: impl for<'x, 'b> FnMut(&mut DocTerms<'x, 'a, 'b>, &mut usize) -> R,
+) -> R {
+    let Some(buffer) = &doc.buffer else {
+        return build(&mut DocTerms::Direct(env), nodes);
+    };
+    let len = buffer.bytes().len();
+    let source = Source::Document(buffer);
+    with_term_builder(env, source, Strings::Borrow, Overflow::Float, |builder| {
+        let mut costs = Vec::new();
+        let result = build(
+            &mut DocTerms::Built {
+                builder: &mut *builder,
+                costs: Some(&mut costs),
+            },
+            nodes,
+        );
+        let borrowed = builder.borrowed();
+        let counted = borrowed + *nodes * BYTES_PER_NODE;
+        // A buffered document is over `BORROW_ANY_INPUT`, so with the counts
+        // unusable there is nothing left to justify borrowing. Repeats only
+        // lower the count, so they are looked for only when it would borrow.
+        if borrowed == 0
+            || (!builder.dropped_members()
+                && borrow_input(len, || counted)
+                && borrow_input(len, || counted - repeated_cost(&mut costs)))
+        {
+            return result;
+        }
+        builder.set_strings(Strings::Copy);
+        build(
+            &mut DocTerms::Built {
+                builder,
+                costs: None,
+            },
+            nodes,
+        )
+    })
+}
+
 #[rustler::nif]
 fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
     let ok_raw = atoms::ok().as_c_arg();
@@ -284,10 +411,12 @@ fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'
     let ntd_raw = atoms::nesting_too_deep().as_c_arg();
     let mut nodes = 0usize;
     let result = match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
-            Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
-            None => make_tuple2(env, err_raw, ntd_raw),
-        },
+        Some(value) => {
+            match build_doc_results(env, &doc, &mut nodes, |b, n| b.value_term(value, n)) {
+                Some(term) => make_tuple2(env, ok_raw, term),
+                None => make_tuple2(env, err_raw, ntd_raw),
+            }
+        }
         None => make_tuple2(env, err_raw, nsf_raw),
     };
     consume_timeslice_nodes(env, nodes);
@@ -305,14 +434,15 @@ struct ResultAtoms {
 #[inline]
 fn get_one_result(
     env: Env,
+    terms: &mut DocTerms,
     doc: &ParsedDocument,
     path: &str,
     atoms: &ResultAtoms,
     nodes: &mut usize,
 ) -> ERL_NIF_TERM {
     match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH, nodes) {
-            Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
+        Some(value) => match terms.selection_term(value, nodes) {
+            Some(term) => make_tuple2(env, atoms.ok, term).as_c_arg(),
             None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
         },
         None => make_tuple2(env, atoms.err, atoms.nsf).as_c_arg(),
@@ -323,7 +453,7 @@ fn get_one_result(
 fn get_many<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
-    paths: ListIterator<'a>,
+    paths: Term<'a>,
 ) -> NifResult<Term<'a>> {
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
@@ -332,16 +462,17 @@ fn get_many<'a>(
         ntd: atoms::nesting_too_deep().as_c_arg(),
     };
     let mut nodes = 0usize;
-    let mut acc = TermAcc::new();
-
-    for path_term in paths {
-        // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
-        let path: &str = path_term.decode()?;
-        acc.push(get_one_result(env, &doc, path, &result_atoms, &mut nodes));
-    }
-
+    let result = build_doc_results(env, &doc, &mut nodes, |terms, nodes| {
+        let mut acc = TermAcc::new();
+        for path_term in paths.into_list_iterator()? {
+            // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
+            let path: &str = path_term.decode()?;
+            acc.push(get_one_result(env, terms, &doc, path, &result_atoms, nodes));
+        }
+        Ok(acc.into_list(env))
+    });
     consume_timeslice_nodes(env, nodes);
-    Ok(acc.into_list(env))
+    result
 }
 
 #[rustler::nif]
@@ -455,60 +586,6 @@ fn plan_segs(
     })
 }
 
-/// Extract all compiled paths from an already-traversed `value` into a result
-/// list term, substituting nil for missing fields and depth-exceeded values.
-#[inline]
-fn extract_compiled<'a>(
-    env: Env<'a>,
-    value: &sonic_rs::Value,
-    compiled: &CompiledPaths,
-    nodes: &mut usize,
-) -> Term<'a> {
-    let nil_raw = atoms::nil().as_c_arg();
-    let mut acc = TermAcc::with_hint(compiled.paths.len());
-    for segs in compiled.paths.iter() {
-        let r = match pointer_lookup_compiled(value, segs, compiled.unique_keys) {
-            Some(v) => value_to_term(env, v, MAX_DEPTH, nodes)
-                .map(|t| t.as_c_arg())
-                .unwrap_or(nil_raw),
-            None => nil_raw,
-        };
-        acc.push(r);
-    }
-    acc.into_list(env)
-}
-
-/// Builds a string term, borrowing from `input` when requested and safe.
-#[inline]
-fn extracted_str_term(
-    env: Env,
-    input_term: ERL_NIF_TERM,
-    input: &[u8],
-    s: &str,
-    borrow: bool,
-) -> ERL_NIF_TERM {
-    // ERTS copies a slice this short onto the heap anyway, so building the
-    // heap binary here skips its sub-binary bookkeeping.
-    if borrow && s.len() > ERTS_ONHEAP_BINARY_LIMIT {
-        if let Some(offset) = (s.as_ptr() as usize).checked_sub(input.as_ptr() as usize) {
-            if let Some(room) = input.len().checked_sub(offset) {
-                if s.len() <= room {
-                    return unsafe {
-                        enif_make_sub_binary(env.as_c_arg(), input_term, offset, s.len())
-                    };
-                }
-            }
-        }
-    }
-    let mut binary = NewBinary::new(env, s.len());
-    binary.as_mut_slice().copy_from_slice(s.as_bytes());
-    let term: Term = binary.into();
-    term.as_c_arg()
-}
-
-/// ERTS keeps binaries up to this size on the process heap.
-const ERTS_ONHEAP_BINARY_LIMIT: usize = 64;
-
 /// Inputs at or under this are borrowed from whatever is taken out of them.
 /// A binary this size is a single allocation whose cost is about what the refc
 /// bookkeeping for one extracted string is, so refusing to pin it buys nothing
@@ -519,7 +596,7 @@ const BORROW_ANY_INPUT: usize = 4096;
 /// Otherwise, extracted strings must cover this fraction of the input.
 const BORROW_INPUT_FRACTION: usize = 4;
 
-/// Whether extracted strings should point into the caller's binary.
+/// Whether extracted values should point into the caller's binary.
 ///
 /// A sub-binary keeps the whole input alive for as long as any string cut from
 /// it survives. That is the trade `decode/1` makes and worth making there,
@@ -529,10 +606,11 @@ const BORROW_INPUT_FRACTION: usize = 4;
 /// all 400 KB of it, which `process_info(:binary)` reports and a bidder
 /// running a million of these a second pays for.
 ///
-/// ERTS copies a slice of 64 bytes or less onto the process heap, so only
-/// longer strings can pin anything at all; what is left is a per-call
-/// question, answered once for the batch rather than per string so that a
-/// result list is either all borrowed or all copied.
+/// The answer is per call rather than per string, so a result list is either
+/// all borrowed or all copied. It weighs what the results hold against the
+/// input they would keep alive, so every string counts, short ones that ERTS
+/// copies onto the heap included, and a selected container counts for its
+/// whole span.
 ///
 /// `borrowed_len` is called only for an input large enough for the answer to
 /// depend on it, so the request-shaped documents this path is tuned on never
@@ -541,6 +619,45 @@ const BORROW_INPUT_FRACTION: usize = 4;
 fn borrow_input(input_len: usize, borrowed_len: impl FnOnce() -> usize) -> bool {
     input_len <= BORROW_ANY_INPUT
         || borrowed_len().saturating_mul(BORROW_INPUT_FRACTION) >= input_len
+}
+
+/// Source bytes per built term, for charging the terms of a selected
+/// container by its span. See `NODES_PER_REDUCTION`.
+const BYTES_PER_NODE: usize = 8;
+
+/// Re-parses the selected containers with copied strings, returning each one's
+/// term by root index. Containers are built before the batch knows whether it
+/// may borrow. The answer is no when their spans total under a quarter of the
+/// input, or when a duplicate key dropped members from one; selected
+/// containers never nest, so this parse covers at most the input again. A
+/// repeated path shares its first occurrence's root, so it is skipped.
+#[cold]
+fn rebuild_copied(
+    bytes: &[u8],
+    plan: &sonic_rs::extract::ExtractPlan,
+    values: &[Option<sonic_rs::extract::Extracted>],
+    builder: &mut TermBuilder,
+) -> Vec<ERL_NIF_TERM> {
+    use sonic_rs::extract::Extracted;
+
+    let mut terms = builder.roots().to_vec();
+    builder.set_strings(Strings::Copy);
+    for (slot, v) in values.iter().enumerate() {
+        let Some(Extracted::Visited { root, start, end }) = v else {
+            continue;
+        };
+        if plan.is_repeat(slot) {
+            continue;
+        }
+        // These bytes already parsed once, so this cannot fail; if it somehow
+        // did, the borrowed term is still a correct value.
+        if sonic_rs::parse_into_visitor(&bytes[*start..*end], builder).is_ok() {
+            if let Some(&term) = builder.roots().last() {
+                terms[*root] = term;
+            }
+        }
+    }
+    terms
 }
 
 /// Parses once and returns the result term with the number of bytes reached.
@@ -567,52 +684,78 @@ fn do_parse_get_many_nil<'a>(
         Keys::Repeatable
     };
 
-    match sonic_rs::extract::extract(bytes, &compiled.plan, validate, keys) {
-        Ok(values) => {
-            let nil_raw = atoms::nil().as_c_arg();
-            // Decided once for the batch, so a result list is either all
-            // borrowed or all copied.
-            let borrow = borrow_input(bytes.len(), || {
-                values
-                    .iter()
-                    .map(|v| match v {
-                        Some(Extracted::Str(s)) => s.len(),
-                        _ => 0,
-                    })
-                    .sum()
-            });
-            // Consed from the back, so the list needs no staging buffer.
-            let mut list =
-                unsafe { enif_make_list_from_array(env.as_c_arg(), std::ptr::null(), 0) };
-            for v in values.iter().rev() {
-                let t = match v {
-                    // A string the parser never had to unescape is still in the
-                    // caller's binary, so the term can point at it rather than
-                    // pay a copy into a `Value` and another out of it - as long
-                    // as keeping the input behind it is worth that.
-                    Some(Extracted::Str(s)) => {
-                        extracted_str_term(env, input_term, bytes, s, borrow)
+    let source = Source::Binary {
+        term: input_term,
+        bytes,
+    };
+    with_term_builder(env, source, Strings::Borrow, Overflow::Float, |builder| {
+        let values =
+            match sonic_rs::extract::extract_with(bytes, &compiled.plan, validate, keys, builder) {
+                Ok(values) => values,
+                Err(e) => return builder_error_term(env, builder, &e),
+            };
+        let nil_raw = atoms::nil().as_c_arg();
+        // A repeated path's result is its first occurrence's term, so it adds
+        // neither borrowed bytes nor work. A container that lost members to a
+        // duplicate key spans bytes no result holds, so after one, containers
+        // add nothing either.
+        let spans_count = !builder.dropped_members();
+        let borrow = borrow_input(bytes.len(), || {
+            values
+                .iter()
+                .enumerate()
+                .filter(|&(slot, _)| !compiled.plan.is_repeat(slot))
+                .map(|(_, v)| match v {
+                    Some(Extracted::Str(s)) => s.len(),
+                    Some(Extracted::Visited { start, end, .. }) if spans_count => end - start,
+                    _ => 0,
+                })
+                .sum()
+        });
+        let rebuilt = (!borrow && builder.borrowed() > 0)
+            .then(|| rebuild_copied(bytes, &compiled.plan, &values, builder));
+        builder.set_strings(if borrow {
+            Strings::Borrow
+        } else {
+            Strings::Copy
+        });
+        // Consed from the back, so the list needs no staging buffer.
+        let mut list = unsafe { enif_make_list_from_array(env.as_c_arg(), std::ptr::null(), 0) };
+        for (slot, v) in values.iter().enumerate().rev() {
+            let t = match v {
+                // ERTS copies a slice this short onto the heap anyway, so
+                // building the heap binary here skips its sub-binary bookkeeping.
+                Some(Extracted::Str(s)) if s.len() <= HEAP_BINARY_MAX => {
+                    native_decode::copied_binary(env, s)
+                }
+                // A string the parser never had to unescape is still in the
+                // caller's binary, so the term can point at it rather than
+                // pay a copy into a `Value` and another out of it - as long
+                // as keeping the input behind it is worth that.
+                Some(Extracted::Str(s)) => builder.str_term(s),
+                Some(Extracted::Visited { root, start, end }) => {
+                    if !compiled.plan.is_repeat(slot) {
+                        *nodes += (end - start) / BYTES_PER_NODE;
                     }
-                    Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
-                    Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
-                    Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
-                    Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
-                    Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
-                    Some(Extracted::Raw(span)) => {
-                        native_decode::decode_span(env, input_term, bytes, span, borrow)
-                            .unwrap_or(nil_raw)
+                    match &rebuilt {
+                        Some(terms) => terms[*root],
+                        None => builder.roots()[*root],
                     }
-                    Some(Extracted::Value(v)) => value_to_term(env, v, MAX_DEPTH, nodes)
-                        .map(|t| t.as_c_arg())
-                        .unwrap_or(nil_raw),
-                    Some(Extracted::Null) | None => nil_raw,
-                };
-                list = unsafe { enif_make_list_cell(env.as_c_arg(), t, list) };
-            }
-            make_tuple2(env, atoms::ok().as_c_arg(), list)
+                }
+                Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
+                Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
+                Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
+                Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
+                Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
+                Some(Extracted::Value(v)) => value_to_term(env, v, MAX_DEPTH, nodes)
+                    .map(|t| t.as_c_arg())
+                    .unwrap_or(nil_raw),
+                Some(Extracted::Null) | None => nil_raw,
+            };
+            list = unsafe { enif_make_list_cell(env.as_c_arg(), t, list) };
         }
-        Err(e) => parse_error_term(env, &e),
-    }
+        make_tuple2(env, atoms::ok().as_c_arg(), list)
+    })
 }
 
 #[rustler::nif]
@@ -669,8 +812,19 @@ fn get_many_nil_compiled<'a>(
     doc: ResourceArc<ParsedDocument>,
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
+    let nil_raw = atoms::nil().as_c_arg();
     let mut nodes = 0usize;
-    let result = extract_compiled(env, &doc.value, &compiled, &mut nodes);
+    let result = build_doc_results(env, &doc, &mut nodes, |terms, nodes| {
+        let mut acc = TermAcc::with_hint(compiled.paths.len());
+        for segs in compiled.paths.iter() {
+            // Missing fields and depth-exceeded values both read as nil.
+            let r = pointer_lookup_compiled(&doc.value, segs, compiled.unique_keys)
+                .and_then(|v| terms.selection_term(v, nodes))
+                .unwrap_or(nil_raw);
+            acc.push(r);
+        }
+        acc.into_list(env)
+    });
     consume_timeslice_nodes(env, nodes);
     result
 }
@@ -679,27 +833,24 @@ fn get_many_nil_compiled<'a>(
 fn get_many_nil<'a>(
     env: Env<'a>,
     doc: ResourceArc<ParsedDocument>,
-    paths: ListIterator<'a>,
+    paths: Term<'a>,
 ) -> NifResult<Term<'a>> {
     let nil_raw = atoms::nil().as_c_arg();
     let mut nodes = 0usize;
-    let mut acc = TermAcc::new();
-
-    for path_term in paths {
-        // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
-        let path: &str = path_term.decode()?;
-        let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
-            Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
-                Some(term) => term.as_c_arg(),
-                None => nil_raw,
-            },
-            None => nil_raw,
-        };
-        acc.push(r);
-    }
-
+    let result = build_doc_results(env, &doc, &mut nodes, |terms, nodes| {
+        let mut acc = TermAcc::new();
+        for path_term in paths.into_list_iterator()? {
+            // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
+            let path: &str = path_term.decode()?;
+            let r = pointer_lookup(&doc.value, path, doc.unique_keys)
+                .and_then(|value| terms.selection_term(value, nodes))
+                .unwrap_or(nil_raw);
+            acc.push(r);
+        }
+        Ok(acc.into_list(env))
+    });
     consume_timeslice_nodes(env, nodes);
-    Ok(acc.into_list(env))
+    result
 }
 
 #[cfg(test)]

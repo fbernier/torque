@@ -357,6 +357,7 @@ Benchee.run(
 
 {:ok, pre_doc} = Torque.parse(sample_json)
 {:ok, pre_doc_uk} = Torque.parse(sample_json, unique_keys: true)
+pointers = Torque.compile_pointers(fields)
 
 IO.puts("\n=== GET BENCHMARK ===\n")
 
@@ -365,9 +366,56 @@ Benchee.run(
     "torque get" => fn -> for f <- fields, do: Torque.get(pre_doc, f) end,
     "torque get_many" => fn -> Torque.get_many(pre_doc, fields) end,
     "torque get_many_nil" => fn -> Torque.get_many_nil(pre_doc, fields) end,
+    "torque get_many_nil (compiled)" => fn -> Torque.get_many_nil(pre_doc, pointers) end,
     "torque get (unique_keys)" => fn -> for f <- fields, do: Torque.get(pre_doc_uk, f) end,
     "torque get_many (unique_keys)" => fn -> Torque.get_many(pre_doc_uk, fields) end,
     "torque get_many_nil (unique_keys)" => fn -> Torque.get_many_nil(pre_doc_uk, fields) end
+  },
+  warmup: 2,
+  time: 5,
+  memory_time: 2,
+  percentiles: [50, 95, 99],
+  formatters: [
+    {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+  ]
+)
+
+# A document over 4 KB keeps its input in a parse buffer, and get results are
+# built from it with decode/1's term builder.
+{:ok, large_doc} = Torque.parse(large_json)
+
+IO.puts("\n=== LARGE DOCUMENT GET BENCHMARK ===\n")
+
+Benchee.run(
+  %{
+    "torque get /statuses" => fn -> Torque.get(large_doc, "/statuses") end,
+    "torque get /statuses/0/user" => fn -> Torque.get(large_doc, "/statuses/0/user") end
+  },
+  warmup: 2,
+  time: 5,
+  memory_time: 2,
+  percentiles: [50, 95, 99],
+  formatters: [
+    {Benchee.Formatters.Console, percentiles: [50, 95, 99]}
+  ]
+)
+
+IO.puts("\n=== EXTRACT BENCHMARK ===\n")
+
+# Scalars stay on the extractor's own path; a selected container with no
+# deeper pointer goes through the term builder.
+scalar_pointers = Torque.compile_pointers(fields -- ["/site/cat", "/user/ext/eids", "/imp"])
+root_pointer = Torque.compile_pointers([""])
+
+Benchee.run(
+  %{
+    "torque parse_get_many_nil" => fn -> Torque.parse_get_many_nil(sample_json, pointers) end,
+    "torque parse_get_many_nil (scalars)" => fn ->
+      Torque.parse_get_many_nil(sample_json, scalar_pointers)
+    end,
+    "torque parse_get_many_nil (large root)" => fn ->
+      Torque.parse_get_many_nil(large_json, root_pointer)
+    end
   },
   warmup: 2,
   time: 5,

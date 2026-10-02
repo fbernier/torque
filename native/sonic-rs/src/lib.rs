@@ -74,4 +74,45 @@ where
     parser.parse_trailing()
 }
 
+/// Bytes the in-place parser reads past the end of the JSON.
+pub const PADDING: usize = 64;
+
+/// Writes `json` into `buffer`, exactly `PADDING` bytes longer, followed by
+/// the string terminator sentinel and zeroes the in-place parser stops on.
+pub fn pad_into(json: &[u8], buffer: &mut [u8]) {
+    let (body, padding) = buffer.split_at_mut(json.len());
+    body.copy_from_slice(json);
+    padding[..3].copy_from_slice(b"x\"x");
+    padding[3..].fill(0);
+}
+
+/// Parse `json` like [`from_slice`], but in place in `buffer`, the caller's
+/// [`pad_into`] copy of it: the value's strings, unescaped where they stand,
+/// point into `buffer`. Added for Torque's parsed documents.
+///
+/// # Safety
+///
+/// `buffer` must hold `pad_into(json, _)`'s output and stay allocated and
+/// unmodified while the returned `Value`, or any clone of it, lives.
+pub unsafe fn from_padded_in_place(buffer: &mut [u8], json: &[u8]) -> Result<Value> {
+    if json.len() > u32::MAX as usize {
+        return Err(crate::error::make_error(format!(
+            "Only support JSON less than 4 GB, the input JSON is too large here, len is {}",
+            json.len()
+        )));
+    }
+    use crate::reader::Reader;
+    // The same pre-scan, trailing check and UTF-8 verdict as `from_slice`.
+    let mut parser = crate::parser::Parser::new(Read::from(json));
+    let mut shared = std::sync::Arc::new(crate::value::shared::Shared::default());
+    std::sync::Arc::as_ptr(&shared).expose_provenance();
+    let smut = std::sync::Arc::get_mut(&mut shared).unwrap_unchecked();
+    let mut value = Value::new();
+    let n = value.parse_padded(buffer, json, Default::default(), smut)?;
+    parser.read.eat(n);
+    parser.parse_trailing()?;
+    parser.read.check_utf8_final()?;
+    Ok(value)
+}
+
 pub mod prelude;
