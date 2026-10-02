@@ -102,9 +102,45 @@ impl KeyCache {
     }
 }
 
+/// Largest map ERTS stores as a flatmap (`MAP_SMALL_MAP_LIMIT`).
+const FLATMAP_LIMIT: usize = 32;
+/// Below this, ERTS's sort is cheaper than checking the order ourselves.
+const MIN_ORDERED_MEMBERS: usize = 4;
+
+/// Sort key for an object member. `ptr` is null when the key bytes live in
+/// the parser's scratch buffer (escaped keys), which later strings overwrite.
+#[derive(Clone, Copy)]
+struct KeyOrd {
+    prefix: u64,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl KeyOrd {
+    /// Erlang orders binaries by bytes, then length, like `[u8]`'s `Ord`.
+    #[inline]
+    fn lt(&self, other: &KeyOrd) -> bool {
+        if self.prefix != other.prefix {
+            return self.prefix < other.prefix;
+        }
+        // SAFETY: both point into the input binary, which outlives the call.
+        unsafe {
+            std::slice::from_raw_parts(self.ptr, self.len)
+                < std::slice::from_raw_parts(other.ptr, other.len)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Frame {
+    values: usize,
+    ords: usize,
+}
+
 struct DecodeBufs {
     values: Vec<ERL_NIF_TERM>,
-    frames: Vec<usize>,
+    frames: Vec<Frame>,
+    ords: Vec<KeyOrd>,
     keys: KeyCache,
 }
 
@@ -117,6 +153,7 @@ thread_local! {
     static DECODE_BUFS: RefCell<DecodeBufs> = RefCell::new(DecodeBufs {
         values: Vec::with_capacity(64),
         frames: Vec::with_capacity(16),
+        ords: Vec::with_capacity(64),
         keys: KeyCache::new(),
     });
 }
@@ -145,8 +182,10 @@ struct TermBuilder<'a, 'b> {
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
     values: &'b mut Vec<ERL_NIF_TERM>,
-    /// `values` index where each currently-open container's children begin.
-    frames: &'b mut Vec<usize>,
+    /// Where each currently-open container's children begin in `values`,
+    /// and its members' sort keys in `ords`.
+    frames: &'b mut Vec<Frame>,
+    ords: &'b mut Vec<KeyOrd>,
     keys: &'b mut KeyCache,
     too_deep: bool,
 }
@@ -177,23 +216,16 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     /// Only borrowed keys qualify: an escaped key's bytes live in the parser's
     /// scratch buffer, which later strings overwrite, so its pointer can't be
     /// used as a cache identity. Those (rare) keys fall back to `str_term`.
-    /// The `len.max(8)` bound keeps the unaligned prefix load in-bounds; a key
-    /// inside the final 8 bytes of the document (impossible in valid JSON,
-    /// which needs at least `":x}` after it) just falls back.
+    /// `wide` says the key starts at least 8 bytes before the end of the input,
+    /// so `prefix` came from one unaligned load; a key inside the final 8 bytes
+    /// of the document (impossible in valid JSON, which needs at least `":x}`
+    /// after it) just falls back.
     #[inline]
-    fn key_term(&mut self, s: &str) -> ERL_NIF_TERM {
+    fn key_term(&mut self, s: &str, wide: bool, prefix: u64) -> ERL_NIF_TERM {
         let ptr = s.as_ptr();
         let len = s.len();
-        if self.keys.debit > KEY_CACHE_BYPASS_AT || len == 0 || len > KEY_CACHE_MAX_LEN {
+        if !wide || self.keys.debit > KEY_CACHE_BYPASS_AT || len == 0 || len > KEY_CACHE_MAX_LEN {
             return self.str_term(s);
-        }
-        match self.input.offset_within(s) {
-            Some(offset) if self.input.len - offset >= 8 => {}
-            _ => return self.str_term(s),
-        }
-        let mut prefix = unsafe { (ptr as *const u64).read_unaligned() };
-        if len < 8 {
-            prefix &= (1u64 << (len * 8)) - 1;
         }
         let h = (prefix ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
@@ -225,11 +257,58 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     }
 }
 
+/// Stable insertion sort of member indices into Erlang term order, or `None`
+/// when the members are already ordered or a key can't be compared here.
+///
+/// ERTS sorts flatmap keys itself (`erts_validate_and_sort_flatmap`) with an
+/// insertion sort over generic term comparisons, O(n²) unless the keys arrive
+/// in term order. JSON producers other than the BEAM emit schema order, so
+/// sorting on raw key bytes first leaves ERTS a linear validation pass.
+#[inline]
+fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
+    // Sorted neighbours often share 8 bytes (`in_reply_to_status_id`,
+    // `in_reply_to_status_id_str`); compare those in full rather than
+    // sorting to find nothing moved.
+    let ordered = ords.windows(2).all(|w| {
+        w[0].prefix < w[1].prefix
+            || (w[0].prefix == w[1].prefix
+                && !w[0].ptr.is_null()
+                && !w[1].ptr.is_null()
+                && w[0].lt(&w[1]))
+    });
+    if ordered || ords.iter().any(|o| o.ptr.is_null()) {
+        return None;
+    }
+    let mut perm = [0u8; FLATMAP_LIMIT];
+    let mut moved = false;
+    for i in 0..ords.len() {
+        let mut j = i;
+        while j > 0 && ords[i].lt(&ords[perm[j - 1] as usize]) {
+            perm[j] = perm[j - 1];
+            j -= 1;
+        }
+        moved |= j != i;
+        perm[j] = i as u8;
+    }
+    moved.then_some(perm)
+}
+
 /// Build a map term from interleaved `[k0, v0, k1, v1, ...]` children.
 /// De-interleaves into separate key/value arrays for `enif_make_map_from_arrays`.
 #[inline]
-fn build_map(env: Env, kv: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+fn build_map(env: Env, kv: &[ERL_NIF_TERM], ords: &[KeyOrd]) -> ERL_NIF_TERM {
     let pairs = kv.len() / 2;
+    if (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&pairs) && ords.len() == pairs {
+        if let Some(perm) = member_order(ords) {
+            let mut keys = [0 as ERL_NIF_TERM; FLATMAP_LIMIT];
+            let mut vals = [0 as ERL_NIF_TERM; FLATMAP_LIMIT];
+            for (slot, &i) in perm[..pairs].iter().enumerate() {
+                keys[slot] = kv[2 * i as usize];
+                vals[slot] = kv[2 * i as usize + 1];
+            }
+            return make_map(env, &keys[..pairs], &vals[..pairs]);
+        }
+    }
     if pairs <= STACK_SIZE {
         let mut keys: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
         let mut vals: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] = [MaybeUninit::uninit(); STACK_SIZE];
@@ -408,7 +487,33 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
     #[inline]
     fn visit_key(&mut self, key: &str) -> bool {
-        let t = self.key_term(key);
+        let len = key.len();
+        let offset = self.input.offset_within(key);
+        let wide = matches!(offset, Some(o) if self.input.len - o >= 8);
+        // First 8 key bytes, little-endian and zero-padded.
+        let prefix = if wide {
+            let w = unsafe { (key.as_ptr() as *const u64).read_unaligned() };
+            if len < 8 {
+                w & ((1u64 << (len * 8)) - 1)
+            } else {
+                w
+            }
+        } else {
+            let mut b = [0u8; 8];
+            let n = len.min(8);
+            b[..n].copy_from_slice(&key.as_bytes()[..n]);
+            u64::from_le_bytes(b)
+        };
+        self.ords.push(KeyOrd {
+            prefix: prefix.swap_bytes(),
+            ptr: if offset.is_some() {
+                key.as_ptr()
+            } else {
+                std::ptr::null()
+            },
+            len,
+        });
+        let t = self.key_term(key, wide, prefix);
         self.push(t);
         true
     }
@@ -419,14 +524,17 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             self.too_deep = true;
             return false;
         }
-        self.frames.push(self.values.len());
+        self.frames.push(Frame {
+            values: self.values.len(),
+            ords: self.ords.len(),
+        });
         true
     }
 
     #[inline]
     fn visit_array_end(&mut self, _len: usize) -> bool {
         let start = match self.frames.pop() {
-            Some(s) => s,
+            Some(f) => f.values,
             None => return false,
         };
         let count = (self.values.len() - start) as u32;
@@ -444,17 +552,22 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             self.too_deep = true;
             return false;
         }
-        self.frames.push(self.values.len());
+        self.frames.push(Frame {
+            values: self.values.len(),
+            ords: self.ords.len(),
+        });
         true
     }
 
     #[inline]
     fn visit_object_end(&mut self, _len: usize) -> bool {
-        let start = match self.frames.pop() {
-            Some(s) => s,
+        let frame = match self.frames.pop() {
+            Some(f) => f,
             None => return false,
         };
-        let map = build_map(self.env, &self.values[start..]);
+        let start = frame.values;
+        let map = build_map(self.env, &self.values[start..], &self.ords[frame.ords..]);
+        self.ords.truncate(frame.ords);
         self.values.truncate(start);
         self.values.push(map);
         true
@@ -467,10 +580,12 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
         let DecodeBufs {
             values,
             frames,
+            ords,
             keys,
         } = &mut *bufs;
         values.clear();
         frames.clear();
+        ords.clear();
         keys.next_epoch();
         let mut builder = TermBuilder {
             env,
@@ -481,6 +596,7 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
             },
             values,
             frames,
+            ords,
             keys,
             too_deep: false,
         };
