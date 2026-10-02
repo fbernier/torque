@@ -112,6 +112,7 @@ Strings go through `escape.rs`'s `write_json_string`, which reserves once for th
 
 Atom names are read as Latin-1 into a stack buffer, because `ERL_NIF_UTF8` needs NIF 2.17 and the NIF still loads on 2.15. A name with any character above U+00FF makes that read fail, so those atoms go through `enif_term_to_binary` and the name is taken from the `SMALL_ATOM_UTF8_EXT` / `ATOM_UTF8_EXT` payload instead. Only the names the Latin-1 read rejects pay for that binary.
 
+A name that fits in 32 quoted, escaped bytes is read once per scheduler thread: `AtomNames` in `encoder.rs` keeps that spelling in a 512-slot table indexed by atom-table index and keyed by the raw term. Atoms are never garbage collected, so an entry stays valid for the life of the VM, and raw terms of different types never compare equal, so a hit needs no type check. It took atom keys from ~61% slower than binary keys to ~10% faster than them. The table rides in the same thread-local `Scratch` as the output buffer, and the encoder passes `&mut Scratch` down the recursion rather than the buffer and the table separately: the extra argument spilled the map iterator's terms around `enif_map_iterator_next` and cost 18% on small binary-keyed maps.
 
 ### Scheduler Awareness
 
