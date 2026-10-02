@@ -255,14 +255,20 @@ Functions return `{:error, reason}` tuples (or raise `ArgumentError` for bang/io
 Per-commit trends and the full cross-library comparison are published at
 [lpgauth.github.io/torque/dev/bench](https://lpgauth.github.io/torque/dev/bench/).
 
-Apple M1 Pro, OTP 29, Elixir 1.20. Both libraries are profile-guided
-optimised (PGO) builds: **Torque PGO** (via `scripts/pgo-build.sh`) and
-**Glazer PGO** (via `make -C deps/glazer/c_src PGO=generate`, the workload in
+Every table below comes from one run of `bench/torque_bench.exs`, against
+glazer 1.1.5, on each of two machines:
+
+- **arm64**: Apple M1 Pro, macOS, OTP 29, Elixir 1.20.3, Apple clang 21, rustc 1.98.1
+- **x86_64**: Intel Xeon E5-2630 v3 (Haswell, 2.4 GHz), Ubuntu 22.04 container pinned to one core of a shared server, OTP 29, Elixir 1.20.2, GCC 13.4, rustc 1.99.0
+
+Both libraries are profile-guided optimised (PGO) builds on both machines:
+**Torque PGO** (via `scripts/pgo-build.sh`, which builds with
+`-C target-cpu=native`) and **Glazer PGO** (via
+`make -C deps/glazer/c_src PGO=generate`, the workload in
 `bench/glazer_pgo_workload.exs`, then `PGO=use`). Glazer's Makefile writes that
 flow for GCC; under clang the raw counters need an explicit
 `llvm-profdata merge -o obj/pgo/default.profdata obj/pgo/*.profraw` between
-those two steps. Every table below comes from one run of
-`bench/torque_bench.exs`.
+those two steps.
 
 glazer is benchmarked with UTF-8 validation enabled (`validate_utf8` on
 decode, `force_utf8` on encode — both off by default in glazer) so every
@@ -271,60 +277,127 @@ valid UTF-8.
 
 ### Decode (1.2 KB OpenRTB)
 
+**arm64**
+
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** | **411.0K** | **2.43 μs** | **2.33 μs** | **2.96 μs** | 1.56 KB |
-| **glazer** | 348.4K | 2.87 μs | 2.79 μs | 3.42 μs | 1.56 KB |
-| **jiffy** | 201.5K | 4.96 μs | 4.63 μs | 9.79 μs | **1.55 KB** |
-| **otp json** | 124.4K | 8.04 μs | 7.08 μs | 19.96 μs | 7.73 KB |
-| **jason** | 102.3K | 9.78 μs | 9.25 μs | 17.50 μs | 9.54 KB |
+| **torque** | **400.0K** | **2.50 μs** | **2.38 μs** | **2.88 μs** | 1.56 KB |
+| **glazer** | 349.1K | 2.86 μs | 2.75 μs | 4.04 μs | 1.56 KB |
+| **jiffy** | 202.4K | 4.94 μs | 4.58 μs | 8.75 μs | **1.55 KB** |
+| **otp json** | 137.8K | 7.25 μs | 7.00 μs | 12.17 μs | 7.73 KB |
+| **jason** | 103.2K | 9.69 μs | 9.17 μs | 16.04 μs | 9.54 KB |
+
+**x86_64**
+
+| Library | ips | mean | median | p99 | memory |
+|---|---|---|---|---|---|
+| **torque** | **173.0K** | **5.78 μs** | **5.54 μs** | **9.07 μs** | 1.56 KB |
+| **glazer** | 170.3K | 5.87 μs | 5.62 μs | 9.38 μs | 1.56 KB |
+| **jiffy** | 90.2K | 11.09 μs | 9.61 μs | 21.53 μs | **1.55 KB** |
+| **otp json** | 60.5K | 16.53 μs | 16.12 μs | 25.60 μs | 7.73 KB |
+| **jason** | 52.4K | 19.09 μs | 18.42 μs | 29.91 μs | 9.46 KB |
 
 ### Decode (750 KB Twitter)
 
+**arm64**
+
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** | **710.6** | **1.41 ms** | **1.28 ms** | **1.85 ms** | **1.57 KB** |
-| **glazer** | 581.6 | 1.72 ms | 1.63 ms | 2.16 ms | 1.58 KB |
-| **jiffy** | 295.6 | 3.38 ms | 3.49 ms | 3.82 ms | 2.30 MB |
-| **otp json** | 202.1 | 4.95 ms | 5.01 ms | 5.63 ms | 2.48 MB |
-| **jason** | 139.2 | 7.18 ms | 7.08 ms | 8.32 ms | 3.54 MB |
+| **torque** | **685.2** | **1.46 ms** | **1.34 ms** | **1.91 ms** | **1.57 KB** |
+| **glazer** | 577.3 | 1.73 ms | 1.65 ms | 2.15 ms | 1.58 KB |
+| **jiffy** | 294.8 | 3.39 ms | 3.49 ms | 3.85 ms | 2.30 MB |
+| **otp json** | 202.2 | 4.94 ms | 4.94 ms | 5.97 ms | 2.48 MB |
+| **jason** | 122.1 | 8.19 ms | 8.17 ms | 8.74 ms | 3.52 MB |
+
+**x86_64**
+
+| Library | ips | mean | median | p99 | memory |
+|---|---|---|---|---|---|
+| **torque** | **347.1** | **2.88 ms** | **2.93 ms** | 3.77 ms | **1.57 KB** |
+| **glazer** | 337.8 | 2.96 ms | 3.00 ms | **3.76 ms** | 1.58 KB |
+| **jiffy** | 132.8 | 7.53 ms | 8.29 ms | 8.81 ms | 2.30 MB |
+| **otp json** | 88.3 | 11.32 ms | 11.40 ms | 14.63 ms | 2.48 MB |
+| **jason** | 71.9 | 13.90 ms | 13.77 ms | 15.79 ms | 3.54 MB |
 
 ### Encode (1.2 KB OpenRTB)
 
+**arm64**
+
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: iodata()] | **1400K** | **0.71 μs** | **0.67 μs** | **0.79 μs** | **64 B** |
-| **torque** [proplist() :: binary()] | 1360K | 0.73 μs | **0.67 μs** | **0.79 μs** | 88 B |
-| **torque** [map() :: binary()] | 1200K | 0.84 μs | 0.75 μs | 1.00 μs | 88 B |
-| **torque** [map() :: iodata()] | 1190K | 0.84 μs | 0.75 μs | 0.96 μs | **64 B** |
-| **otp json** [map() :: iodata()] | 1110K | 0.90 μs | 0.83 μs | 1.17 μs | 3928 B |
-| **glazer** [map() :: binary()] | 1070K | 0.93 μs | 0.83 μs | 1.17 μs | **64 B** |
-| **jiffy** [proplist() :: iodata()] | 850K | 1.18 μs | 1.04 μs | 1.29 μs | 120 B |
-| **jiffy** [map() :: iodata()] | 680K | 1.47 μs | 1.33 μs | 1.58 μs | 632 B |
-| **jason** [map() :: iodata()] | 590K | 1.70 μs | 1.63 μs | 2.63 μs | 3848 B |
-| **jason** [map() :: binary()] | 370K | 2.71 μs | 2.54 μs | 4.67 μs | 3912 B |
+| **torque** [proplist() :: binary()] | **1460K** | **0.68 μs** | **0.63 μs** | **0.75 μs** | 88 B |
+| **torque** [proplist() :: iodata()] | 1430K | 0.70 μs | **0.63 μs** | 0.79 μs | **64 B** |
+| **torque** [map() :: binary()] | 1390K | 0.72 μs | 0.67 μs | 0.79 μs | 88 B |
+| **torque** [map() :: iodata()] | 1370K | 0.73 μs | 0.67 μs | **0.75 μs** | **64 B** |
+| **otp json** [map() :: iodata()] | 1110K | 0.90 μs | 0.83 μs | 1.17 μs | 3.84 KB |
+| **glazer** [map() :: binary()] | 1010K | 0.99 μs | 0.83 μs | 1.04 μs | **64 B** |
+| **jiffy** [proplist() :: iodata()] | 830K | 1.20 μs | 1.04 μs | 1.29 μs | 120 B |
+| **jiffy** [map() :: iodata()] | 670K | 1.50 μs | 1.33 μs | 1.63 μs | 632 B |
+| **jason** [map() :: iodata()] | 580K | 1.72 μs | 1.63 μs | 2.67 μs | 3.76 KB |
+| **jason** [map() :: binary()] | 380K | 2.65 μs | 2.50 μs | 4.50 μs | 3.82 KB |
+
+**x86_64**
+
+| Library | ips | mean | median | p99 | memory |
+|---|---|---|---|---|---|
+| **torque** [proplist() :: iodata()] | **709.8K** | **1.41 μs** | **1.26 μs** | **1.64 μs** | **64 B** |
+| **torque** [proplist() :: binary()] | 708.0K | **1.41 μs** | **1.26 μs** | 1.67 μs | 88 B |
+| **torque** [map() :: iodata()] | 624.9K | 1.60 μs | 1.46 μs | 1.76 μs | **64 B** |
+| **torque** [map() :: binary()] | 615.4K | 1.63 μs | 1.49 μs | 1.77 μs | 88 B |
+| **glazer** [map() :: binary()] | 479.1K | 2.09 μs | 1.92 μs | 2.63 μs | **64 B** |
+| **otp json** [map() :: iodata()] | 429.8K | 2.33 μs | 2.05 μs | 3.32 μs | 3.84 KB |
+| **jiffy** [proplist() :: iodata()] | 414.4K | 2.41 μs | 2.03 μs | 3.03 μs | 120 B |
+| **jiffy** [map() :: iodata()] | 344.2K | 2.91 μs | 2.55 μs | 3.51 μs | 632 B |
+| **jason** [map() :: iodata()] | 221.9K | 4.51 μs | 3.43 μs | 6.73 μs | 3.76 KB |
+| **jason** [map() :: binary()] | 184.8K | 5.41 μs | 4.92 μs | 9.77 μs | 3.82 KB |
 
 ### Encode (750 KB Twitter)
 
+**arm64**
+
 | Library | ips | mean | median | p99 | memory |
 |---|---|---|---|---|---|
-| **torque** [proplist() :: binary()] | **1604.8** | **0.62 ms** | **0.61 ms** | **0.73 ms** | 88 B |
-| **torque** [proplist() :: iodata()] | 1533.6 | 0.65 ms | **0.61 ms** | 0.79 ms | **64 B** |
-| **torque** [map() :: iodata()] | 1421.5 | 0.70 ms | 0.69 ms | 0.82 ms | **64 B** |
-| **torque** [map() :: binary()] | 1420.4 | 0.70 ms | 0.69 ms | 0.84 ms | 88 B |
-| **glazer** [map() :: binary()] | 872.6 | 1.15 ms | 1.14 ms | 1.34 ms | **64 B** |
-| **jiffy** [proplist() :: iodata()] | 607.8 | 1.65 ms | 1.63 ms | 1.86 ms | 2.97 KB |
-| **jiffy** [map() :: iodata()] | 439.4 | 2.28 ms | 2.16 ms | 2.81 ms | 803 KB |
-| **otp json** [map() :: iodata()] | 256.9 | 3.89 ms | 4.03 ms | 5.20 ms | 5.40 MB |
-| **jason** [map() :: iodata()] | 243.5 | 4.11 ms | 3.79 ms | 6.72 ms | 4.96 MB |
-| **jason** [map() :: binary()] | 128.3 | 7.79 ms | 7.56 ms | 9.57 ms | 4.96 MB |
+| **torque** [proplist() :: iodata()] | **1640.2** | **0.61 ms** | **0.60 ms** | **0.72 ms** | **64 B** |
+| **torque** [proplist() :: binary()] | 1629.3 | **0.61 ms** | **0.60 ms** | 0.75 ms | 88 B |
+| **torque** [map() :: iodata()] | 1511.6 | 0.66 ms | 0.65 ms | 0.76 ms | **64 B** |
+| **torque** [map() :: binary()] | 1509.7 | 0.66 ms | 0.65 ms | 0.78 ms | 88 B |
+| **glazer** [map() :: binary()] | 857.7 | 1.17 ms | 1.16 ms | 1.36 ms | **64 B** |
+| **jiffy** [proplist() :: iodata()] | 614.5 | 1.63 ms | 1.62 ms | 1.85 ms | 2.97 KB |
+| **jiffy** [map() :: iodata()] | 504.0 | 1.98 ms | 1.97 ms | 2.15 ms | 803.19 KB |
+| **otp json** [map() :: iodata()] | 263.6 | 3.79 ms | 3.81 ms | 5.04 ms | 5.40 MB |
+| **jason** [map() :: iodata()] | 248.4 | 4.03 ms | 3.74 ms | 6.28 ms | 4.96 MB |
+| **jason** [map() :: binary()] | 132.8 | 7.53 ms | 7.46 ms | 8.58 ms | 4.96 MB |
+
+**x86_64**
+
+| Library | ips | mean | median | p99 | memory |
+|---|---|---|---|---|---|
+| **torque** [proplist() :: binary()] | **772.9** | **1.29 ms** | **1.35 ms** | **2.32 ms** | 88 B |
+| **torque** [proplist() :: iodata()] | 772.6 | **1.29 ms** | **1.35 ms** | 2.36 ms | **64 B** |
+| **torque** [map() :: iodata()] | 641.6 | 1.56 ms | 1.61 ms | 2.60 ms | **64 B** |
+| **torque** [map() :: binary()] | 606.8 | 1.65 ms | 1.70 ms | 2.72 ms | 88 B |
+| **jiffy** [proplist() :: iodata()] | 377.8 | 2.65 ms | 2.54 ms | 3.33 ms | 2.97 KB |
+| **glazer** [map() :: binary()] | 367.8 | 2.72 ms | 2.78 ms | 4.07 ms | **64 B** |
+| **jiffy** [map() :: iodata()] | 257.0 | 3.89 ms | 3.70 ms | 5.37 ms | 803.19 KB |
+| **otp json** [map() :: iodata()] | 107.6 | 9.30 ms | 9.59 ms | 11.95 ms | 5.40 MB |
+| **jason** [map() :: iodata()] | 73.7 | 13.56 ms | 13.57 ms | 15.73 ms | 4.96 MB |
+| **jason** [map() :: binary()] | 58.2 | 17.17 ms | 17.25 ms | 19.61 ms | 4.96 MB |
 
 ### Parse (1.2 KB OpenRTB)
 
+**arm64**
+
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse | **585.5K** | **1.71 μs** | **1.38 μs** | 3.50 μs |
-| **torque** parse(unique_keys) | 578.9K | 1.73 μs | **1.38 μs** | **2.96 μs** |
+| **torque** parse | **633.7K** | **1.58 μs** | **1.33 μs** | **3.08 μs** |
+| **torque** parse(unique_keys) | 593.1K | 1.69 μs | 1.38 μs | **3.08 μs** |
+
+**x86_64**
+
+| Library | ips | mean | median | p99 |
+|---|---|---|---|---|
+| **torque** parse(unique_keys) | **220.9K** | **4.53 μs** | 3.66 μs | **7.35 μs** |
+| **torque** parse | 219.6K | 4.55 μs | **3.58 μs** | 13.27 μs |
 
 ### Extract 5 fields from raw JSON (1.2 KB OpenRTB)
 
@@ -339,15 +412,29 @@ builds a value only where a path ends, so no document is built at all.
 `validate: false` also skips validating the regions no path selects, which on
 a document this small is most of what is left.
 
+**arm64**
+
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse_get_many_nil unique_keys validate: false | **1363K** | **0.73 μs** | **0.71 μs** | **0.83 μs** |
-| **torque** parse_get_many_nil unique_keys | 705.8K | 1.42 μs | 1.38 μs | 1.58 μs |
-| **torque** parse_get_many_nil | 699.3K | 1.43 μs | 1.38 μs | 1.58 μs |
-| **torque** parse(unique_keys) + get_many | 486.0K | 2.06 μs | 1.79 μs | 4.13 μs |
-| **torque** parse + get_many | 468.6K | 2.13 μs | 1.75 μs | 3.88 μs |
-| **torque** parse + get x5 | 464.0K | 2.16 μs | 1.92 μs | 4.04 μs |
-| **glazer** decode + find x5 | 312.4K | 3.20 μs | 3.08 μs | 4.38 μs |
+| **torque** parse_get_many_nil unique_keys validate: false | **1379K** | **0.73 μs** | **0.71 μs** | **0.83 μs** |
+| **torque** parse_get_many_nil unique_keys | 723.8K | 1.38 μs | 1.33 μs | 1.50 μs |
+| **torque** parse_get_many_nil | 694.5K | 1.44 μs | 1.33 μs | 1.67 μs |
+| **torque** parse(unique_keys) + get_many | 504.8K | 1.98 μs | 1.75 μs | 3.58 μs |
+| **torque** parse + get x5 | 482.6K | 2.07 μs | 1.83 μs | 4.00 μs |
+| **torque** parse + get_many | 482.4K | 2.07 μs | 1.71 μs | 3.33 μs |
+| **glazer** decode + find x5 | 315.7K | 3.17 μs | 3.08 μs | 4.33 μs |
+
+**x86_64**
+
+| Library | ips | mean | median | p99 |
+|---|---|---|---|---|
+| **torque** parse_get_many_nil unique_keys validate: false | **933.0K** | **1.07 μs** | **0.98 μs** | **1.63 μs** |
+| **torque** parse_get_many_nil unique_keys | 533.3K | 1.87 μs | 1.77 μs | 2.44 μs |
+| **torque** parse_get_many_nil | 533.1K | 1.88 μs | 1.78 μs | 2.44 μs |
+| **torque** parse(unique_keys) + get_many | 187.3K | 5.34 μs | 4.05 μs | 14.88 μs |
+| **torque** parse + get x5 | 181.1K | 5.52 μs | 4.85 μs | 12.84 μs |
+| **torque** parse + get_many | 171.8K | 5.82 μs | 4.80 μs | 10.15 μs |
+| **glazer** decode + find x5 | 152.3K | 6.57 μs | 6.31 μs | 11.41 μs |
 
 Run benchmarks locally:
 
