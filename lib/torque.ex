@@ -406,6 +406,12 @@ defmodule Torque do
 
   Automatically uses a dirty CPU scheduler for inputs larger than 20 KB.
 
+  Strings in results taken from a document over 4 KB can be sub-binaries of
+  a copy of `json` that the document holds, so they keep that copy alive
+  after the document is gone. That happens only when the results of a call
+  cover about a quarter of the document or more; `:binary.copy/1` detaches a
+  string that outlives it.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"a":1}))

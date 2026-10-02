@@ -19,7 +19,11 @@
 #   * `Error::is_recursion_limit` so the NIF can classify the nesting-limit
 #     error without matching its message
 #   * `extract` module: one-pass extraction of a compiled path set that
-#     builds values only where a path ends and skips the rest
+#     builds values only where a path ends and skips the rest; `extract_with`
+#     parses selected containers through a caller's `JsonVisitor` instead, and
+#     `ExtractPlan::is_repeat` tells a repeated path's shared slot apart
+#   * `pad_into` + `from_padded_in_place`: parse a document in a padded buffer
+#     the caller owns, so its strings can be handed out as slices of it
 #   * `Read` caches the pinned input's slice pointer: resolving it through the
 #     `PinnedInput` enum stopped inlining inside the skip paths
 #   * checked `skip_string` scans with `StringBlock` like `parse_string_raw`,

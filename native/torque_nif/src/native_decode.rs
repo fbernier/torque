@@ -21,11 +21,20 @@ use crate::atoms;
 use crate::decoder::parse_error_term;
 use crate::nif_util::{make_tuple2, map_from_arrays};
 use crate::types::MAX_DEPTH;
+use crate::ParseBuffer;
 
-/// Cap on the retained thread-local value stack (in terms, 8 bytes each ≈ 1 MB),
-/// so a one-off huge document doesn't pin a large allocation on a scheduler
-/// thread indefinitely. Mirrors the encoder's `BUF_RETAIN_CAP`.
-const VALUES_RETAIN_CAP: usize = 1 << 17;
+/// Cap on each retained thread-local stack, in entries, so a one-off huge
+/// document doesn't pin a large allocation on a scheduler thread.
+const STACK_RETAIN_CAP: usize = 1 << 17;
+
+/// Empties a stack and caps its capacity. Emptying first matters: `shrink_to`
+/// cannot go below the length, and a build can leave any number of roots.
+fn release<T>(stack: &mut Vec<T>) {
+    stack.clear();
+    if stack.capacity() > STACK_RETAIN_CAP {
+        stack.shrink_to(STACK_RETAIN_CAP);
+    }
+}
 
 const KEY_CACHE_SLOTS: usize = 256;
 /// Longest key eligible for caching; bounds the byte-compare on lookup.
@@ -54,7 +63,7 @@ struct KeyEntry {
 /// within the env of the call that made them.
 ///
 /// Cached keys are built as *copied* heap binaries rather than sub-binaries.
-/// On OTP 28+ this matches what `enif_make_sub_binary` does anyway (slices
+/// On OTP 27+ this matches what `enif_make_sub_binary` does anyway (slices
 /// ≤ 64 bytes are copied on-heap); on older OTPs it avoids real sub-binaries
 /// that would pin the whole input binary via the decoded map's keys. The copy
 /// is once per distinct key per call — amortized by the cache.
@@ -159,32 +168,89 @@ thread_local! {
     });
 }
 
-struct InputRef {
+/// Where the strings a builder may borrow live.
+pub(crate) enum Source<'r> {
+    /// The binary term `term`, whose bytes are `bytes`.
+    Binary { term: ERL_NIF_TERM, bytes: &'r [u8] },
+    /// A parsed document's buffer, made a binary term of the caller's
+    /// environment only once a string is taken from it, so gets of numbers
+    /// and literals skip the copy.
+    Document(&'r ParseBuffer),
+}
+
+struct InputRef<'b> {
+    /// 0 until a `Source::Document` buffer is first referenced.
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
-    /// Whether strings may be sub-binaries of `term`; otherwise they are copied.
-    borrow: bool,
+    document: Option<&'b ParseBuffer>,
 }
 
-impl InputRef {
+impl InputRef<'_> {
     /// Offset of `s` when its entire span lies inside the input. Integer
     /// arithmetic on purpose: `s` may point into the parser's scratch buffer,
     /// a different allocation, where `offset_from` would be undefined.
     #[inline]
     fn offset_within(&self, s: &str) -> Option<usize> {
-        if !self.borrow {
-            return None;
-        }
         let offset = (s.as_ptr() as usize).checked_sub(self.base as usize)?;
         let room = self.len.checked_sub(offset)?;
         (s.len() <= room).then_some(offset)
     }
+
+    #[cold]
+    fn make_term(&mut self, env: Env) -> ERL_NIF_TERM {
+        if let Some(document) = self.document {
+            self.term = document.term_in(env);
+        }
+        self.term
+    }
 }
 
-struct TermBuilder<'a, 'b> {
+/// How the builder spells a string that lies inside the input binary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Strings {
+    /// A sub-binary of the input, which may keep the input alive.
+    Borrow,
+    /// A fresh binary.
+    Copy,
+}
+
+/// How the builder spells an integer literal outside the i64/u64 range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Overflow {
+    /// An exact bignum, which `decode/1` returns.
+    Bignum,
+    /// The nearest float, as a sonic-rs `Value` holds it. Extraction and get
+    /// mix both builders depending on which other pointers were asked for,
+    /// so they must agree.
+    Float,
+}
+
+/// Longest slice ERTS copies onto the heap for a sub-binary, since OTP 27.
+/// Before that, a sub-binary of any length references its source.
+pub(crate) const HEAP_BINARY_MAX: usize = 64;
+
+/// A fresh binary holding `s`.
+#[inline]
+pub(crate) fn copied_binary(env: Env, s: &str) -> ERL_NIF_TERM {
+    let mut binary = NewBinary::new(env, s.len());
+    binary.as_mut_slice().copy_from_slice(s.as_bytes());
+    let term: Term = binary.into();
+    term.as_c_arg()
+}
+
+pub(crate) struct TermBuilder<'a, 'b> {
     env: Env<'a>,
-    input: InputRef,
+    input: InputRef<'b>,
+    strings: Strings,
+    overflow: Overflow,
+    /// Bytes of strings borrowed from the input. ERTS (since OTP 27) copies
+    /// the short ones onto the heap, but they still count: the budget weighs
+    /// what the results hold against the input they may keep alive.
+    borrowed: usize,
+    /// An object built so far lost members to a later duplicate key, so
+    /// `borrowed` counts strings no result holds.
+    dropped_members: bool,
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
     values: &'b mut Vec<ERL_NIF_TERM>,
@@ -200,24 +266,53 @@ struct TermBuilder<'a, 'b> {
 }
 
 impl<'a, 'b> TermBuilder<'a, 'b> {
+    /// Terms of the values parsed so far, in order. Each parse driven through
+    /// the builder leaves exactly one.
+    #[inline]
+    pub(crate) fn roots(&self) -> &[ERL_NIF_TERM] {
+        debug_assert!(self.frames.is_empty());
+        self.values
+    }
+
+    /// Bytes of input strings borrowed so far.
+    #[inline]
+    pub(crate) fn borrowed(&self) -> usize {
+        self.borrowed
+    }
+
+    /// Whether a duplicate key discarded built members, leaving `borrowed`
+    /// and any span or node count of the containers above what survives.
+    #[inline]
+    pub(crate) fn dropped_members(&self) -> bool {
+        self.dropped_members
+    }
+
+    #[inline]
+    pub(crate) fn set_strings(&mut self, strings: Strings) {
+        self.strings = strings;
+    }
+
     #[inline]
     fn push(&mut self, term: ERL_NIF_TERM) {
         self.values.push(term);
     }
 
-    /// Sub-binary (zero-copy) when the str lives in the input buffer, else copy
-    /// (escaped strings are unescaped into the parser's scratch buffer).
+    /// Sub-binary (zero-copy) when the str lives in the input buffer and the
+    /// builder borrows, else copy (escaped strings are unescaped into the
+    /// parser's scratch buffer).
     #[inline]
-    fn str_term(&self, s: &str) -> ERL_NIF_TERM {
-        if let Some(offset) = self.input.offset_within(s) {
-            return unsafe {
-                enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
-            };
+    pub(crate) fn str_term(&mut self, s: &str) -> ERL_NIF_TERM {
+        if self.strings == Strings::Borrow {
+            if let Some(offset) = self.input.offset_within(s) {
+                self.borrowed += s.len();
+                let term = match self.input.term {
+                    0 => self.input.make_term(self.env),
+                    term => term,
+                };
+                return unsafe { enif_make_sub_binary(self.env.as_c_arg(), term, offset, s.len()) };
+            }
         }
-        let mut binary = NewBinary::new(self.env, s.len());
-        binary.as_mut_slice().copy_from_slice(s.as_bytes());
-        let term: Term = binary.into();
-        term.as_c_arg()
+        copied_binary(self.env, s)
     }
 
     /// Term for an object key, memoized in the per-call key cache.
@@ -229,7 +324,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     /// so `prefix` came from one unaligned load; a key inside the final 8 bytes
     /// of the document (impossible in valid JSON, which needs at least `":x}`
     /// after it) just falls back.
-    #[inline]
+    #[inline(always)]
     fn key_term(&mut self, s: &str, wide: bool, prefix: u64) -> ERL_NIF_TERM {
         let ptr = s.as_ptr();
         let len = s.len();
@@ -274,6 +369,85 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         };
         term
     }
+
+    /// Builds the term for a parsed document's `value` through the same hooks
+    /// a parse drives, sharing the key cache and presorted map members. `None`
+    /// past `MAX_DEPTH`, leaving the builder ready for the next value. `nodes`
+    /// counts container children for timeslice accounting.
+    pub(crate) fn value_term(
+        &mut self,
+        value: &sonic_rs::Value,
+        nodes: &mut usize,
+    ) -> Option<ERL_NIF_TERM> {
+        let base = self.values.len();
+        if self.replay(value, nodes) {
+            return self.values.pop();
+        }
+        self.values.truncate(base);
+        self.frames.clear();
+        self.key_terms.clear();
+        self.ords.clear();
+        self.too_deep = false;
+        None
+    }
+
+    /// The term for a scalar `value`; `None` for a container.
+    #[inline]
+    fn scalar_term(&mut self, value: &sonic_rs::Value) -> Option<ERL_NIF_TERM> {
+        use sonic_rs::{JsonType, JsonValueTrait};
+        let env = self.env.as_c_arg();
+        Some(match value.get_type() {
+            JsonType::Null => atoms::nil().as_c_arg(),
+            JsonType::Boolean if value.is_true() => atoms::r#true().as_c_arg(),
+            JsonType::Boolean => atoms::r#false().as_c_arg(),
+            JsonType::Number => match (value.as_i64(), value.as_u64()) {
+                (Some(n), _) => unsafe { enif_make_int64(env, n) },
+                (None, Some(n)) => unsafe { enif_make_uint64(env, n) },
+                // A number that is neither integer type is a float.
+                (None, None) => unsafe {
+                    enif_make_double(env, value.as_f64().unwrap_or_default())
+                },
+            },
+            JsonType::String => self.str_term(value.as_str().unwrap_or_default()),
+            JsonType::Array | JsonType::Object => return None,
+        })
+    }
+
+    fn replay(&mut self, value: &sonic_rs::Value, nodes: &mut usize) -> bool {
+        use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
+        if let Some(term) = self.scalar_term(value) {
+            self.push(term);
+            return true;
+        }
+        if value.get_type() == JsonType::Array {
+            let Some(array) = value.as_array() else {
+                return false;
+            };
+            *nodes += array.len();
+            if !self.visit_array_start(array.len()) {
+                return false;
+            }
+            for child in array.iter() {
+                if !self.replay(child, nodes) {
+                    return false;
+                }
+            }
+            return self.visit_array_end(array.len());
+        }
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        *nodes += 2 * object.len();
+        if !self.visit_object_start(object.len()) {
+            return false;
+        }
+        for (key, child) in object.iter() {
+            if !self.visit_key(key) || !self.replay(child, nodes) {
+                return false;
+            }
+        }
+        self.visit_object_end(object.len())
+    }
 }
 
 /// Stable insertion sort of member indices into Erlang term order, or `None`
@@ -313,14 +487,15 @@ fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
 }
 
 /// Build a map term from an object's keys and values, ordering its members
-/// first when ERTS would otherwise sort them itself.
+/// first when ERTS would otherwise sort them itself. `None` when a key
+/// repeats.
 #[inline]
 fn build_map(
     env: Env,
     keys: &[ERL_NIF_TERM],
     vals: &[ERL_NIF_TERM],
     ords: &[KeyOrd],
-) -> ERL_NIF_TERM {
+) -> Option<ERL_NIF_TERM> {
     let pairs = keys.len();
     if (MIN_ORDERED_MEMBERS..=FLATMAP_LIMIT).contains(&pairs) {
         if let Some(perm) = member_order(ords) {
@@ -337,21 +512,26 @@ fn build_map(
 }
 
 #[inline]
-fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> Option<ERL_NIF_TERM> {
+    let mut map: ERL_NIF_TERM = 0;
+    // SAFETY: `keys` and `vals` are live slices of `keys.len()` terms.
+    unsafe { map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) }
+        .then_some(map)
+}
+
+/// Map of an object whose keys repeat: last value wins, in source order
+/// (matches `object_get` lookups).
+#[cold]
+#[inline(never)]
+fn map_last_wins(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
     unsafe {
-        let mut map: ERL_NIF_TERM = 0;
-        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) {
-            map
-        } else {
-            // Duplicate keys: last value wins (matches value_to_term).
-            map = enif_make_new_map(env.as_c_arg());
-            for i in 0..keys.len() {
-                let mut new_map: ERL_NIF_TERM = 0;
-                enif_make_map_put(env.as_c_arg(), map, keys[i], vals[i], &mut new_map);
-                map = new_map;
-            }
-            map
+        let mut map = enif_make_new_map(env.as_c_arg());
+        for (&key, &val) in keys.iter().zip(vals) {
+            let mut new_map: ERL_NIF_TERM = 0;
+            enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
+            map = new_map;
         }
+        map
     }
 }
 
@@ -469,12 +649,15 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
         true
     }
 
-    /// Integer literal beyond i64/u64 range: build an exact Erlang bignum from
-    /// the raw digits instead of degrading to a lossy f64.
+    /// Integer literal beyond i64/u64 range: an exact Erlang bignum from the
+    /// raw digits under `Overflow::Bignum`, else the float a `Value` holds.
     #[inline]
     fn visit_overflow_int(&mut self, raw: &str, as_f64: f64) -> bool {
-        let t = bignum_term(self.env, raw)
-            .unwrap_or_else(|| unsafe { enif_make_double(self.env.as_c_arg(), as_f64) });
+        let exact = match self.overflow {
+            Overflow::Bignum => bignum_term(self.env, raw),
+            Overflow::Float => None,
+        };
+        let t = exact.unwrap_or_else(|| unsafe { enif_make_double(self.env.as_c_arg(), as_f64) });
         self.push(t);
         true
     }
@@ -486,7 +669,9 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
         true
     }
 
-    #[inline]
+    // Always, like `visit_array_end` and `key_term`: `replay` is a second
+    // caller, and outlining the three cost decode/1 4%.
+    #[inline(always)]
     fn visit_key(&mut self, key: &str) -> bool {
         let len = key.len();
         let offset = self.input.offset_within(key);
@@ -532,7 +717,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
         true
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_array_end(&mut self, _len: usize) -> bool {
         let start = match self.frames.pop() {
             Some(f) => f.values,
@@ -567,12 +752,15 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             None => return false,
         };
         let start = frame.values;
-        let map = build_map(
-            self.env,
-            &self.key_terms[frame.ords..],
-            &self.values[start..],
-            &self.ords[frame.ords..],
-        );
+        let keys = &self.key_terms[frame.ords..];
+        let vals = &self.values[start..];
+        let map = match build_map(self.env, keys, vals, &self.ords[frame.ords..]) {
+            Some(map) => map,
+            None => {
+                self.dropped_members = true;
+                map_last_wins(self.env, keys, vals)
+            }
+        };
         self.key_terms.truncate(frame.ords);
         self.ords.truncate(frame.ords);
         self.values.truncate(start);
@@ -581,53 +769,29 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     }
 }
 
-pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
-    let input = InputRef {
-        term: input_term,
-        base: bytes.as_ptr(),
-        len: bytes.len(),
-        borrow: true,
-    };
-    match decode_with(env, input, bytes) {
-        Ok(Some(root)) => make_tuple2(env, atoms::ok().as_c_arg(), root),
-        Ok(None) => make_tuple2(
-            env,
-            atoms::error().as_c_arg(),
-            "empty document".encode(env).as_c_arg(),
-        ),
-        Err(Failure::TooDeep) => make_tuple2(
-            env,
-            atoms::error().as_c_arg(),
-            atoms::nesting_too_deep().as_c_arg(),
-        ),
-        Err(Failure::Parse(e)) => parse_error_term(env, &e),
-    }
-}
-
-/// Decodes `span`, a validated JSON value lying inside `input`, to a term.
-/// Strings become sub-binaries of `input_term` only when `borrow` allows it.
-pub fn decode_span<'a>(
+/// Runs `f` with a term builder whose strings may borrow from `source`, on
+/// this scheduler thread's reused stacks and key cache.
+pub(crate) fn with_term_builder<'a, R>(
     env: Env<'a>,
-    input_term: ERL_NIF_TERM,
-    input: &[u8],
-    span: &[u8],
-    borrow: bool,
-) -> Option<ERL_NIF_TERM> {
-    let input = InputRef {
-        term: input_term,
-        base: input.as_ptr(),
-        len: input.len(),
-        borrow,
+    source: Source,
+    strings: Strings,
+    overflow: Overflow,
+    f: impl for<'b> FnOnce(&mut TermBuilder<'a, 'b>) -> R,
+) -> R {
+    let input = match source {
+        Source::Binary { term, bytes } => InputRef {
+            term,
+            base: bytes.as_ptr(),
+            len: bytes.len(),
+            document: None,
+        },
+        Source::Document(document) => InputRef {
+            term: 0,
+            base: document.bytes().as_ptr(),
+            len: document.bytes().len(),
+            document: Some(document),
+        },
     };
-    decode_with(env, input, span).ok().flatten()
-}
-
-enum Failure {
-    TooDeep,
-    Parse(sonic_rs::Error),
-}
-
-fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF_TERM>, Failure> {
     DECODE_BUFS.with(|cell| {
         let mut bufs = cell.borrow_mut();
         let DecodeBufs {
@@ -637,6 +801,9 @@ fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF
             ords,
             keys,
         } = &mut *bufs;
+        // Emptied on entry as well as on exit: where panics unwind (debug
+        // builds; release aborts), rustler catches one out of `f`, skipping
+        // the release below and leaving the next build a dead env's terms.
         values.clear();
         frames.clear();
         key_terms.clear();
@@ -645,6 +812,10 @@ fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF
         let mut builder = TermBuilder {
             env,
             input,
+            strings,
+            overflow,
+            borrowed: 0,
+            dropped_members: false,
             values,
             frames,
             key_terms,
@@ -652,16 +823,49 @@ fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF
             keys,
             too_deep: false,
         };
-
-        let result = match sonic_rs::parse_into_visitor(bytes, &mut builder) {
-            Ok(()) => Ok(builder.values.first().copied()),
-            Err(_) if builder.too_deep => Err(Failure::TooDeep),
-            Err(e) => Err(Failure::Parse(e)),
-        };
-
-        if builder.values.capacity() > VALUES_RETAIN_CAP {
-            builder.values.shrink_to(VALUES_RETAIN_CAP);
-        }
+        let result = f(&mut builder);
+        // The terms live in the environment; the handles here are dead now.
+        release(builder.values);
+        release(builder.frames);
+        release(builder.key_terms);
+        release(builder.ords);
         result
+    })
+}
+
+/// Build the `{:error, _}` term for a failed parse through `builder`.
+pub(crate) fn builder_error_term<'a>(
+    env: Env<'a>,
+    builder: &TermBuilder,
+    err: &sonic_rs::Error,
+) -> Term<'a> {
+    if builder.too_deep {
+        make_tuple2(
+            env,
+            atoms::error().as_c_arg(),
+            atoms::nesting_too_deep().as_c_arg(),
+        )
+    } else {
+        parse_error_term(env, err)
+    }
+}
+
+pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
+    let source = Source::Binary {
+        term: input_term,
+        bytes,
+    };
+    with_term_builder(env, source, Strings::Borrow, Overflow::Bignum, |builder| {
+        match sonic_rs::parse_into_visitor(bytes, builder) {
+            Ok(()) => match builder.values.first() {
+                Some(&root) => make_tuple2(env, atoms::ok().as_c_arg(), root),
+                None => make_tuple2(
+                    env,
+                    atoms::error().as_c_arg(),
+                    "empty document".encode(env).as_c_arg(),
+                ),
+            },
+            Err(e) => builder_error_term(env, builder, &e),
+        }
     })
 }
