@@ -1,12 +1,12 @@
 use crate::atoms;
-use crate::nif_util::{make_tuple2, timeslice_percent};
+use crate::nif_util::{make_tuple2, timeslice_percent, MapEntries};
 use crate::types::MAX_DEPTH;
 use rustler::sys::{
     c_int, c_uint, enif_get_atom, enif_get_double, enif_get_int64, enif_get_list_cell,
     enif_get_tuple, enif_get_uint64, enif_inspect_binary, enif_is_empty_list, enif_release_binary,
     enif_term_to_binary, ErlNifBinary, ErlNifCharEncoding, ErlNifEnv, ERL_NIF_TERM,
 };
-use rustler::{schedule, Env, MapIterator, NewBinary, Term, TermType};
+use rustler::{schedule, Env, NewBinary, Term, TermType};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 
@@ -269,7 +269,7 @@ fn encode_map(
     if depth == 0 {
         return Err(EncodeError::DepthExceeded);
     }
-    let iter = MapIterator::new(term).ok_or(EncodeError::UnsupportedType)?;
+    let iter = MapEntries::new(term).ok_or(EncodeError::UnsupportedType)?;
     // Elixir structs (maps carrying an atom `__struct__` key) are not
     // encodable as-is: they must opt into Torque.Encoder, and the Elixir layer
     // normalizes them through the protocol and retries once. The test rides on
