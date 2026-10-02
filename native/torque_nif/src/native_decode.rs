@@ -38,9 +38,10 @@ const KEY_CACHE_BYPASS_AT: i32 = 256;
 struct KeyEntry {
     ptr: *const u8,
     term: ERL_NIF_TERM,
-    /// First 8 key bytes, zero-padded. For keys of ≤ 8 bytes this is the whole
-    /// content, so prefix + len equality needs no byte compare on a hit.
+    /// First 8 key bytes, zero-padded, and for longer keys the last 8. Up to
+    /// 16 bytes they cover the whole key, so a hit needs no byte compare.
     prefix: u64,
+    tail: u64,
     len: u32,
     epoch: u32,
 }
@@ -76,6 +77,7 @@ impl KeyCache {
                 ptr: std::ptr::null(),
                 term: 0,
                 prefix: 0,
+                tail: 0,
                 len: 0,
                 epoch: 0,
             }; KEY_CACHE_SLOTS],
@@ -229,15 +231,24 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         if !wide || self.keys.debit > KEY_CACHE_BYPASS_AT || len == 0 || len > KEY_CACHE_MAX_LEN {
             return self.str_term(s);
         }
-        let h = (prefix ^ (len as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // Schema keys often share their first 8 bytes and length
+        // (`profile_link_color`, `profile_text_color`), so mix in the last 8
+        // too or they evict each other from the same slot.
+        let tail = if len > 8 {
+            unsafe { (ptr.add(len - 8) as *const u64).read_unaligned() }
+        } else {
+            0
+        };
+        let h = (prefix ^ (len as u64) ^ tail.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
         if entry.epoch == self.keys.epoch
             && entry.prefix == prefix
+            && entry.tail == tail
             && entry.len == len as u32
-            && (len <= 8
+            && (len <= 16
                 || unsafe {
-                    std::slice::from_raw_parts(entry.ptr.add(8), len - 8)
-                        == std::slice::from_raw_parts(ptr.add(8), len - 8)
+                    std::slice::from_raw_parts(entry.ptr.add(8), len - 16)
+                        == std::slice::from_raw_parts(ptr.add(8), len - 16)
                 })
         {
             self.keys.debit -= 8;
@@ -252,6 +263,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
             ptr,
             term,
             prefix,
+            tail,
             len: len as u32,
             epoch: self.keys.epoch,
         };
