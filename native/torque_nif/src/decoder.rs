@@ -4,8 +4,8 @@ use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_sub_binary,
-    enif_make_uint64, ERL_NIF_TERM,
+    enif_make_double, enif_make_int64, enif_make_list_cell, enif_make_list_from_array,
+    enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
 };
 use rustler::{
     schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
@@ -581,8 +581,10 @@ fn do_parse_get_many_nil<'a>(
                     })
                     .sum()
             });
-            let mut acc = TermAcc::with_hint(values.len());
-            for v in values.iter() {
+            // Consed from the back, so the list needs no staging buffer.
+            let mut list =
+                unsafe { enif_make_list_from_array(env.as_c_arg(), std::ptr::null(), 0) };
+            for v in values.iter().rev() {
                 let t = match v {
                     // A string the parser never had to unescape is still in the
                     // caller's binary, so the term can point at it rather than
@@ -601,9 +603,9 @@ fn do_parse_get_many_nil<'a>(
                         .unwrap_or(nil_raw),
                     Some(Extracted::Null) | None => nil_raw,
                 };
-                acc.push(t);
+                list = unsafe { enif_make_list_cell(env.as_c_arg(), t, list) };
             }
-            make_tuple2(env, atoms::ok().as_c_arg(), acc.into_list(env).as_c_arg())
+            make_tuple2(env, atoms::ok().as_c_arg(), list)
         }
         Err(e) => parse_error_term(env, &e),
     }
