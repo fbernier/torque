@@ -79,6 +79,7 @@ struct Node {
 pub struct ExtractPlan {
     nodes: Vec<Node>,
     result_slots: Vec<usize>,
+    has_aliases: bool,
 }
 
 /// Child count above which a node indexes its children instead of scanning
@@ -96,6 +97,7 @@ impl ExtractPlan {
         Self {
             nodes: vec![Node::default()],
             result_slots: Vec::new(),
+            has_aliases: false,
         }
     }
 
@@ -122,6 +124,7 @@ impl ExtractPlan {
         }
         let terminal = self.nodes[cur].slot.get_or_insert(slot as u32);
         self.result_slots[slot] = *terminal as usize;
+        self.has_aliases |= *terminal as usize != slot;
     }
 
     /// Prepares forward array walks and releases construction slack. Extraction
@@ -224,6 +227,9 @@ pub fn extract<'de, Input: JsonInput<'de>>(
     keys: Keys,
 ) -> Result<Vec<Option<Extracted<'de>>>> {
     let mut out = extract_unique(json, plan, validate, keys)?;
+    if !plan.has_aliases {
+        return Ok(out);
+    }
     for (slot, &canonical) in plan.result_slots.iter().enumerate() {
         if slot != canonical {
             out[slot] = out[canonical].clone();
