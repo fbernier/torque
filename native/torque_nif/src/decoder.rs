@@ -3,7 +3,10 @@ use crate::native_decode;
 use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
-use rustler::sys::{enif_make_list_from_array, enif_make_sub_binary, ERL_NIF_TERM};
+use rustler::sys::{
+    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_sub_binary,
+    enif_make_uint64, ERL_NIF_TERM,
+};
 use rustler::{
     schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
@@ -588,10 +591,15 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::Str(s)) => {
                         extracted_str_term(env, input_term, bytes, s, borrow)
                     }
+                    Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
+                    Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
+                    Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
+                    Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
+                    Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
                     Some(Extracted::Value(v)) => value_to_term(env, v, MAX_DEPTH, nodes)
                         .map(|t| t.as_c_arg())
                         .unwrap_or(nil_raw),
-                    None => nil_raw,
+                    Some(Extracted::Null) | None => nil_raw,
                 };
                 acc.push(t);
             }

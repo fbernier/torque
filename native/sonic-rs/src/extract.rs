@@ -208,14 +208,19 @@ impl ExtractPlan {
     }
 }
 
-/// Extracted value. Unescaped strings may borrow the input; all other values
-/// own their storage through `Value`.
+/// Extracted value. Unescaped strings may borrow the input, scalars are
+/// returned bare, and containers own their storage through `Value`.
 #[derive(Debug, Clone)]
 pub enum Extracted<'de> {
     /// Bytes inside the input, valid UTF-8, no escapes.
     Str(&'de str),
-    /// Anything else: containers, numbers, literals, and strings that had to be
-    /// unescaped into scratch space.
+    U64(u64),
+    I64(i64),
+    /// Finite, with negative zero preserved.
+    F64(f64),
+    Bool(bool),
+    Null,
+    /// Containers, and strings that had to be unescaped into scratch space.
     Value(Value),
 }
 
@@ -673,23 +678,22 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
             let start = parser.read.index();
             parser.read.eat(1);
             match parser.parse_number(c)? {
-                ParserNumber::Unsigned(u) => Ok(Extracted::Value(Value::new_u64(u))),
-                ParserNumber::Signed(i) => Ok(Extracted::Value(Value::new_i64(i))),
-                ParserNumber::Float(f) => {
+                ParserNumber::Unsigned(u) => Ok(Extracted::U64(u)),
+                ParserNumber::Signed(i) => Ok(Extracted::I64(i)),
+                ParserNumber::Float(f) if f.is_finite() => {
                     // Preserve negative zero across every decode path.
                     let token = parser.read.slice_unchecked(start, parser.read.index());
-                    Value::new_f64(restore_neg_zero(f, token))
-                        .map(Extracted::Value)
-                        .ok_or_else(|| parser.error(ErrorCode::InvalidNumber))
+                    Ok(Extracted::F64(restore_neg_zero(f, token)))
                 }
+                ParserNumber::Float(_) => Err(parser.error(ErrorCode::InvalidNumber)),
             }
         }
         Some(_) => {
             let (slice, _) = parser.skip_one(true)?;
             match slice {
-                b"true" => Ok(Extracted::Value(Value::new_bool(true))),
-                b"false" => Ok(Extracted::Value(Value::new_bool(false))),
-                b"null" => Ok(Extracted::Value(Value::new_null())),
+                b"true" => Ok(Extracted::Bool(true)),
+                b"false" => Ok(Extracted::Bool(false)),
+                b"null" => Ok(Extracted::Null),
                 _ => Err(parser.error(ErrorCode::InvalidJsonValue)),
             }
         }
