@@ -163,6 +163,8 @@ struct InputRef {
     term: ERL_NIF_TERM,
     base: *const u8,
     len: usize,
+    /// Whether strings may be sub-binaries of `term`; otherwise they are copied.
+    borrow: bool,
 }
 
 impl InputRef {
@@ -171,6 +173,9 @@ impl InputRef {
     /// a different allocation, where `offset_from` would be undefined.
     #[inline]
     fn offset_within(&self, s: &str) -> Option<usize> {
+        if !self.borrow {
+            return None;
+        }
         let offset = (s.as_ptr() as usize).checked_sub(self.base as usize)?;
         let room = self.len.checked_sub(offset)?;
         (s.len() <= room).then_some(offset)
@@ -577,6 +582,52 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 }
 
 pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
+    let input = InputRef {
+        term: input_term,
+        base: bytes.as_ptr(),
+        len: bytes.len(),
+        borrow: true,
+    };
+    match decode_with(env, input, bytes) {
+        Ok(Some(root)) => make_tuple2(env, atoms::ok().as_c_arg(), root),
+        Ok(None) => make_tuple2(
+            env,
+            atoms::error().as_c_arg(),
+            "empty document".encode(env).as_c_arg(),
+        ),
+        Err(Failure::TooDeep) => make_tuple2(
+            env,
+            atoms::error().as_c_arg(),
+            atoms::nesting_too_deep().as_c_arg(),
+        ),
+        Err(Failure::Parse(e)) => parse_error_term(env, &e),
+    }
+}
+
+/// Decodes `span`, a validated JSON value lying inside `input`, to a term.
+/// Strings become sub-binaries of `input_term` only when `borrow` allows it.
+pub fn decode_span<'a>(
+    env: Env<'a>,
+    input_term: ERL_NIF_TERM,
+    input: &[u8],
+    span: &[u8],
+    borrow: bool,
+) -> Option<ERL_NIF_TERM> {
+    let input = InputRef {
+        term: input_term,
+        base: input.as_ptr(),
+        len: input.len(),
+        borrow,
+    };
+    decode_with(env, input, span).ok().flatten()
+}
+
+enum Failure {
+    TooDeep,
+    Parse(sonic_rs::Error),
+}
+
+fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF_TERM>, Failure> {
     DECODE_BUFS.with(|cell| {
         let mut bufs = cell.borrow_mut();
         let DecodeBufs {
@@ -593,11 +644,7 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
         keys.next_epoch();
         let mut builder = TermBuilder {
             env,
-            input: InputRef {
-                term: input_term,
-                base: bytes.as_ptr(),
-                len: bytes.len(),
-            },
+            input,
             values,
             frames,
             key_terms,
@@ -607,25 +654,9 @@ pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) 
         };
 
         let result = match sonic_rs::parse_into_visitor(bytes, &mut builder) {
-            Ok(()) => match builder.values.first() {
-                Some(&root) => make_tuple2(env, atoms::ok().as_c_arg(), root),
-                None => make_tuple2(
-                    env,
-                    atoms::error().as_c_arg(),
-                    "empty document".encode(env).as_c_arg(),
-                ),
-            },
-            Err(e) => {
-                if builder.too_deep {
-                    make_tuple2(
-                        env,
-                        atoms::error().as_c_arg(),
-                        atoms::nesting_too_deep().as_c_arg(),
-                    )
-                } else {
-                    parse_error_term(env, &e)
-                }
-            }
+            Ok(()) => Ok(builder.values.first().copied()),
+            Err(_) if builder.too_deep => Err(Failure::TooDeep),
+            Err(e) => Err(Failure::Parse(e)),
         };
 
         if builder.values.capacity() > VALUES_RETAIN_CAP {

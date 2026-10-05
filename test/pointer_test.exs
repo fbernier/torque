@@ -535,6 +535,55 @@ defmodule Torque.PointerTest do
     end
   end
 
+  describe "parse_get_many_nil/2 selected containers" do
+    test "decode exactly as decode/1 does" do
+      docs = [
+        ~s({"a":[1,-2,1.5,-0.0,18446744073709551615,-9223372036854775808,true,false,null]}),
+        ~s({"a":{"k":1,"k":2,"s":"plain","e":"esc\\n\\u00e9","x\\ty":[{}]}}),
+        ~s({"a":[{"id":"d1","bidfloor":1.5},{"id":"d2","ext":{"x":[[]]}}]}),
+        ~s({"a":[]}),
+        ~s({"a":{}})
+      ]
+
+      for keys <- [[], [unique_keys: true]], json <- docs do
+        ptrs = Torque.compile_pointers(["/a"], keys)
+        {:ok, %{"a" => expected}} = Torque.decode(json)
+        assert {:ok, [^expected]} = Torque.parse_get_many_nil(json, ptrs), json
+      end
+    end
+
+    test "reject what decode/1 rejects" do
+      ptrs = Torque.compile_pointers(["/a"])
+
+      for json <- [~s({"a":[1e400]}), ~s({"a":{"n":-1e400}}), ~s({"a":["\\ud800"]})] do
+        assert {:error, _} = Torque.decode(json), json
+        assert {:error, _} = Torque.parse_get_many_nil(json, ptrs), json
+      end
+    end
+
+    test "copy their strings rather than pin a large input" do
+      filler = String.duplicate("x", 8192)
+      json = ~s({"pad":"#{filler}","a":["#{String.duplicate("y", 100)}"]})
+      ptrs = Torque.compile_pointers(["/a"])
+      assert {:ok, [[s]]} = Torque.parse_get_many_nil(json, ptrs)
+      assert :binary.referenced_byte_size(s) == 100
+    end
+  end
+
+  describe "parse_get_many_nil/2 key matching" do
+    test "tells apart keys of one length that differ in a single byte" do
+      for len <- 1..24, at <- Enum.uniq([0, div(len, 2), len - 1]) do
+        key = String.duplicate("k", len)
+        other = String.slice(key, 0, at) <> "j" <> String.slice(key, at + 1, len)
+        ptrs = Torque.compile_pointers(["/" <> key, "/" <> other])
+        assert {:ok, [1, 2]} = Torque.parse_get_many_nil(~s({"#{other}":2,"#{key}":1}), ptrs)
+
+        json = ~s({"#{String.duplicate("q", len)}":3,"#{key}":1})
+        assert {:ok, [1, nil]} = Torque.parse_get_many_nil(json, ptrs)
+      end
+    end
+  end
+
   describe "parse_get_many_nil/2 skipped regions" do
     test "a fault outside every selected path is still reported" do
       ptrs = Torque.compile_pointers(["/keep"])

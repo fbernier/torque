@@ -74,11 +74,31 @@ struct Node {
     index: Option<Box<AHashMap<String, u32>>>,
 }
 
+/// Compares two keys of equal length. Plan nodes are narrow and most document
+/// keys are a few bytes long, so loading short keys directly beats a call to
+/// `memcmp` for every plan key that happens to share the length.
+#[inline(always)]
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let u64_at = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+    let u32_at = |s: &[u8], i: usize| u32::from_le_bytes(s[i..i + 4].try_into().unwrap());
+    match n {
+        // Two overlapping loads cover each range.
+        8..=16 => u64_at(a, 0) == u64_at(b, 0) && u64_at(a, n - 8) == u64_at(b, n - 8),
+        4..=7 => u32_at(a, 0) == u32_at(b, 0) && u32_at(a, n - 4) == u32_at(b, n - 4),
+        1..=3 => a[0] == b[0] && a[n / 2] == b[n / 2] && a[n - 1] == b[n - 1],
+        0 => true,
+        _ => a == b,
+    }
+}
+
 /// Immutable extraction plan built from an ordered path set.
 #[derive(Debug)]
 pub struct ExtractPlan {
     nodes: Vec<Node>,
     result_slots: Vec<usize>,
+    has_aliases: bool,
 }
 
 /// Child count above which a node indexes its children instead of scanning
@@ -96,6 +116,7 @@ impl ExtractPlan {
         Self {
             nodes: vec![Node::default()],
             result_slots: Vec::new(),
+            has_aliases: false,
         }
     }
 
@@ -122,6 +143,7 @@ impl ExtractPlan {
         }
         let terminal = self.nodes[cur].slot.get_or_insert(slot as u32);
         self.result_slots[slot] = *terminal as usize;
+        self.has_aliases |= *terminal as usize != slot;
     }
 
     /// Prepares forward array walks and releases construction slack. Extraction
@@ -205,13 +227,22 @@ impl ExtractPlan {
     }
 }
 
-/// Extracted value. Unescaped strings may borrow the input; all other values
-/// own their storage through `Value`.
+/// Extracted value. Unescaped strings may borrow the input, scalars are
+/// returned bare, and containers own their storage through `Value`.
 #[derive(Debug, Clone)]
 pub enum Extracted<'de> {
     /// Bytes inside the input, valid UTF-8, no escapes.
     Str(&'de str),
-    /// Anything else: containers, numbers, literals, and strings that had to be
+    U64(u64),
+    I64(i64),
+    /// Finite, with negative zero preserved.
+    F64(f64),
+    Bool(bool),
+    Null,
+    /// A selected container, already validated, as its JSON text. Callers
+    /// decode it themselves rather than pay for a `Value` arena.
+    Raw(&'de [u8]),
+    /// Containers some longer path descends into, and strings that had to be
     /// unescaped into scratch space.
     Value(Value),
 }
@@ -224,6 +255,9 @@ pub fn extract<'de, Input: JsonInput<'de>>(
     keys: Keys,
 ) -> Result<Vec<Option<Extracted<'de>>>> {
     let mut out = extract_unique(json, plan, validate, keys)?;
+    if !plan.has_aliases {
+        return Ok(out);
+    }
     for (slot, &canonical) in plan.result_slots.iter().enumerate() {
         if slot != canonical {
             out[slot] = out[canonical].clone();
@@ -371,7 +405,12 @@ impl<'de> Extractor<'_, '_, 'de> {
         // A terminal node needs the whole value. Resolve any longer paths from
         // that value when one requested path prefixes another.
         if let Some(slot) = n.slot {
-            let value = parse_value_in_place(parser, strbuf, depth)?;
+            let value = if n.keys.is_empty() && matches!(parser.skip_space_peek(), Some(b'{' | b'[')) {
+                let (span, _) = parser.skip_one_at(true, depth)?;
+                Extracted::Raw(span)
+            } else {
+                parse_value_in_place(parser, strbuf, depth)?
+            };
             if !self.live.is_empty() {
                 self.activate(node);
             }
@@ -431,7 +470,7 @@ impl<'de> Extractor<'_, '_, 'de> {
                     Some(map) => map.get(key).map(|&i| (i as usize, keys[i as usize].1)),
                     None => keys
                         .iter()
-                        .position(|(k, _)| k == key)
+                        .position(|(k, _)| k.len() == key.len() && same_bytes(k.as_bytes(), key.as_bytes()))
                         .map(|i| (i, keys[i].1)),
                 }
             };
@@ -667,23 +706,22 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
             let start = parser.read.index();
             parser.read.eat(1);
             match parser.parse_number(c)? {
-                ParserNumber::Unsigned(u) => Ok(Extracted::Value(Value::new_u64(u))),
-                ParserNumber::Signed(i) => Ok(Extracted::Value(Value::new_i64(i))),
-                ParserNumber::Float(f) => {
+                ParserNumber::Unsigned(u) => Ok(Extracted::U64(u)),
+                ParserNumber::Signed(i) => Ok(Extracted::I64(i)),
+                ParserNumber::Float(f) if f.is_finite() => {
                     // Preserve negative zero across every decode path.
                     let token = parser.read.slice_unchecked(start, parser.read.index());
-                    Value::new_f64(restore_neg_zero(f, token))
-                        .map(Extracted::Value)
-                        .ok_or_else(|| parser.error(ErrorCode::InvalidNumber))
+                    Ok(Extracted::F64(restore_neg_zero(f, token)))
                 }
+                ParserNumber::Float(_) => Err(parser.error(ErrorCode::InvalidNumber)),
             }
         }
         Some(_) => {
             let (slice, _) = parser.skip_one(true)?;
             match slice {
-                b"true" => Ok(Extracted::Value(Value::new_bool(true))),
-                b"false" => Ok(Extracted::Value(Value::new_bool(false))),
-                b"null" => Ok(Extracted::Value(Value::new_null())),
+                b"true" => Ok(Extracted::Bool(true)),
+                b"false" => Ok(Extracted::Bool(false)),
+                b"null" => Ok(Extracted::Null),
                 _ => Err(parser.error(ErrorCode::InvalidJsonValue)),
             }
         }
