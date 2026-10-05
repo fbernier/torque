@@ -239,7 +239,11 @@ pub enum Extracted<'de> {
     F64(f64),
     Bool(bool),
     Null,
-    /// Containers, and strings that had to be unescaped into scratch space.
+    /// A selected container, already validated, as its JSON text. Callers
+    /// decode it themselves rather than pay for a `Value` arena.
+    Raw(&'de [u8]),
+    /// Containers some longer path descends into, and strings that had to be
+    /// unescaped into scratch space.
     Value(Value),
 }
 
@@ -401,7 +405,12 @@ impl<'de> Extractor<'_, '_, 'de> {
         // A terminal node needs the whole value. Resolve any longer paths from
         // that value when one requested path prefixes another.
         if let Some(slot) = n.slot {
-            let value = parse_value_in_place(parser, strbuf, depth)?;
+            let value = if n.keys.is_empty() && matches!(parser.skip_space_peek(), Some(b'{' | b'[')) {
+                let (span, _) = parser.skip_one_at(true, depth)?;
+                Extracted::Raw(span)
+            } else {
+                parse_value_in_place(parser, strbuf, depth)?
+            };
             if !self.live.is_empty() {
                 self.activate(node);
             }

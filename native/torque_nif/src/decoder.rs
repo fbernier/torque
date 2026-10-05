@@ -598,6 +598,10 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
                     Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
                     Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
+                    Some(Extracted::Raw(span)) => {
+                        native_decode::decode_span(env, input_term, bytes, span, borrow)
+                            .unwrap_or(nil_raw)
+                    }
                     Some(Extracted::Value(v)) => value_to_term(env, v, MAX_DEPTH, nodes)
                         .map(|t| t.as_c_arg())
                         .unwrap_or(nil_raw),
