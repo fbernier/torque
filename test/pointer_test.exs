@@ -535,6 +535,20 @@ defmodule Torque.PointerTest do
     end
   end
 
+  describe "parse_get_many_nil/2 key matching" do
+    test "tells apart keys of one length that differ in a single byte" do
+      for len <- 1..24, at <- Enum.uniq([0, div(len, 2), len - 1]) do
+        key = String.duplicate("k", len)
+        other = String.slice(key, 0, at) <> "j" <> String.slice(key, at + 1, len)
+        ptrs = Torque.compile_pointers(["/" <> key, "/" <> other])
+        assert {:ok, [1, 2]} = Torque.parse_get_many_nil(~s({"#{other}":2,"#{key}":1}), ptrs)
+
+        json = ~s({"#{String.duplicate("q", len)}":3,"#{key}":1})
+        assert {:ok, [1, nil]} = Torque.parse_get_many_nil(json, ptrs)
+      end
+    end
+  end
+
   describe "parse_get_many_nil/2 skipped regions" do
     test "a fault outside every selected path is still reported" do
       ptrs = Torque.compile_pointers(["/keep"])

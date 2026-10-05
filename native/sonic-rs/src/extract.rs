@@ -74,6 +74,25 @@ struct Node {
     index: Option<Box<AHashMap<String, u32>>>,
 }
 
+/// Compares two keys of equal length. Plan nodes are narrow and most document
+/// keys are a few bytes long, so loading short keys directly beats a call to
+/// `memcmp` for every plan key that happens to share the length.
+#[inline(always)]
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let u64_at = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+    let u32_at = |s: &[u8], i: usize| u32::from_le_bytes(s[i..i + 4].try_into().unwrap());
+    match n {
+        // Two overlapping loads cover each range.
+        8..=16 => u64_at(a, 0) == u64_at(b, 0) && u64_at(a, n - 8) == u64_at(b, n - 8),
+        4..=7 => u32_at(a, 0) == u32_at(b, 0) && u32_at(a, n - 4) == u32_at(b, n - 4),
+        1..=3 => a[0] == b[0] && a[n / 2] == b[n / 2] && a[n - 1] == b[n - 1],
+        0 => true,
+        _ => a == b,
+    }
+}
+
 /// Immutable extraction plan built from an ordered path set.
 #[derive(Debug)]
 pub struct ExtractPlan {
@@ -442,7 +461,7 @@ impl<'de> Extractor<'_, '_, 'de> {
                     Some(map) => map.get(key).map(|&i| (i as usize, keys[i as usize].1)),
                     None => keys
                         .iter()
-                        .position(|(k, _)| k == key)
+                        .position(|(k, _)| k.len() == key.len() && same_bytes(k.as_bytes(), key.as_bytes()))
                         .map(|i| (i, keys[i].1)),
                 }
             };
