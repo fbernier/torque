@@ -484,7 +484,9 @@ fn extracted_str_term(
     s: &str,
     borrow: bool,
 ) -> ERL_NIF_TERM {
-    if borrow {
+    // ERTS copies a slice this short onto the heap anyway, so building the
+    // heap binary here skips its sub-binary bookkeeping.
+    if borrow && s.len() > ERTS_ONHEAP_BINARY_LIMIT {
         if let Some(offset) = (s.as_ptr() as usize).checked_sub(input.as_ptr() as usize) {
             if let Some(room) = input.len().checked_sub(offset) {
                 if s.len() <= room {
@@ -500,6 +502,9 @@ fn extracted_str_term(
     let term: Term = binary.into();
     term.as_c_arg()
 }
+
+/// ERTS keeps binaries up to this size on the process heap.
+const ERTS_ONHEAP_BINARY_LIMIT: usize = 64;
 
 /// Inputs at or under this are borrowed from whatever is taken out of them.
 /// A binary this size is a single allocation whose cost is about what the refc
