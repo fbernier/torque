@@ -12,6 +12,10 @@ permissions:
 env:
   MIX_ENV: bench
   TORQUE_BUILD: true
+  # glazer's compile hook otherwise runs its own PGO build, which shells out
+  # to a bare `rebar3` that is not on the runner's PATH. The steps below PGO
+  # glazer with the same payloads as torque instead.
+  OPTIMIZE: "0"
 
 jobs:
   benchmark:
@@ -91,23 +95,30 @@ jobs:
           ls -la pgo-data
 
       # PGO the comparison library too, so the benchmark is PGO-vs-PGO instead
-      # of PGO-torque-vs-plain-glazer. glazer's `make OPTIMIZE=1` target drives
-      # PGO from bin/pgo-profile.es, which the hex package doesn't ship, so we
-      # drive its c_src Makefile's PGO=generate/use directly with the same
-      # payloads the torque pass uses (bench/glazer_pgo_workload.exs). The
-      # runtime loads deps/glazer/priv/glazer.so (the _build app priv dir is a
-      # symlink to it), so rebuilding there is what the benchmark picks up.
+      # of PGO-torque-vs-plain-glazer, driving its c_src Makefile's
+      # PGO=generate/use with the same payloads the torque pass uses
+      # (bench/glazer_pgo_workload.exs). Under mix, glazer builds into its
+      # _build app dir (REBAR_BARE_COMPILER_OUTPUT_DIR), which is where the
+      # runtime loads glazer.so from, so the Makefile is pointed there.
       # CI's g++ is GCC: it writes .gcda and reads them back from the profile
-      # dir on -fprofile-use with no separate merge step. A later
-      # `mix compile --force` only forces torque, not the glazer dep, so this
-      # optimised .so survives into the benchmark step.
+      # dir on -fprofile-use with no separate merge step. `clean` would delete
+      # that profile dir, so the PGO=use pass removes only the object and the
+      # library. A later `mix compile --force` only forces torque, not the
+      # glazer dep, so this optimised .so survives into the benchmark step.
       - name: Build instrumented glazer & collect PGO profile
         run: |
-          make -C deps/glazer/c_src PGO=generate clean all
-          mix run bench/glazer_pgo_workload.exs
+          make -C deps/glazer/c_src REBAR_BARE_COMPILER_OUTPUT_DIR="$GLAZER_DIR" PGO=generate clean all
+          mix run --no-compile bench/glazer_pgo_workload.exs
+        env:
+          GLAZER_DIR: ${{ github.workspace }}/_build/bench/lib/glazer
 
       - name: Rebuild glazer with PGO profile
-        run: make -C deps/glazer/c_src PGO=use all
+        run: |
+          rm -f "$GLAZER_DIR/obj/glazer_nif.o" "$GLAZER_DIR/priv/glazer.so"
+          make -C deps/glazer/c_src REBAR_BARE_COMPILER_OUTPUT_DIR="$GLAZER_DIR" PGO=use all
+          strings "$GLAZER_DIR/priv/glazer.so" | grep -q GLAZER_PGO_OPTIMIZED
+        env:
+          GLAZER_DIR: ${{ github.workspace }}/_build/bench/lib/glazer
 
       # PGO pass 2: rebuild torque with the collected profile, then benchmark.
       # --force is mandatory here: mix does not treat a changed RUSTFLAGS as a
