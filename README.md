@@ -30,6 +30,8 @@ end
 
 Precompiled binaries are available for common targets. To compile from source, install a stable Rust toolchain and set `TORQUE_BUILD=true`.
 
+A source build targets the platform's baseline CPU, so the binary runs on any machine of that architecture. On x86_64 that baseline is SSE2, which leaves the AVX2 parser paths out: set `RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"` to match the precompiled v3 variant, or `-C target-cpu=native` only when the binary will run on the machine that built it.
+
 ### CPU-optimized variants
 
 On x86_64, precompiled binaries are available for three CPU feature levels:
