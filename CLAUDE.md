@@ -113,6 +113,10 @@ Strings go through `escape.rs`'s `write_json_string`, which reserves once for th
 Atom names are read as Latin-1 into a stack buffer, because `ERL_NIF_UTF8` needs NIF 2.17 and the NIF still loads on 2.15. A name with any character above U+00FF makes that read fail, so those atoms go through `enif_term_to_binary` and the name is taken from the `SMALL_ATOM_UTF8_EXT` / `ATOM_UTF8_EXT` payload instead. Only the names the Latin-1 read rejects pay for that binary.
 
 
+### Panic Strategy
+
+The release profile keeps `panic = "abort"`, so a panic anywhere in the NIF (including the vendored sonic-rs, which parses untrusted input) takes down the whole node instead of becoming an Erlang exception through Rustler's `catch_unwind`. Measured on PGO builds (2026-10-06, Apple M1 Pro, two builds per setting): unwinding costs 7-8% on large encodes and 2-3% on small ones; decode, parse and extraction are unchanged. Dropping the `Drop` impl from `MapEntries` so `encode_map` needs no unwind cleanup won back only ~1.5 points, within noise, so the cost is spread across the encoder rather than in one landing pad. Revisit with fresh measurements before switching.
+
 ### Scheduler Awareness
 
 Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
