@@ -449,6 +449,11 @@ defmodule Torque do
   entry point in Torque agrees on that, and changing it would silently move
   existing callers' lookups, so it stands until a breaking release.
 
+  A malformed pointer (non-empty without a leading `"/"`, or with a `~` not
+  followed by `0` or `1`) matches nothing and returns
+  `{:error, :no_such_field}`. `compile_pointers/2` raises for the same strings
+  instead, since it runs once at setup, where a typo should fail loudly.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"site":{"domain":"example.com"}}))
@@ -471,7 +476,8 @@ defmodule Torque do
   does not exist.
 
   Raises `ArgumentError` for errors other than `:no_such_field`
-  (e.g. `:nesting_too_deep`).
+  (e.g. `:nesting_too_deep`). A malformed pointer returns `default`, as it
+  returns `:no_such_field` from `get/2`.
 
   ## Examples
 
@@ -505,7 +511,8 @@ defmodule Torque do
   still, since it never builds the document at all, though that advantage
   narrows to nothing as the document grows.
 
-  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary. A malformed
+  pointer gives `{:error, :no_such_field}`, as in `get/2`.
 
   ## Examples
 
@@ -535,7 +542,8 @@ defmodule Torque do
   parsing and is the recommended option for a fixed, repeatedly-queried path
   set.
 
-  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary. A malformed
+  pointer gives `nil`, as it gives `:no_such_field` from `get/2`.
 
   ## Examples
 
@@ -674,7 +682,8 @@ defmodule Torque do
       |> Map.new(fn {p, nil} -> {p, Map.get(defaults, p)}; pv -> pv end)
 
   Note: a parsed JSON `null` at the path is indistinguishable from a missing
-  field (same as `get_many_nil/2`) — both substitute the default.
+  field (same as `get_many_nil/2`) — both substitute the default, and so does
+  a malformed pointer.
 
   ## Examples
 
