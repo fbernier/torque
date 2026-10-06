@@ -1060,5 +1060,26 @@ defmodule Torque.PointerTest do
       assert_receive {^ua, retained}
       assert retained < 4096, "a 100-byte field kept #{retained} bytes of input alive"
     end
+
+    test "a container taken from a large input is copied and decoded intact" do
+      long = String.duplicate("m", 80)
+
+      records =
+        "[" <>
+          Enum.map_join(1..50, ",", fn i ->
+            ~s({"zeta":#{i},"mid":"#{long}","alpha":"v#{i}","beta":[#{i}],"gamma":null})
+          end) <> "]"
+
+      json = ~s({"pad":"#{String.duplicate("x", 400_000)}","recs":#{records}})
+
+      for ptrs <- [
+            Torque.compile_pointers(["/recs"]),
+            Torque.compile_pointers(["/recs"], validate: false)
+          ] do
+        assert {:ok, [recs]} = Torque.parse_get_many_nil(json, ptrs)
+        assert recs == Torque.decode!(records)
+        assert Enum.all?(recs, &(:binary.referenced_byte_size(&1["mid"]) == 80))
+      end
+    end
   end
 end

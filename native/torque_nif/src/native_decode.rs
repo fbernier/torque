@@ -181,9 +181,6 @@ impl InputRef {
     /// a different allocation, where `offset_from` would be undefined.
     #[inline]
     fn offset_within(&self, s: &str) -> Option<usize> {
-        if !self.borrow {
-            return None;
-        }
         let offset = (s.as_ptr() as usize).checked_sub(self.base as usize)?;
         let room = self.len.checked_sub(offset)?;
         (s.len() <= room).then_some(offset)
@@ -213,14 +210,17 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         self.values.push(term);
     }
 
-    /// Sub-binary (zero-copy) when the str lives in the input buffer, else copy
-    /// (escaped strings are unescaped into the parser's scratch buffer).
+    /// Sub-binary (zero-copy) when borrowing is allowed and the str lives in the
+    /// input buffer, else copy (escaped strings are unescaped into the parser's
+    /// scratch buffer).
     #[inline]
     fn str_term(&self, s: &str) -> ERL_NIF_TERM {
-        if let Some(offset) = self.input.offset_within(s) {
-            return unsafe {
-                enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
-            };
+        if self.input.borrow {
+            if let Some(offset) = self.input.offset_within(s) {
+                return unsafe {
+                    enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
+                };
+            }
         }
         let mut binary = NewBinary::new(self.env, s.len());
         binary.as_mut_slice().copy_from_slice(s.as_bytes());
