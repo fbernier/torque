@@ -869,7 +869,12 @@ mod extract_regressions {
         extract(json, plan, Validate::Yes, Keys::Repeatable)
             .unwrap()
             .into_iter()
-            .map(|value| value.map(|value| owned(Some(value)).as_u64().unwrap()))
+            .map(|value| {
+                value.map(|value| match value {
+                    Extracted::U64(n) => n,
+                    other => panic!("expected an unsigned number, got {other:?}"),
+                })
+            })
             .collect()
     }
 
