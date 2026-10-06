@@ -22,10 +22,18 @@ use crate::decoder::parse_error_term;
 use crate::nif_util::{make_tuple2, map_from_arrays};
 use crate::types::MAX_DEPTH;
 
-/// Cap on the retained thread-local value stack (in terms, 8 bytes each ≈ 1 MB),
-/// so a one-off huge document doesn't pin a large allocation on a scheduler
-/// thread indefinitely. Mirrors the encoder's `BUF_RETAIN_CAP`.
-const VALUES_RETAIN_CAP: usize = 1 << 17;
+/// Cap on each retained thread-local buffer, so a one-off huge document
+/// doesn't pin a large allocation on a scheduler thread indefinitely. Mirrors
+/// the encoder's `BUF_RETAIN_CAP`.
+const RETAIN_CAP_BYTES: usize = 1 << 20;
+
+#[inline]
+fn cap_retained<T>(buf: &mut Vec<T>) {
+    let max = RETAIN_CAP_BYTES / std::mem::size_of::<T>();
+    if buf.capacity() > max {
+        buf.shrink_to(max);
+    }
+}
 
 const KEY_CACHE_SLOTS: usize = 256;
 /// Longest key eligible for caching; bounds the byte-compare on lookup.
@@ -659,9 +667,9 @@ fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF
             Err(e) => Err(Failure::Parse(e)),
         };
 
-        if builder.values.capacity() > VALUES_RETAIN_CAP {
-            builder.values.shrink_to(VALUES_RETAIN_CAP);
-        }
+        cap_retained(builder.values);
+        cap_retained(builder.key_terms);
+        cap_retained(builder.ords);
         result
     })
 }
