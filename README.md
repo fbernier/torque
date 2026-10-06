@@ -208,7 +208,7 @@ expected to encode to large output (more than roughly 20 KB):
 
 For objects with duplicate keys, the last value wins (unless `unique_keys: true` is passed to `parse/2`).
 
-Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) rather than degrading to lossy floats, from `decode/1` and from every `get` and `parse_get_many_nil` lookup alike.
+Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) rather than degrading to lossy floats, from `decode/1` and from every `get` and `parse_get_many_nil` lookup alike. One exception: a `compile_pointers/2` handle with the default `validate: true` rejects an integer beyond the `f64` range (about 1.8e308) in a region no path selects.
 
 ### Elixir to JSON
 

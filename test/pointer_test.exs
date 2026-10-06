@@ -386,11 +386,14 @@ defmodule Torque.PointerTest do
 
   describe "integers beyond 64 bits" do
     # Each lookup path must agree with decode/1, which builds exact bignums:
-    # one past u64::MAX, one past i64::MIN, and one far past f64 precision.
+    # one past u64::MAX, one past i64::MIN, one far past f64 precision, and
+    # two past the f64 range, the last too long for the stack-built bignum.
     @bignums [
       18_446_744_073_709_551_616,
       -9_223_372_036_854_775_809,
-      String.to_integer("1" <> String.duplicate("0", 300)) + 1
+      String.to_integer("1" <> String.duplicate("0", 300)) + 1,
+      -String.to_integer("1" <> String.duplicate("0", 400)),
+      String.to_integer("1" <> String.duplicate("0", 700))
     ]
 
     test "every lookup returns the exact integer" do
@@ -411,6 +414,34 @@ defmodule Torque.PointerTest do
 
           assert {:ok, [^n, [^n], ^deep, ^n]} = Torque.parse_get_many_nil(json, pointers)
         end
+
+        # Validated skipping still rejects integers past the f64 range;
+        # accepting them there costs ~10% on number-heavy documents.
+        skipped = Torque.compile_pointers(["/other"])
+        doc = ~s({"n":#{n},"other":1})
+
+        if abs(n) < 1.0e308 do
+          assert {:ok, [1]} = Torque.parse_get_many_nil(doc, skipped)
+        else
+          assert {:error, _} = Torque.parse_get_many_nil(doc, skipped)
+        end
+
+        unvalidated = Torque.compile_pointers(["/other"], validate: false)
+        assert {:ok, [1]} = Torque.parse_get_many_nil(doc, unvalidated)
+      end
+    end
+
+    test "numbers outside the f64 range that are not integers are still rejected" do
+      huge = "1" <> String.duplicate("0", 400)
+      pointers = Torque.compile_pointers(["/n"])
+      skipped = Torque.compile_pointers(["/other"])
+
+      for token <- ["1e400", "-1e400", huge <> ".0", huge <> "e0"] do
+        json = ~s({"n":#{token},"other":1})
+        assert {:error, _} = Torque.decode(json)
+        assert {:error, _} = Torque.parse(json)
+        assert {:error, _} = Torque.parse_get_many_nil(json, pointers)
+        assert {:error, _} = Torque.parse_get_many_nil(json, skipped)
       end
     end
   end
