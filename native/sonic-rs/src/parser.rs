@@ -207,7 +207,7 @@ pub(crate) const MAX_PARSE_DEPTH: usize = 128;
 /// A numeric token with no fraction or exponent is an integer literal; when
 /// such a token only reaches the `f64` path it overflowed i64/u64.
 #[inline(always)]
-fn is_integer_token(slice: &[u8]) -> bool {
+pub(crate) fn is_integer_token(slice: &[u8]) -> bool {
     !slice.iter().any(|&b| matches!(b, b'.' | b'e' | b'E'))
 }
 

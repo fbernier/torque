@@ -370,7 +370,7 @@ const MAG_CAP: usize = 255;
 /// buffer. Tokens beyond `MAG_CAP` bytes defer to `num-bigint` so correctness
 /// stays unbounded. Returns `None` only if the digits don't parse.
 #[inline]
-fn bignum_term(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
+pub(crate) fn bignum_term(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     let (neg, digits) = match raw.as_bytes().split_first() {
         Some((b'-', rest)) => (1u8, rest),
         _ => (0u8, raw.as_bytes()),

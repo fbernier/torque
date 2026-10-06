@@ -4,6 +4,7 @@ use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
 use std::mem::MaybeUninit;
 
 use crate::atoms;
+use crate::native_decode::bignum_term;
 use crate::nif_util::map_from_arrays;
 
 const STACK_SIZE: usize = 64;
@@ -52,6 +53,11 @@ pub fn value_to_term<'a>(
                 Some(unsafe { Term::new(env, rustler::sys::enif_make_int64(env.as_c_arg(), n)) })
             } else if let Some(n) = value.as_u64() {
                 Some(unsafe { Term::new(env, rustler::sys::enif_make_uint64(env.as_c_arg(), n)) })
+            } else if let Some(t) = value
+                .as_raw_number()
+                .and_then(|raw| bignum_term(env, raw.as_str()))
+            {
+                Some(unsafe { Term::new(env, t) })
             } else {
                 value.as_f64().map(|n| unsafe {
                     Term::new(env, rustler::sys::enif_make_double(env.as_c_arg(), n))

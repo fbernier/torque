@@ -17,7 +17,7 @@ use sonic_number::ParserNumber;
 use crate::{
     error::{ErrorCode, Result},
     parser::Reference,
-    parser::{restore_neg_zero, Parser, MAX_PARSE_DEPTH},
+    parser::{is_integer_token, restore_neg_zero, Parser, MAX_PARSE_DEPTH},
     reader::{Read, Reader},
     util::utf8::from_utf8,
     value::shared::Shared,
@@ -239,6 +239,8 @@ pub enum Extracted<'de> {
     F64(f64),
     Bool(bool),
     Null,
+    /// An integer literal outside the i64/u64 range, as its digits.
+    BigInt(&'de str),
     /// A selected container, already validated, as its JSON text. Callers
     /// decode it themselves rather than pay for a `Value` arena.
     Raw(&'de [u8]),
@@ -708,12 +710,18 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
             match parser.parse_number(c)? {
                 ParserNumber::Unsigned(u) => Ok(Extracted::U64(u)),
                 ParserNumber::Signed(i) => Ok(Extracted::I64(i)),
-                ParserNumber::Float(f) if f.is_finite() => {
-                    // Preserve negative zero across every decode path.
+                ParserNumber::Float(f) => {
                     let token = parser.read.slice_unchecked(start, parser.read.index());
-                    Ok(Extracted::F64(restore_neg_zero(f, token)))
+                    if is_integer_token(token) {
+                        // SAFETY: a number token is ASCII.
+                        Ok(Extracted::BigInt(unsafe { std::str::from_utf8_unchecked(token) }))
+                    } else if f.is_finite() {
+                        // Preserve negative zero across every decode path.
+                        Ok(Extracted::F64(restore_neg_zero(f, token)))
+                    } else {
+                        Err(parser.error(ErrorCode::InvalidNumber))
+                    }
                 }
-                ParserNumber::Float(_) => Err(parser.error(ErrorCode::InvalidNumber)),
             }
         }
         Some(_) => {

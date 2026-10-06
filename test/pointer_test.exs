@@ -384,6 +384,37 @@ defmodule Torque.PointerTest do
     end
   end
 
+  describe "integers beyond 64 bits" do
+    # Each lookup path must agree with decode/1, which builds exact bignums:
+    # one past u64::MAX, one past i64::MIN, and one far past f64 precision.
+    @bignums [
+      18_446_744_073_709_551_616,
+      -9_223_372_036_854_775_809,
+      String.to_integer("1" <> String.duplicate("0", 300)) + 1
+    ]
+
+    test "every lookup returns the exact integer" do
+      for n <- @bignums do
+        json = ~s({"n":#{n},"box":[#{n}],"deep":{"m":[#{n}]}})
+        assert {:ok, %{"n" => ^n}} = Torque.decode(json)
+
+        {:ok, doc} = Torque.parse(json)
+        assert {:ok, ^n} = Torque.get(doc, "/n")
+        assert [{:ok, ^n}] = Torque.get_many(doc, ["/n"])
+        assert [^n] = Torque.get_many_nil(doc, ["/n"])
+        assert [^n] = Torque.get_many_nil(doc, Torque.compile_pointers(["/n"]))
+
+        for validate <- [true, false] do
+          paths = ["/n", "/box", "/deep", "/deep/m/0"]
+          pointers = Torque.compile_pointers(paths, validate: validate)
+          deep = %{"m" => [n]}
+
+          assert {:ok, [^n, [^n], ^deep, ^n]} = Torque.parse_get_many_nil(json, pointers)
+        end
+      end
+    end
+  end
+
   describe "large subtree extraction" do
     # Exercises the node-count timeslice accounting paths (>512 terms built).
     test "get of a large root returns the full document" do

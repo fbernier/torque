@@ -602,6 +602,9 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
                     Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
                     Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
+                    Some(Extracted::BigInt(raw)) => {
+                        native_decode::bignum_term(env, raw).unwrap_or(nil_raw)
+                    }
                     Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
                     Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
                     Some(Extracted::Raw(span)) => {
