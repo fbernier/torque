@@ -227,14 +227,20 @@ fn do_parse(
 
 /// Build the `{:error, _}` term for a parse failure. The vendored sonic-rs caps
 /// nesting; surface that as `:nesting_too_deep` for parity with get/encode.
-/// Other errors keep the sonic-rs message string.
+/// Other errors keep the sonic-rs message string, minus the excerpt of the
+/// input it appends after a blank line: those bytes can be anything the caller
+/// was sent, and the message ends up in logs and crash reports.
 #[inline]
 pub(crate) fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<'a> {
     let err_raw = atoms::error().as_c_arg();
     if err.is_recursion_limit() {
         make_tuple2(env, err_raw, atoms::nesting_too_deep().as_c_arg())
     } else {
-        make_tuple2(env, err_raw, format!("{}", err).encode(env).as_c_arg())
+        let message = err.to_string();
+        let message = message
+            .split_once("\n\n")
+            .map_or(&*message, |(head, _)| head);
+        make_tuple2(env, err_raw, message.encode(env).as_c_arg())
     }
 }
 

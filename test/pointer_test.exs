@@ -321,6 +321,17 @@ defmodule Torque.PointerTest do
     test "empty string" do
       assert {:error, _} = Torque.parse("")
     end
+
+    test "error messages do not quote the input" do
+      json = ~s({"password":"hunter2", oops})
+      pointers = Torque.compile_pointers(["/password"])
+
+      for result <- [Torque.parse(json), Torque.parse_get_many_nil(json, pointers)] do
+        assert {:error, message} = result
+        assert message =~ ~r/ at line 1 column \d+$/
+        refute message =~ "hunter2"
+      end
+    end
   end
 
   describe "parse/1 dirty scheduler" do

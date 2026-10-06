@@ -182,6 +182,13 @@ defmodule Torque.DecodeTest do
       assert {:error, _reason} = Torque.decode("{invalid}")
     end
 
+    test "error messages give the position without quoting the input" do
+      assert {:error, message} = Torque.decode(~s({"password":"hunter2", oops}))
+      assert message =~ ~r/ at line 1 column 24$/
+      refute message =~ "hunter2"
+      refute message =~ "oops"
+    end
+
     test "large payload uses dirty scheduler" do
       # Generate a payload > 10KB to exercise the dirty scheduler path
       large_map = Map.new(1..500, fn i -> {"key_#{i}", String.duplicate("v", 20)} end)
