@@ -718,7 +718,11 @@ mod extract_regressions {
         extract(json, plan, Validate::Yes, Keys::Repeatable)
             .unwrap()
             .into_iter()
-            .map(|value| value.map(|value| owned(Some(value)).as_u64().unwrap()))
+            .map(|value| match value {
+                Some(Extracted::U64(n)) => Some(n),
+                None => None,
+                other => panic!("expected an unsigned scalar, got {other:?}"),
+            })
             .collect()
     }
 
@@ -728,9 +732,12 @@ mod extract_regressions {
     fn selected_container_root_outlives_extraction() {
         let mut plan = ExtractPlan::new();
         plan.add_path(std::iter::empty());
+        // A selected container with no longer path into it comes back as a
+        // raw span; descending into it is what makes the root an arena value.
+        plan.add_path([Seg::Index { idx: 0, key: "0" }].into_iter());
         for validate in [Validate::Yes, Validate::No] {
             let mut values = extract("[1]", &plan, validate, Keys::Repeatable).unwrap();
-            let root = owned(values.pop().unwrap());
+            let root = owned(values.swap_remove(0));
             let child = root.get(0).unwrap().clone();
             let clone = root.clone();
             drop(values);

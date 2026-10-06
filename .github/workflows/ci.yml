@@ -29,7 +29,8 @@ jobs:
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test -p torque_nif
 
   test:
     name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
