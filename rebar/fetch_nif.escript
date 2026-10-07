@@ -189,10 +189,11 @@ fetch(Asset) ->
     install(extract(Asset, Tarball), Asset),
     io:format("torque: installed ~s~n", [Asset]).
 
+%% checksums.txt is `shasum -a 256' output for the release's assets.
 expected_sha256(Asset) ->
-    {ok, Checksums} = file:read_file("checksum-Elixir.Torque.Native.exs"),
-    Pattern = "\"" ++ re_escape(Asset) ++ "\" => \"sha256:([0-9a-f]{64})\"",
-    case re:run(Checksums, Pattern, [{capture, all_but_first, list}]) of
+    {ok, Checksums} = file:read_file("checksums.txt"),
+    Pattern = "^([0-9a-f]{64}) [ *]" ++ re_escape(Asset) ++ "$",
+    case re:run(Checksums, Pattern, [multiline, {capture, all_but_first, list}]) of
         {match, [Sha]} -> Sha;
         nomatch -> throw({fail, "~s is not in the shipped checksum file", [Asset]})
     end.

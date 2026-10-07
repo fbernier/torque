@@ -123,7 +123,7 @@ jobs:
         env:
           TORQUE_BUILD: ""
         run: |
-          VSN=$(sed -n 's/.*"libtorque_nif-v\([0-9.]*\)-nif-.*/\1/p' checksum-Elixir.Torque.Native.exs | head -n1)
+          VSN=$(sed -n 's/.*libtorque_nif-v\([0-9.]*\)-nif-.*/\1/p' checksums.txt | head -n1)
           rm -f priv/native/torque_nif.so
           TORQUE_NIF_VSN="$VSN" escript rebar/fetch_nif.escript
           test -s priv/native/torque_nif.so

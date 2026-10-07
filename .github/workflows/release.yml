@@ -102,7 +102,7 @@ jobs:
           # generic build profiles different functions than v3 ships).
           RUSTFLAGS="${{ matrix.job.rustflags }}"
           case "$RUSTFLAGS" in
-            # Same flag sets as Torque.CPU.
+            # Same flag sets as rebar/fetch_nif.escript.
             *x86-64-v3*) NEED="pni ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm avx avx2 bmi1 bmi2 f16c fma abm movbe pclmulqdq" ;;
             *x86-64-v2*) NEED="pni ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm" ;;
             *) NEED="" ;;
@@ -180,7 +180,7 @@ jobs:
             LIB_FILE="target/${TARGET}/release/libtorque_nif.so"
           fi
 
-          # RustlerPrecompiled expects the file inside the archive to match this name
+          # rebar/fetch_nif.escript expects the file inside the archive to match this name
           VARIANT="${{ matrix.job.variant }}"
           NIF_NAME="libtorque_nif-v${VERSION}-nif-${NIF}-${TARGET}"
           if [ -n "${VARIANT}" ]; then
