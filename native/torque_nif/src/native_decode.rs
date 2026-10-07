@@ -19,7 +19,7 @@ use std::cell::RefCell;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
-use crate::nif_util::{make_tuple2, map_from_arrays};
+use crate::nif_util::{make_tuple2, map_from_arrays, FLATMAP_LIMIT};
 use crate::types::MAX_DEPTH;
 
 /// Cap on each retained thread-local buffer, so a one-off huge document
@@ -109,8 +109,6 @@ impl KeyCache {
     }
 }
 
-/// Largest map ERTS stores as a flatmap (`MAP_SMALL_MAP_LIMIT`).
-const FLATMAP_LIMIT: usize = 32;
 /// Below this, ERTS's sort is cheaper than checking the order ourselves.
 const MIN_ORDERED_MEMBERS: usize = 4;
 

@@ -30,8 +30,9 @@ pub fn timeslice_percent(bytes: usize) -> i32 {
     ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
 }
 
-/// Largest map ERTS stores as a flatmap; bigger maps are hash maps.
-const FLATMAP_LIMIT: usize = 32;
+/// Largest map ERTS stores as a flatmap (`MAP_SMALL_MAP_LIMIT`); bigger maps
+/// are hash maps.
+pub const FLATMAP_LIMIT: usize = 32;
 
 /// Build a map from key and value arrays.
 ///
