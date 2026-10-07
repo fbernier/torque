@@ -33,14 +33,20 @@ jobs:
       - run: cargo test -p torque_nif
 
   test:
-    name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - otp: "28"
+          - os: ubuntu-latest
+            otp: "28"
             elixir: "1.18"
-          - otp: "27"
+          - os: ubuntu-latest
+            otp: "27"
+            elixir: "1.18"
+          # Apple Silicon: the NEON escape kernels and parser paths.
+          - os: macos-14
+            otp: "28"
             elixir: "1.18"
     steps:
       - uses: actions/checkout@v6
@@ -55,6 +61,8 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
+      - if: runner.os == 'macOS'
+        run: cargo test -p torque_nif
 
   dialyzer:
     name: Dialyzer
