@@ -17,6 +17,13 @@ if [ "$CRATE_VERSION" != "$VERSION" ]; then
   exit 1
 fi
 
+# rebar3 builds read the version from the app file, and fetch the NIF for it.
+APP_VERSION=$(sed -n 's/^ *{vsn, "\(.*\)"},/\1/p' src/torque.app.src | head -n1)
+if [ "$APP_VERSION" != "$VERSION" ]; then
+  echo "error: version mismatch, mix.exs is ${VERSION} but src/torque.app.src is ${APP_VERSION}"
+  exit 1
+fi
+
 echo "==> Releasing torque ${TAG}"
 
 # Check for uncommitted changes

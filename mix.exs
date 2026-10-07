@@ -58,8 +58,12 @@ defmodule Torque.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
+      build_tools: ["mix", "rebar3"],
       files: ~w(
         lib
+        src
+        rebar
+        rebar.config
         native/torque_nif/src
         native/torque_nif/Cargo.toml
         native/sonic-rs/src
