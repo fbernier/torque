@@ -156,6 +156,22 @@ jobs:
             echo "::notice::PGO: ${MISSES} functions without profile data (${{ matrix.job.target }}${{ matrix.job.variant && format(' {0}', matrix.job.variant) || '' }})"
           fi
 
+      # Runs the suite against the exact library this job ships. Only the PGO
+      # jobs can: their runner matches the target and already has Elixir. The
+      # compile builds a throwaway NIF (the draft release has nothing to
+      # download yet), which the shipped one then replaces.
+      - name: Test the built library
+        if: matrix.job.pgo
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TORQUE_BUILD=true MIX_ENV=test
+          mix deps.get
+          mix compile
+          EXT=so; [[ "${{ matrix.job.target }}" == *darwin* ]] && EXT=dylib
+          cp "target/${{ matrix.job.target }}/release/libtorque_nif.$EXT" priv/native/torque_nif.so
+          mix test --no-compile
+
       - name: Package artifact
         shell: bash
         run: |
