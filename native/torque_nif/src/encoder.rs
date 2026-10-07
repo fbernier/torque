@@ -6,8 +6,8 @@ use rustler::sys::{
     enif_get_tuple, enif_get_uint64, enif_inspect_binary, enif_is_empty_list, enif_release_binary,
     enif_term_to_binary, ErlNifBinary, ErlNifCharEncoding, ErlNifEnv, ERL_NIF_TERM,
 };
-use rustler::{schedule, Env, NewBinary, Term, TermType};
-use std::cell::RefCell;
+use rustler::{schedule, Atom, Env, NewBinary, Term, TermType};
+use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 
 /// Below this output size the work is sub-microsecond, so the
@@ -25,6 +25,11 @@ thread_local! {
     /// payloads. NIFs run to completion without preemption and the encoder
     /// never re-enters this NIF, so the borrow is never nested.
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
+
+    /// The atom that encodes as JSON null for the current call: `nil` from
+    /// Elixir, `null` from Erlang. Set on entry rather than threaded through
+    /// the recursive encoder, which only reads it for atoms.
+    static NULL_ATOM: Cell<ERL_NIF_TERM> = const { Cell::new(0) };
 }
 
 enum EncodeError {
@@ -174,8 +179,14 @@ fn write_atom_name(
 }
 
 #[inline]
-fn encode_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) -> Term<'a> {
+fn encode_impl<'a>(
+    env: Env<'a>,
+    term: Term<'a>,
+    report_timeslice: bool,
+    null: ERL_NIF_TERM,
+) -> Term<'a> {
     let env_raw = env.as_c_arg();
+    NULL_ATOM.with(|cell| cell.set(null));
     ENCODE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
@@ -195,14 +206,25 @@ fn encode_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) -> Term
 
 #[rustler::nif]
 fn encode<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    encode_impl(env, term, true)
+    encode_impl(env, term, true, atoms::nil().as_c_arg())
 }
 
 /// Opt-in dirty variant: output size can't be predicted from the input term
 /// without a full traversal, so large encodes are dispatched by the caller.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn encode_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    encode_impl(env, term, false)
+    encode_impl(env, term, false, atoms::nil().as_c_arg())
+}
+
+/// `encode/1` with the atom that encodes as JSON null chosen by the caller.
+#[rustler::nif]
+fn encode_opts<'a>(env: Env<'a>, term: Term<'a>, null: Atom) -> Term<'a> {
+    encode_impl(env, term, true, null.as_c_arg())
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_opts_dirty<'a>(env: Env<'a>, term: Term<'a>, null: Atom) -> Term<'a> {
+    encode_impl(env, term, false, null.as_c_arg())
 }
 
 /// Returns the raw binary on success, raises on error.
@@ -210,6 +232,7 @@ fn encode_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
 #[inline]
 fn encode_iodata_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) -> Term<'a> {
     let env_raw = env.as_c_arg();
+    NULL_ATOM.with(|cell| cell.set(atoms::nil().as_c_arg()));
     ENCODE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
@@ -430,7 +453,7 @@ fn encode_atom(env_raw: *mut ErlNifEnv, term: Term, buf: &mut Vec<u8>) -> Result
         buf.extend_from_slice(b"true");
     } else if raw == atoms::r#false().as_c_arg() {
         buf.extend_from_slice(b"false");
-    } else if raw == atoms::nil().as_c_arg() {
+    } else if raw == NULL_ATOM.with(Cell::get) {
         buf.extend_from_slice(b"null");
     } else {
         buf.push(b'"');

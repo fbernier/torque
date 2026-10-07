@@ -31,7 +31,15 @@ defmodule Torque.MixProject do
     [
       main: "Torque",
       source_ref: "v#{@version}",
-      extras: ["README.md": [title: "Overview"], LICENSE: [title: "License"]],
+      extras: [
+        "README.md": [title: "Overview"],
+        "guides/erlang.md": [title: "Erlang API"],
+        LICENSE: [title: "License"]
+      ],
+      # The Erlang `torque` module is documented by guides/erlang.md: its page
+      # would be torque.html, which overwrites Torque.html on the
+      # case-insensitive filesystem releases build docs on.
+      filter_modules: fn module, _meta -> module != :torque end,
       groups_for_docs: [
         Decoding: &(&1[:group] == :decode),
         Encoding: &(&1[:group] == :encode),
@@ -57,9 +65,13 @@ defmodule Torque.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url},
+      links: %{"GitHub" => @source_url, "Docs" => "https://hexdocs.pm/torque"},
+      build_tools: ["mix", "rebar3"],
       files: ~w(
         lib
+        src
+        rebar
+        rebar.config
         native/torque_nif/src
         native/torque_nif/Cargo.toml
         native/sonic-rs/src

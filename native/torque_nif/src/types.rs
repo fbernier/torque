@@ -26,8 +26,9 @@ fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {
 
 /// Convert a sonic-rs Value to an Erlang term.
 ///
-/// `depth` is the remaining nesting budget; returns `None` when it reaches zero
-/// on an object or array, signalling that the document is too deeply nested.
+/// `null` is the term JSON null becomes. `depth` is the remaining nesting
+/// budget; returns `None` when it reaches zero on an object or array,
+/// signalling that the document is too deeply nested.
 ///
 /// `nodes` approximates the number of terms built, counted once per container
 /// child (object children count double for their keys), so scalar conversions
@@ -38,11 +39,12 @@ fn make_binary_term<'a>(env: Env<'a>, s: &str) -> Term<'a> {
 pub fn value_to_term<'a>(
     env: Env<'a>,
     value: &sonic_rs::Value,
+    null: ERL_NIF_TERM,
     depth: u32,
     nodes: &mut usize,
 ) -> Option<Term<'a>> {
     match value.get_type() {
-        JsonType::Null => Some(atoms::nil().to_term(env)),
+        JsonType::Null => Some(unsafe { Term::new(env, null) }),
         JsonType::Boolean => Some(if value.as_bool().unwrap() {
             atoms::r#true().to_term(env)
         } else {
@@ -77,7 +79,7 @@ pub fn value_to_term<'a>(
                 let mut terms: [MaybeUninit<ERL_NIF_TERM>; STACK_SIZE] =
                     [MaybeUninit::uninit(); STACK_SIZE];
                 for (i, v) in arr.iter().enumerate() {
-                    terms[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
+                    terms[i].write(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
                 unsafe {
                     Some(Term::new(
@@ -92,7 +94,7 @@ pub fn value_to_term<'a>(
             } else {
                 let mut terms: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 for v in arr.iter() {
-                    terms.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
+                    terms.push(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
                 unsafe {
                     Some(Term::new(
@@ -117,7 +119,7 @@ pub fn value_to_term<'a>(
                     [MaybeUninit::uninit(); STACK_SIZE];
                 for (i, (k, v)) in obj.iter().enumerate() {
                     keys[i].write(make_binary_term(env, k).as_c_arg());
-                    vals[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
+                    vals[i].write(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
                 // SAFETY: the loop initialised the first `count` slots of each.
                 let (keys, vals) = unsafe {
@@ -132,7 +134,7 @@ pub fn value_to_term<'a>(
                 let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 for (k, v) in obj.iter() {
                     keys.push(make_binary_term(env, k).as_c_arg());
-                    vals.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
+                    vals.push(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
                 Some(unsafe { Term::new(env, make_map(env, &keys, &vals)) })
             }

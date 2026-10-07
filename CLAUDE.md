@@ -16,6 +16,7 @@ mix dialyzer                       # static type analysis
 cargo fmt                          # format Rust code (run from repo root)
 cargo fmt --check                  # check Rust formatting
 cargo clippy -- -D warnings        # Rust linter
+TORQUE_BUILD=true rebar3 eunit     # Erlang API under a rebar3 build (builds into _build/rebar3)
 MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks
 ```
 
@@ -77,18 +78,20 @@ checksums and publish by hand instead, run with `SKIP_PUBLISH=1`.
 
 ### Version bumping
 
-The version lives in **three places**: `@version` in `mix.exs`, `version` in
-`native/torque_nif/Cargo.toml` (these two must match — `release.sh` refuses
-to tag on a mismatch), and the `{:torque, "~> x.y.z"}` install snippet in
-`README.md`. To bump:
+The version lives in **four files**: `@version` in `mix.exs`, `version` in
+`native/torque_nif/Cargo.toml`, `vsn` in `src/torque.app.src` (all three must
+match: `release.sh` refuses to tag on a mismatch, and a rebar3 build fetches
+the NIF for the app file's version), and the two install snippets (Mix and
+rebar3) in `README.md`. To bump:
 
 1. Edit `@version` in `mix.exs`, `version` in `native/torque_nif/Cargo.toml`,
-   and the dep snippet in `README.md`.
+   `vsn` in `src/torque.app.src`, and both dep snippets in `README.md`.
 2. Run `TORQUE_BUILD=true mix compile` once so `Cargo.lock` picks up the crate
    version.
-3. Commit all four files (`mix.exs`, `Cargo.toml`, `Cargo.lock`, `README.md`)
-   together as a single `Bump version to x.y.z` commit (see faaa403) before
-   running `./scripts/release.sh`.
+3. Commit all five files (`mix.exs`, `Cargo.toml`, `Cargo.lock`,
+   `src/torque.app.src`, `README.md`) together as a single
+   `Bump version to x.y.z` commit (see faaa403) before running
+   `./scripts/release.sh`.
 
 ## Architecture
 
@@ -112,6 +115,12 @@ Strings go through `escape.rs`'s `write_json_string`, which reserves once for th
 
 Atom names are read as Latin-1 into a stack buffer, because `ERL_NIF_UTF8` needs NIF 2.17 and the NIF still loads on 2.15. A name with any character above U+00FF makes that read fail, so those atoms go through `enif_term_to_binary` and the name is taken from the `SMALL_ATOM_UTF8_EXT` / `ATOM_UTF8_EXT` payload instead. Only the names the Latin-1 read rejects pay for that binary.
 
+
+### Erlang and rebar3
+
+One Hex package serves both build tools. rebar3 prefers a rebar3-buildable app when a package also has `mix.exs`, so `src/torque.app.src` and `rebar.config` make it build Torque itself rather than through rebar_mix. Mix compiles `src/` too (the `torque` Erlang API module), so an Erlang library depending on Torque works inside an Elixir project; it never compiles `rebar/src/`, which holds the rebar3-only `Elixir.Torque.Native` loader (the NIF registers under that name). The rebar3 pre-compile hook `rebar/fetch_nif.escript` does what RustlerPrecompiled does for Mix: it maps `system_architecture` and the x86 flag sets (kept in sync with `lib/torque/cpu.ex`) to a release asset, downloads it over verified TLS, checks it against `checksum-Elixir.Torque.Native.exs`, or runs cargo with `TORQUE_BUILD=true`. A published binary only loads into a build of the same NIF sources, so CI's download step stops at a verified install. `rebar.config` sets `base_dir` to `_build/rebar3` because Mix also builds into `_build/test/lib/torque`.
+
+The Erlang API wants `null` for JSON null and `undefined` for a missing path where Elixir uses `nil` for both, so the NIFs take those atoms as arguments rather than hardcoding `nil`: `ParsedDocument` and `CompiledPaths` store them (lookups use the document's, fused extraction the handle's), `decode_opts` takes the null atom, and the encoder reads the atom that encodes as JSON null from a thread-local set on entry to each call, so the recursive encoder carries no extra parameter. Elixir passes `nil` everywhere, through the same NIFs.
 
 ### Panic Strategy
 
@@ -137,6 +146,8 @@ Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU 
 
 - `lib/torque.ex` — public API with `@doc`, typespecs, dirty scheduler dispatch
 - `lib/torque/native.ex` — RustlerPrecompiled NIF stubs (set `TORQUE_BUILD=true` to compile from source)
+- `src/torque.erl`: Erlang API (`null` / `undefined` conventions); compiled by both Mix and rebar3
+- `src/torque.app.src`, `rebar.config`, `rebar/src/Elixir.Torque.Native.erl`, `rebar/fetch_nif.escript`: the rebar3 build (app file, rebar3-only NIF loader, precompiled-NIF fetch)
 - `lib/torque/cpu.ex`: x86-64 v2/v3 detection that picks the precompiled variant
 - `lib/torque/build.ex` — captures `TORQUE_BUILD` and makes switching it recompile `Torque.Native`
 - `lib/torque/encoder.ex`: `Torque.Encoder` protocol, `@derive` support via `__deriving__/3` on the `Any` impl, built-in `Date`/`Time`/`NaiveDateTime`/`DateTime` implementations

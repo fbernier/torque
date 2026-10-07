@@ -6,9 +6,14 @@ pub(crate) mod native_decode;
 pub(crate) mod nif_util;
 mod types;
 
+/// `null` is the term JSON null becomes and `missing` the term a lookup returns
+/// for an absent path: `nil` for both from Elixir, `null` and `undefined` from
+/// Erlang.
 pub struct ParsedDocument {
     pub value: sonic_rs::Value,
     pub unique_keys: bool,
+    pub null: rustler::Atom,
+    pub missing: rustler::Atom,
 }
 
 #[rustler::resource_impl]
@@ -29,6 +34,9 @@ pub struct CompiledPaths {
     pub unique_keys: bool,
     /// Whether fused extraction validates syntax in unselected regions.
     pub validate: bool,
+    /// As in `ParsedDocument`, for fused extraction.
+    pub null: rustler::Atom,
+    pub missing: rustler::Atom,
 }
 
 #[rustler::resource_impl]
