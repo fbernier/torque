@@ -304,6 +304,23 @@ defmodule Torque.PointerTest do
       {:ok, doc} = Torque.parse(~s({"a":1,"a":2}))
       assert [{:ok, %{"a" => 2}}] = Torque.get_many(doc, [""])
     end
+
+    # Past 64 members the object is built from heap arrays, and past 32 ERTS
+    # makes a hash map; duplicates there still resolve to the last value.
+    test "large objects with duplicate keys match decode/1" do
+      for size <- [40, 100] do
+        members = Enum.map(1..size, &~s("k#{&1}":{"v":[#{&1}]}))
+        dups = Enum.map(1..10, &~s("k#{&1}":{"v":"last #{&1}"}))
+        json = "{" <> Enum.join(members ++ dups, ",") <> "}"
+        expected = Torque.decode!(json)
+        assert map_size(expected) == size
+        assert expected["k1"] == %{"v" => "last 1"}
+
+        {:ok, doc} = Torque.parse(json)
+        assert {:ok, ^expected} = Torque.get(doc, "")
+        assert [^expected] = Torque.get_many_nil(doc, [""])
+      end
+    end
   end
 
   describe "get/3 error propagation" do
@@ -320,6 +337,17 @@ defmodule Torque.PointerTest do
 
     test "empty string" do
       assert {:error, _} = Torque.parse("")
+    end
+
+    test "error messages do not quote the input" do
+      json = ~s({"password":"hunter2", oops})
+      pointers = Torque.compile_pointers(["/password"])
+
+      for result <- [Torque.parse(json), Torque.parse_get_many_nil(json, pointers)] do
+        assert {:error, message} = result
+        assert message =~ ~r/ at line 1 column \d+$/
+        refute message =~ "hunter2"
+      end
     end
   end
 
@@ -370,6 +398,68 @@ defmodule Torque.PointerTest do
       assert {:ok, _} = Torque.parse(~s({"a":1}), unique_keys: true)
       assert {:ok, ~s({"a":1})} = Torque.encode(%{a: 1}, dirty: true)
       assert ~s({"a":1}) == Torque.encode_to_iodata(%{a: 1}, dirty: true)
+    end
+  end
+
+  describe "integers beyond 64 bits" do
+    # Each lookup path must agree with decode/1, which builds exact bignums:
+    # one past u64::MAX, one past i64::MIN, one far past f64 precision, and
+    # two past the f64 range, the last too long for the stack-built bignum.
+    @bignums [
+      18_446_744_073_709_551_616,
+      -9_223_372_036_854_775_809,
+      String.to_integer("1" <> String.duplicate("0", 300)) + 1,
+      -String.to_integer("1" <> String.duplicate("0", 400)),
+      String.to_integer("1" <> String.duplicate("0", 700))
+    ]
+
+    test "every lookup returns the exact integer" do
+      for n <- @bignums do
+        json = ~s({"n":#{n},"box":[#{n}],"deep":{"m":[#{n}]}})
+        assert {:ok, %{"n" => ^n}} = Torque.decode(json)
+
+        {:ok, doc} = Torque.parse(json)
+        assert {:ok, ^n} = Torque.get(doc, "/n")
+        assert [{:ok, ^n}] = Torque.get_many(doc, ["/n"])
+        assert [^n] = Torque.get_many_nil(doc, ["/n"])
+        assert [^n] = Torque.get_many_nil(doc, Torque.compile_pointers(["/n"]))
+
+        for validate <- [true, false] do
+          paths = ["/n", "/box", "/deep", "/deep/m/0"]
+          pointers = Torque.compile_pointers(paths, validate: validate)
+          deep = %{"m" => [n]}
+
+          assert {:ok, [^n, [^n], ^deep, ^n]} = Torque.parse_get_many_nil(json, pointers)
+        end
+
+        # Validated skipping still rejects integers past the f64 range;
+        # accepting them there costs ~10% on number-heavy documents.
+        skipped = Torque.compile_pointers(["/other"])
+        doc = ~s({"n":#{n},"other":1})
+
+        if abs(n) < 1.0e308 do
+          assert {:ok, [1]} = Torque.parse_get_many_nil(doc, skipped)
+        else
+          assert {:error, _} = Torque.parse_get_many_nil(doc, skipped)
+        end
+
+        unvalidated = Torque.compile_pointers(["/other"], validate: false)
+        assert {:ok, [1]} = Torque.parse_get_many_nil(doc, unvalidated)
+      end
+    end
+
+    test "numbers outside the f64 range that are not integers are still rejected" do
+      huge = "1" <> String.duplicate("0", 400)
+      pointers = Torque.compile_pointers(["/n"])
+      skipped = Torque.compile_pointers(["/other"])
+
+      for token <- ["1e400", "-1e400", huge <> ".0", huge <> "e0"] do
+        json = ~s({"n":#{token},"other":1})
+        assert {:error, _} = Torque.decode(json)
+        assert {:error, _} = Torque.parse(json)
+        assert {:error, _} = Torque.parse_get_many_nil(json, pointers)
+        assert {:error, _} = Torque.parse_get_many_nil(json, skipped)
+      end
     end
   end
 
@@ -986,6 +1076,27 @@ defmodule Torque.PointerTest do
 
       assert_receive {^ua, retained}
       assert retained < 4096, "a 100-byte field kept #{retained} bytes of input alive"
+    end
+
+    test "a container taken from a large input is copied and decoded intact" do
+      long = String.duplicate("m", 80)
+
+      records =
+        "[" <>
+          Enum.map_join(1..50, ",", fn i ->
+            ~s({"zeta":#{i},"mid":"#{long}","alpha":"v#{i}","beta":[#{i}],"gamma":null})
+          end) <> "]"
+
+      json = ~s({"pad":"#{String.duplicate("x", 400_000)}","recs":#{records}})
+
+      for ptrs <- [
+            Torque.compile_pointers(["/recs"]),
+            Torque.compile_pointers(["/recs"], validate: false)
+          ] do
+        assert {:ok, [recs]} = Torque.parse_get_many_nil(json, ptrs)
+        assert recs == Torque.decode!(records)
+        assert Enum.all?(recs, &(:binary.referenced_byte_size(&1["mid"]) == 80))
+      end
     end
   end
 end

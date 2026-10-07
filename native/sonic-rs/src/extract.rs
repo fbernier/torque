@@ -15,9 +15,9 @@ use ahash::AHashMap;
 use sonic_number::ParserNumber;
 
 use crate::{
-    error::{ErrorCode, Result},
+    error::{Error, ErrorCode, Result},
     parser::Reference,
-    parser::{restore_neg_zero, Parser, MAX_PARSE_DEPTH},
+    parser::{is_integer_token, restore_neg_zero, Parser, MAX_PARSE_DEPTH},
     reader::{Read, Reader},
     util::utf8::from_utf8,
     value::shared::Shared,
@@ -239,6 +239,8 @@ pub enum Extracted<'de> {
     F64(f64),
     Bool(bool),
     Null,
+    /// An integer literal outside the i64/u64 range, as its digits.
+    BigInt(&'de str),
     /// A selected container, already validated, as its JSON text. Callers
     /// decode it themselves rather than pay for a `Value` arena.
     Raw(&'de [u8]),
@@ -406,8 +408,11 @@ impl<'de> Extractor<'_, '_, 'de> {
         // that value when one requested path prefixes another.
         if let Some(slot) = n.slot {
             let value = if n.keys.is_empty() && matches!(parser.skip_space_peek(), Some(b'{' | b'[')) {
-                let (span, _) = parser.skip_one_at(true, depth)?;
-                Extracted::Raw(span)
+                let start = parser.read.index();
+                match parser.skip_one_at(true, depth) {
+                    Ok((span, _)) => Extracted::Raw(span),
+                    Err(err) => reparse_container(parser, strbuf, start, depth, err)?,
+                }
             } else {
                 parse_value_in_place(parser, strbuf, depth)?
             };
@@ -673,6 +678,22 @@ fn last_key<'v>(value: &'v Value, key: &str) -> Option<&'v Value> {
     }
 }
 
+/// A selected container failed the checked skip, which rejects integers too
+/// large for `f64`. Building it instead accepts them, so retry that way and
+/// keep the skip's error if the container is malformed after all.
+#[cold]
+#[inline(never)]
+fn reparse_container<'de, R: Reader<'de>>(
+    parser: &mut Parser<R>,
+    strbuf: &mut Vec<u8>,
+    start: usize,
+    depth: usize,
+    err: Error,
+) -> Result<Extracted<'de>> {
+    parser.read.set_index(start);
+    parse_value_in_place(parser, strbuf, depth).map_err(|_| err)
+}
+
 /// Parses the current value in place. Scalars are built directly, unescaped
 /// strings borrow the input, and only containers need an arena.
 fn parse_value_in_place<'de, R: Reader<'de>>(
@@ -705,15 +726,25 @@ fn parse_value_in_place<'de, R: Reader<'de>>(
         Some(c @ b'-') | Some(c @ b'0'..=b'9') => {
             let start = parser.read.index();
             parser.read.eat(1);
-            match parser.parse_number(c)? {
+            let number = match parser.parse_number(c) {
+                Ok(number) => number,
+                Err(err) => return parser.huge_int(start, c, err).map(Extracted::BigInt),
+            };
+            match number {
                 ParserNumber::Unsigned(u) => Ok(Extracted::U64(u)),
                 ParserNumber::Signed(i) => Ok(Extracted::I64(i)),
-                ParserNumber::Float(f) if f.is_finite() => {
-                    // Preserve negative zero across every decode path.
+                ParserNumber::Float(f) => {
                     let token = parser.read.slice_unchecked(start, parser.read.index());
-                    Ok(Extracted::F64(restore_neg_zero(f, token)))
+                    if is_integer_token(token) {
+                        // SAFETY: a number token is ASCII.
+                        Ok(Extracted::BigInt(unsafe { std::str::from_utf8_unchecked(token) }))
+                    } else if f.is_finite() {
+                        // Preserve negative zero across every decode path.
+                        Ok(Extracted::F64(restore_neg_zero(f, token)))
+                    } else {
+                        Err(parser.error(ErrorCode::InvalidNumber))
+                    }
                 }
-                ParserNumber::Float(_) => Err(parser.error(ErrorCode::InvalidNumber)),
             }
         }
         Some(_) => {

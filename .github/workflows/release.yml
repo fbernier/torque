@@ -74,17 +74,12 @@ jobs:
         shell: bash
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Set up Elixir for PGO profiling (Linux)
-        if: matrix.job.pgo && runner.os == 'Linux'
+      - name: Set up Elixir for PGO profiling
+        if: matrix.job.pgo
         uses: erlef/setup-beam@v1
         with:
           otp-version: "27"
           elixir-version: "1.18"
-
-      - name: Set up Elixir for PGO profiling (macOS)
-        if: matrix.job.pgo && runner.os == 'macOS'
-        shell: bash
-        run: brew install elixir
 
       - name: Collect PGO profile
         if: matrix.job.pgo
@@ -107,8 +102,9 @@ jobs:
           # generic build profiles different functions than v3 ships).
           RUSTFLAGS="${{ matrix.job.rustflags }}"
           case "$RUSTFLAGS" in
-            *x86-64-v3*) NEED="avx2 bmi2 fma pclmulqdq" ;;
-            *x86-64-v2*) NEED="sse4_2 ssse3 popcnt" ;;
+            # Same flag sets as Torque.CPU.
+            *x86-64-v3*) NEED="pni ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm avx avx2 bmi1 bmi2 f16c fma abm movbe pclmulqdq" ;;
+            *x86-64-v2*) NEED="pni ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm" ;;
             *) NEED="" ;;
           esac
           for f in $NEED; do
@@ -154,6 +150,22 @@ jobs:
             MISSES=$(grep -c "no profile data available" build.log || true)
             echo "::notice::PGO: ${MISSES} functions without profile data (${{ matrix.job.target }}${{ matrix.job.variant && format(' {0}', matrix.job.variant) || '' }})"
           fi
+
+      # Runs the suite against the exact library this job ships. Only the PGO
+      # jobs can: their runner matches the target and already has Elixir. The
+      # compile builds a throwaway NIF (the draft release has nothing to
+      # download yet), which the shipped one then replaces.
+      - name: Test the built library
+        if: matrix.job.pgo
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TORQUE_BUILD=true MIX_ENV=test
+          mix deps.get
+          mix compile
+          EXT=so; [[ "${{ matrix.job.target }}" == *darwin* ]] && EXT=dylib
+          cp "target/${{ matrix.job.target }}/release/libtorque_nif.$EXT" priv/native/torque_nif.so
+          mix test --no-compile
 
       - name: Package artifact
         shell: bash

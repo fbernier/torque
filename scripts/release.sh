@@ -44,6 +44,26 @@ if [ -z "${SKIP_PUBLISH:-}" ] && [ -z "${HEX_API_KEY:-}" ]; then
   exit 1
 fi
 
+# The tag must point at a pushed commit that passed CI: a tag on an unpushed or
+# red commit still triggers the release build, and the tag is hard to retract.
+HEAD_SHA=$(git rev-parse HEAD)
+git fetch -q origin main
+if [ "$HEAD_SHA" != "$(git rev-parse origin/main)" ]; then
+  echo "error: HEAD is not origin/main, push main or check it out before releasing"
+  exit 1
+fi
+
+CI_RUN=$(gh run list --workflow=ci.yml --commit "$HEAD_SHA" --event push --json databaseId --jq '.[0].databaseId')
+if [ -z "$CI_RUN" ]; then
+  echo "error: no CI run found for ${HEAD_SHA}"
+  exit 1
+fi
+echo "==> Waiting for CI run ${CI_RUN} on ${HEAD_SHA}"
+if ! gh run watch "$CI_RUN" --exit-status >/dev/null; then
+  echo "error: CI failed for ${HEAD_SHA}: https://github.com/lpgauth/torque/actions/runs/${CI_RUN}"
+  exit 1
+fi
+
 # Create and push tag
 echo "==> Creating tag ${TAG}"
 git tag "$TAG"

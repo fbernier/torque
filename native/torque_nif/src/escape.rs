@@ -787,6 +787,110 @@ mod tests {
         }
     }
 
+    // Runtime dispatch picks AVX2 on every CI runner, so the SSE2 kernels only
+    // run on old hardware unless called directly.
+    #[cfg(target_arch = "x86_64")]
+    mod x86_kernels {
+        use super::super::*;
+
+        type Escape = unsafe fn(*const u8, usize, *mut u8) -> usize;
+        type Validate = unsafe fn(*const u8, usize, *mut u8) -> Result<usize, ()>;
+
+        fn escape_with(kernel: Escape, input: &[u8]) -> Vec<u8> {
+            let mut dst = vec![0u8; input.len() * 6 + 64];
+            let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr()) };
+            dst.truncate(n);
+            dst
+        }
+
+        fn validate_with(kernel: Validate, input: &[u8]) -> Result<Vec<u8>, ()> {
+            let mut dst = vec![0u8; input.len() * 6 + 64];
+            let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr())? };
+            dst.truncate(n);
+            Ok(dst)
+        }
+
+        fn kernels() -> Vec<(&'static str, Escape, Validate)> {
+            let mut k: Vec<(&'static str, Escape, Validate)> =
+                vec![("sse2", escape_sse2, validate_escape_sse2)];
+            if is_x86_feature_detected!("avx2") {
+                k.push(("avx2", escape_avx2, validate_escape_avx2));
+            }
+            k
+        }
+
+        fn inputs() -> Vec<Vec<u8>> {
+            let mut all = Vec::new();
+            for len in 0..100usize {
+                all.push(vec![b'a'; len]);
+                for pos in 0..len {
+                    for special in [b'"', b'\\', 0x01, b'\n', 0x1f] {
+                        let mut input = vec![b'a'; len];
+                        input[pos] = special;
+                        all.push(input);
+                    }
+                }
+            }
+            for pad in 0..70usize {
+                for seq in ["é", "✨", "🚀"] {
+                    let mut input = vec![b'a'; pad];
+                    input.extend_from_slice(seq.as_bytes());
+                    input.extend_from_slice(b"\"tail\\");
+                    all.push(input);
+                }
+            }
+            all
+        }
+
+        #[test]
+        fn escape_kernels_match_the_scalar_kernel() {
+            for (name, escape, _) in kernels() {
+                for input in inputs() {
+                    assert_eq!(
+                        escape_with(escape, &input),
+                        escape_with(escape_scalar, &input),
+                        "{name} on {input:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn validating_kernels_match_the_scalar_kernel() {
+            for (name, _, validate) in kernels() {
+                for input in inputs() {
+                    assert_eq!(
+                        validate_with(validate, &input),
+                        validate_with(validate_escape_scalar, &input),
+                        "{name} on {input:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn validating_kernels_reject_invalid_utf8_at_any_offset() {
+            for (name, _, validate) in kernels() {
+                for pad in 0..70usize {
+                    for bad in [
+                        &[0xFFu8][..],
+                        &[0xC3, 0x28],
+                        &[0xED, 0xA0, 0x80],
+                        &[0xE2, 0x82],
+                    ] {
+                        let mut input = vec![b'a'; pad];
+                        input.extend_from_slice(bad);
+                        input.extend_from_slice(&[b'b'; 40]);
+                        assert!(
+                            validate_with(validate, &input).is_err(),
+                            "{name} accepted {bad:?} after {pad} bytes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn invalid_utf8_is_rejected_after_any_clean_prefix() {
         for pad in 0..40usize {

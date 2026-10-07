@@ -1670,6 +1670,11 @@ impl<'de, 'a> JsonVisitor<'de> for DocumentVisitor<'a> {
     }
 
     #[inline(always)]
+    fn visit_overflow_int(&mut self, raw: &str, _as_f64: f64) -> bool {
+        self.visit_raw_number(raw)
+    }
+
+    #[inline(always)]
     fn visit_borrowed_raw_number(&mut self, val: &str) -> bool {
         let idx = self.index();
         self.push_node(Value::pack_str(Meta::RAWNUM_NODE, idx, val))

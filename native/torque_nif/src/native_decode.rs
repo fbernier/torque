@@ -10,8 +10,8 @@
 //! result. After a successful parse the stack holds exactly the root term.
 
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_put,
-    enif_make_new_map, enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
+    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_sub_binary,
+    enif_make_uint64, ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
@@ -19,13 +19,21 @@ use std::cell::RefCell;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
-use crate::nif_util::{make_tuple2, map_from_arrays};
+use crate::nif_util::{make_map, make_tuple2, FLATMAP_LIMIT};
 use crate::types::MAX_DEPTH;
 
-/// Cap on the retained thread-local value stack (in terms, 8 bytes each ≈ 1 MB),
-/// so a one-off huge document doesn't pin a large allocation on a scheduler
-/// thread indefinitely. Mirrors the encoder's `BUF_RETAIN_CAP`.
-const VALUES_RETAIN_CAP: usize = 1 << 17;
+/// Cap on each retained thread-local buffer, so a one-off huge document
+/// doesn't pin a large allocation on a scheduler thread indefinitely. Mirrors
+/// the encoder's `BUF_RETAIN_CAP`.
+const RETAIN_CAP_BYTES: usize = 1 << 20;
+
+#[inline]
+fn cap_retained<T>(buf: &mut Vec<T>) {
+    let max = RETAIN_CAP_BYTES / std::mem::size_of::<T>();
+    if buf.capacity() > max {
+        buf.shrink_to(max);
+    }
+}
 
 const KEY_CACHE_SLOTS: usize = 256;
 /// Longest key eligible for caching; bounds the byte-compare on lookup.
@@ -101,8 +109,6 @@ impl KeyCache {
     }
 }
 
-/// Largest map ERTS stores as a flatmap (`MAP_SMALL_MAP_LIMIT`).
-const FLATMAP_LIMIT: usize = 32;
 /// Below this, ERTS's sort is cheaper than checking the order ourselves.
 const MIN_ORDERED_MEMBERS: usize = 4;
 
@@ -173,9 +179,6 @@ impl InputRef {
     /// a different allocation, where `offset_from` would be undefined.
     #[inline]
     fn offset_within(&self, s: &str) -> Option<usize> {
-        if !self.borrow {
-            return None;
-        }
         let offset = (s.as_ptr() as usize).checked_sub(self.base as usize)?;
         let room = self.len.checked_sub(offset)?;
         (s.len() <= room).then_some(offset)
@@ -205,14 +208,17 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         self.values.push(term);
     }
 
-    /// Sub-binary (zero-copy) when the str lives in the input buffer, else copy
-    /// (escaped strings are unescaped into the parser's scratch buffer).
+    /// Sub-binary (zero-copy) when borrowing is allowed and the str lives in the
+    /// input buffer, else copy (escaped strings are unescaped into the parser's
+    /// scratch buffer).
     #[inline]
     fn str_term(&self, s: &str) -> ERL_NIF_TERM {
-        if let Some(offset) = self.input.offset_within(s) {
-            return unsafe {
-                enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
-            };
+        if self.input.borrow {
+            if let Some(offset) = self.input.offset_within(s) {
+                return unsafe {
+                    enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
+                };
+            }
         }
         let mut binary = NewBinary::new(self.env, s.len());
         binary.as_mut_slice().copy_from_slice(s.as_bytes());
@@ -336,25 +342,6 @@ fn build_map(
     make_map(env, keys, vals)
 }
 
-#[inline]
-fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
-    unsafe {
-        let mut map: ERL_NIF_TERM = 0;
-        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) {
-            map
-        } else {
-            // Duplicate keys: last value wins (matches value_to_term).
-            map = enif_make_new_map(env.as_c_arg());
-            for i in 0..keys.len() {
-                let mut new_map: ERL_NIF_TERM = 0;
-                enif_make_map_put(env.as_c_arg(), map, keys[i], vals[i], &mut new_map);
-                map = new_map;
-            }
-            map
-        }
-    }
-}
-
 // Erlang External Term Format tags for arbitrary-precision integers.
 const ETF_VERSION: u8 = 131;
 const SMALL_BIG_EXT: u8 = 110;
@@ -370,7 +357,7 @@ const MAG_CAP: usize = 255;
 /// buffer. Tokens beyond `MAG_CAP` bytes defer to `num-bigint` so correctness
 /// stays unbounded. Returns `None` only if the digits don't parse.
 #[inline]
-fn bignum_term(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
+pub(crate) fn bignum_term(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     let (neg, digits) = match raw.as_bytes().split_first() {
         Some((b'-', rest)) => (1u8, rest),
         _ => (0u8, raw.as_bytes()),
@@ -581,12 +568,19 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     }
 }
 
-pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
+/// Decodes a whole document. With `borrow`, strings the parser did not have to
+/// unescape are sub-binaries of `input_term`; otherwise every string is copied.
+pub fn decode_to_term<'a>(
+    env: Env<'a>,
+    input_term: ERL_NIF_TERM,
+    bytes: &[u8],
+    borrow: bool,
+) -> Term<'a> {
     let input = InputRef {
         term: input_term,
         base: bytes.as_ptr(),
         len: bytes.len(),
-        borrow: true,
+        borrow,
     };
     match decode_with(env, input, bytes) {
         Ok(Some(root)) => make_tuple2(env, atoms::ok().as_c_arg(), root),
@@ -659,9 +653,9 @@ fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF
             Err(e) => Err(Failure::Parse(e)),
         };
 
-        if builder.values.capacity() > VALUES_RETAIN_CAP {
-            builder.values.shrink_to(VALUES_RETAIN_CAP);
-        }
+        cap_retained(builder.values);
+        cap_retained(builder.key_terms);
+        cap_retained(builder.ords);
         result
     })
 }

@@ -28,7 +28,9 @@ def deps do
 end
 ```
 
-Precompiled binaries are available for common targets. To compile from source, install a stable Rust toolchain and set `TORQUE_BUILD=true`.
+Precompiled binaries are available for macOS and glibc Linux on `aarch64` and `x86_64` (with CPU-optimized variants on `x86_64`, below). Anything else, such as musl (Alpine) or Windows, builds from source: install a stable Rust toolchain and set `TORQUE_BUILD=true`.
+
+A source build targets the platform's baseline CPU, so the binary runs on any machine of that architecture. On x86_64 that baseline is SSE2, which leaves the AVX2 parser paths out: set `RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"` to match the precompiled v3 variant, or `-C target-cpu=native` only when the binary will run on the machine that built it.
 
 ### CPU-optimized variants
 
@@ -86,9 +88,14 @@ for faster field lookups (uses sonic-rs internal indexing instead of linear scan
 When the same fixed set of paths is extracted from every document, compile the
 pointers once and reuse the handle. `parse_get_many_nil/2` then reads the
 document in a single pass, building values only where a path ends and skipping
-everything else, without building an intermediate document. On a 1.2 KB bid
-request with 26 fields that is ~1.35× the previous fused parse; with 3 paths
-and `validate: false` (below) it is ~2.6×.
+everything else, without building an intermediate document. Against
+`parse/2` + `get_many_nil/2` with the same handle, on PGO builds:
+
+| | arm64 (M1 Pro) | x86_64 (Xeon E5-2630 v3) |
+|---|---|---|
+| 1.2 KB bid request, all 51 fields | ~3× faster | ~3.6× faster |
+| 1.2 KB bid request, 3 fields | ~1.3× faster | ~3× faster |
+| 776 KB feed, 3 fields | parity | ~3.2× faster |
 
 ```elixir
 # Once, at startup (e.g. into :persistent_term or application state; the
@@ -113,9 +120,10 @@ trusted input.
 
 It is not a free speed-up. A bracket scan over 64-byte blocks beats tokenizing
 a large subtree and loses to it on the few-byte scalars a dense path set leaves
-behind, so the win tracks how little of the document the paths select. Three
-paths out of a 2 KB request run ~3.6× faster unvalidated; 146 fields of the
-same request run ~1.2× slower. Measure your own path set.
+behind, so the win tracks how little of the document the paths select.
+Against a validated handle, on both machines, 3 paths run ~1.9× faster
+unvalidated on the 1.2 KB request and ~4× faster on the 776 KB feed, while all
+51 fields of the request run 3-7% slower. Measure your own path set.
 
 ```elixir
 pointers = Torque.compile_pointers(paths, unique_keys: true, validate: false)
@@ -173,13 +181,34 @@ expected to encode to large output (more than roughly 20 KB):
 {:ok, json} = Torque.encode(big_term, dirty: true)
 ```
 
+## Using with Phoenix, Plug and Postgrex
+
+Torque provides the functions these libraries call on a JSON module
+(`encode_to_iodata!/1`, `encode!/1`, `decode!/1`), so it can replace Jason in
+their configuration:
+
+```elixir
+# config/config.exs
+config :phoenix, :json_library, Torque
+config :postgrex, :json_library, Torque
+
+# endpoint.ex
+plug Plug.Parsers,
+  parsers: [:urlencoded, :multipart, :json],
+  json_decoder: Torque
+```
+
+Structs, Ecto schemas included, must implement `Torque.Encoder` (for example
+`@derive {Torque.Encoder, only: [:id, :name]}`): a struct without an
+implementation raises rather than encoding its raw fields.
+
 ## API
 
 | Function | Description |
 |----------|-------------|
 | `Torque.compile_pointers(paths, opts)` | Pre-compile a fixed path set into a reusable handle |
-| `Torque.decode(binary)` | Decode JSON to Elixir terms |
-| `Torque.decode!(binary)` | Decode JSON, raising on error |
+| `Torque.decode(binary, opts)` | Decode JSON to Elixir terms (`strings: :copy` to detach strings from the input) |
+| `Torque.decode!(binary, opts)` | Decode JSON, raising on error |
 | `Torque.encode(term, opts)` | Encode term to JSON binary |
 | `Torque.encode!(term, opts)` | Encode term, raising on error |
 | `Torque.encode_to_iodata(term, opts)` | Encode term, returns binary directly (fastest) |
@@ -188,6 +217,7 @@ expected to encode to large output (more than roughly 20 KB):
 | `Torque.get(doc, path, default)` | Extract field with default for missing paths |
 | `Torque.get_many(doc, paths)` | Extract multiple fields in one NIF call |
 | `Torque.get_many_nil(doc, paths)` | Extract multiple fields, `nil` for missing |
+| `Torque.get_many_defaults(doc, defaults)` | Extract fields with per-path defaults (`%{path => default}`) |
 | `Torque.length(doc, path)` | Return length of array at path |
 | `Torque.parse(binary, opts)` | Parse JSON into opaque document reference |
 | `Torque.parse_get_many_nil(binary, pointers)` | Fused parse + extract of compiled pointers in one NIF call |
@@ -208,7 +238,7 @@ expected to encode to large output (more than roughly 20 KB):
 
 For objects with duplicate keys, the last value wins (unless `unique_keys: true` is passed to `parse/2`).
 
-Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) via `decode/1`, rather than degrading to lossy floats. The `parse/2` + `get/2` path returns them as floats, since the parsed document cannot hold a bignum.
+Integers outside the signed/unsigned 64-bit range decode as exact arbitrary-precision integers (Erlang bignums) rather than degrading to lossy floats, from `decode/1` and from every `get` and `parse_get_many_nil` lookup alike. One exception: a `compile_pointers/2` handle with the default `validate: true` rejects an integer beyond the `f64` range (about 1.8e308) in a region no path selects.
 
 ### Elixir to JSON
 

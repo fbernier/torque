@@ -16,12 +16,12 @@ defmodule Torque do
       values only where a path ends and skipping everything else. For one-shot
       extraction — parse a payload, take a few fields, discard it — prefer this
       over `parse/2` + `get/2`: it never builds the document it is about to
-      throw away. That is worth ~1.4× on a request-shaped payload and fades to
-      parity as the document grows, since on a large one the plan walk costs
-      about what the document build it replaces did. The bigger lever is
-      `validate: false` on the handle, worth ~7× on a 450 KB feed read through
-      a handful of paths, but read its note in `compile_pointers/2` first: it
-      is only a win when the paths select a small part of the document.
+      throw away. Measured, it is never slower, and anywhere from parity to
+      several times faster depending on the document's size and the CPU. The
+      bigger lever on large documents is `validate: false` on the handle, but
+      read its note in `compile_pointers/2` first: it is only a win when the
+      paths select a small part of the document. The README has measured
+      figures.
 
     * **Full decode** — `decode/1` converts an entire JSON binary into
       Elixir terms in one pass.
@@ -78,6 +78,12 @@ defmodule Torque do
   """
   @opaque pointers :: reference()
 
+  @typedoc """
+  An opaque handle to a parsed JSON document, returned by `parse/2`. Pass it to
+  `get/2`, `get_many/2`, `get_many_nil/2`, `get_many_defaults/2` or `length/2`.
+  """
+  @opaque document :: reference()
+
   # --- Decoding ---
 
   @doc """
@@ -92,6 +98,16 @@ defmodule Torque do
 
   Automatically uses a dirty CPU scheduler for inputs larger than 20 KB.
 
+  ## Options
+
+    * `:strings`: `:reference` (the default) returns strings longer than 64
+      bytes as sub-binaries of `json` where no unescaping was needed, which
+      saves a copy but keeps all of `json` alive for as long as any of them
+      is. `:copy` gives every string its own binary: use it when only a small
+      part of a large document outlives the call.
+
+  Any other option raises `ArgumentError`.
+
   ## Examples
 
       iex> Torque.decode(~s({"a":1,"b":"hello"}))
@@ -100,21 +116,49 @@ defmodule Torque do
       iex> Torque.decode(~s([1,2,3]))
       {:ok, [1, 2, 3]}
 
+      iex> Torque.decode(~s({"a":"hello"}), strings: :copy)
+      {:ok, %{"a" => "hello"}}
+
       iex> match?({:error, _}, Torque.decode("invalid"))
       true
   """
   @doc group: :decode
-  @spec decode(binary()) :: {:ok, term()} | {:error, binary() | :nesting_too_deep}
-  def decode(json) when is_binary(json) and byte_size(json) > @timeslice_bytes do
+  @spec decode(binary(), keyword()) :: {:ok, term()} | {:error, binary() | :nesting_too_deep}
+  def decode(json, opts \\ [])
+
+  def decode(json, []) when is_binary(json) and byte_size(json) > @timeslice_bytes do
     Torque.Native.decode_dirty(json)
   end
 
-  def decode(json) when is_binary(json) do
+  def decode(json, []) when is_binary(json) do
     Torque.Native.decode(json)
+  end
+
+  def decode(json, opts) when is_binary(json) and byte_size(json) > @timeslice_bytes do
+    Torque.Native.decode_opts_dirty(json, copy_strings!(opts))
+  end
+
+  def decode(json, opts) when is_binary(json) do
+    Torque.Native.decode_opts(json, copy_strings!(opts))
+  end
+
+  defp copy_strings!(opts) do
+    case Keyword.validate!(opts, strings: :reference)[:strings] do
+      :reference ->
+        false
+
+      :copy ->
+        true
+
+      other ->
+        raise ArgumentError, "expected :strings to be :reference or :copy, got: #{inspect(other)}"
+    end
   end
 
   @doc """
   Decodes a JSON binary into Elixir terms, raising on error.
+
+  Accepts the same options as `decode/2`.
 
   ## Examples
 
@@ -122,9 +166,9 @@ defmodule Torque do
       %{"a" => 1}
   """
   @doc group: :decode
-  @spec decode!(binary()) :: term()
-  def decode!(json) when is_binary(json) do
-    case decode(json) do
+  @spec decode!(binary(), keyword()) :: term()
+  def decode!(json, opts \\ []) when is_binary(json) do
+    case decode(json, opts) do
       {:ok, term} -> term
       {:error, reason} -> raise ArgumentError, "decode error: #{reason}"
     end
@@ -417,7 +461,7 @@ defmodule Torque do
       {:ok, 1}
   """
   @doc group: :parse_get
-  @spec parse(binary(), keyword()) :: {:ok, reference()} | {:error, binary() | :nesting_too_deep}
+  @spec parse(binary(), keyword()) :: {:ok, document()} | {:error, binary() | :nesting_too_deep}
   def parse(json, opts \\ [])
 
   def parse(json, []) when is_binary(json) and byte_size(json) > @timeslice_bytes do
@@ -449,6 +493,11 @@ defmodule Torque do
   entry point in Torque agrees on that, and changing it would silently move
   existing callers' lookups, so it stands until a breaking release.
 
+  A malformed pointer (non-empty without a leading `"/"`, or with a `~` not
+  followed by `0` or `1`) matches nothing and returns
+  `{:error, :no_such_field}`. `compile_pointers/2` raises for the same strings
+  instead, since it runs once at setup, where a typo should fail loudly.
+
   ## Examples
 
       iex> {:ok, doc} = Torque.parse(~s({"site":{"domain":"example.com"}}))
@@ -460,7 +509,7 @@ defmodule Torque do
       {:error, :no_such_field}
   """
   @doc group: :parse_get
-  @spec get(reference(), binary()) ::
+  @spec get(document(), binary()) ::
           {:ok, term()} | {:error, :no_such_field | :nesting_too_deep}
   def get(doc, path) when is_reference(doc) and is_binary(path) do
     Torque.Native.get(doc, path)
@@ -471,7 +520,8 @@ defmodule Torque do
   does not exist.
 
   Raises `ArgumentError` for errors other than `:no_such_field`
-  (e.g. `:nesting_too_deep`).
+  (e.g. `:nesting_too_deep`). A malformed pointer returns `default`, as it
+  returns `:no_such_field` from `get/2`.
 
   ## Examples
 
@@ -484,7 +534,7 @@ defmodule Torque do
       :default
   """
   @doc group: :parse_get
-  @spec get(reference(), binary(), term()) :: term()
+  @spec get(document(), binary(), term()) :: term()
   def get(doc, path, default) when is_reference(doc) and is_binary(path) do
     case Torque.Native.get(doc, path) do
       {:ok, value} -> value
@@ -505,7 +555,8 @@ defmodule Torque do
   still, since it never builds the document at all, though that advantage
   narrows to nothing as the document grows.
 
-  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary. A malformed
+  pointer gives `{:error, :no_such_field}`, as in `get/2`.
 
   ## Examples
 
@@ -514,7 +565,7 @@ defmodule Torque do
       [{:ok, 1}, {:ok, 2}, {:error, :no_such_field}]
   """
   @doc group: :parse_get
-  @spec get_many(reference(), [binary()]) ::
+  @spec get_many(document(), [binary()]) ::
           [{:ok, term()} | {:error, :no_such_field | :nesting_too_deep}]
   def get_many(doc, paths) when is_reference(doc) and is_list(paths) do
     Torque.Native.get_many(doc, paths)
@@ -535,7 +586,8 @@ defmodule Torque do
   parsing and is the recommended option for a fixed, repeatedly-queried path
   set.
 
-  Raises `ArgumentError` if any path is not a valid UTF-8 binary.
+  Raises `ArgumentError` if any path is not a valid UTF-8 binary. A malformed
+  pointer gives `nil`, as it gives `:no_such_field` from `get/2`.
 
   ## Examples
 
@@ -549,7 +601,7 @@ defmodule Torque do
       [1, nil, nil]
   """
   @doc group: :parse_get
-  @spec get_many_nil(reference(), [binary()] | pointers()) :: [term()]
+  @spec get_many_nil(document(), [binary()] | pointers()) :: [term()]
   def get_many_nil(doc, paths) when is_reference(doc) and is_list(paths) do
     Torque.Native.get_many_nil(doc, paths)
   end
@@ -565,8 +617,7 @@ defmodule Torque do
   re-split and unescape those pointer strings on every call — wasted work, since
   they never change. `compile_pointers/2` does it once and returns an opaque
   `t:pointers/0` handle that `parse_get_many_nil/2` and `get_many_nil/2` accept
-  in place of a path list, eliminating all per-call path parsing (≈2× faster
-  extraction on a typical field set).
+  in place of a path list, eliminating all per-call path parsing.
 
   Compile once at startup (e.g. into `:persistent_term`, application state or
   the process holding the documents) and reuse the handle for every document.
@@ -597,8 +648,7 @@ defmodule Torque do
       Measure before enabling it. Skipping a region structurally is a bracket
       scan over 64-byte blocks, which beats tokenizing a large subtree and
       loses to it on the few-byte scalars left over when the paths select most
-      of the document. Reading 3 paths out of a 2 KB request is ~3.6× faster
-      unvalidated; reading 146 of its fields is ~1.2× *slower*.
+      of the document, so the win tracks how little of it the paths select.
 
   Any other option raises `ArgumentError`.
 
@@ -674,7 +724,8 @@ defmodule Torque do
       |> Map.new(fn {p, nil} -> {p, Map.get(defaults, p)}; pv -> pv end)
 
   Note: a parsed JSON `null` at the path is indistinguishable from a missing
-  field (same as `get_many_nil/2`) — both substitute the default.
+  field (same as `get_many_nil/2`) — both substitute the default, and so does
+  a malformed pointer.
 
   ## Examples
 
@@ -683,7 +734,7 @@ defmodule Torque do
       %{"/a" => 1, "/b" => 0, "/c" => "missing"}
   """
   @doc group: :parse_get
-  @spec get_many_defaults(reference(), %{binary() => term()}) ::
+  @spec get_many_defaults(document(), %{binary() => term()}) ::
           %{binary() => term()}
   def get_many_defaults(doc, defaults)
       when is_reference(doc) and is_map(defaults) do
@@ -713,7 +764,7 @@ defmodule Torque do
       nil
   """
   @doc group: :parse_get
-  @spec length(reference(), binary()) :: non_neg_integer() | nil
+  @spec length(document(), binary()) :: non_neg_integer() | nil
   def length(doc, path) when is_reference(doc) and is_binary(path) do
     Torque.Native.array_length(doc, path)
   end

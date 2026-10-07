@@ -146,7 +146,7 @@ defmodule Torque.DecodeTest do
 
       for order <- [keys, Enum.reverse(keys), Enum.shuffle(keys)] do
         json = "{" <> Enum.map_join(order, ",", &~s("#{&1}":"#{&1}")) <> "}"
-        expected = :json.decode(json)
+        expected = Jason.decode!(json)
 
         decoded = Torque.decode!(json)
         assert map_size(decoded) == length(keys)
@@ -182,6 +182,13 @@ defmodule Torque.DecodeTest do
       assert {:error, _reason} = Torque.decode("{invalid}")
     end
 
+    test "error messages give the position without quoting the input" do
+      assert {:error, message} = Torque.decode(~s({"password":"hunter2", oops}))
+      assert message =~ ~r/ at line 1 column 24$/
+      refute message =~ "hunter2"
+      refute message =~ "oops"
+    end
+
     test "large payload uses dirty scheduler" do
       # Generate a payload > 10KB to exercise the dirty scheduler path
       large_map = Map.new(1..500, fn i -> {"key_#{i}", String.duplicate("v", 20)} end)
@@ -189,6 +196,54 @@ defmodule Torque.DecodeTest do
       assert byte_size(json) > 10_240
       assert {:ok, decoded} = Torque.decode(json)
       assert decoded == large_map
+    end
+  end
+
+  describe "decode/2 strings option" do
+    defp document(records) do
+      long = String.duplicate("s", 80)
+
+      "[" <>
+        Enum.map_join(1..records, ",", fn i ->
+          ~s({"id":#{i},"text":"#{long}#{i}","esc":"line\\n#{long}","nested":{"k":"#{long}"}})
+        end) <> "]"
+    end
+
+    defp long_strings(term) when is_map(term),
+      do: Enum.flat_map(term, fn {_, v} -> long_strings(v) end)
+
+    defp long_strings(term) when is_list(term), do: Enum.flat_map(term, &long_strings/1)
+    defp long_strings(term) when is_binary(term) and byte_size(term) > 64, do: [term]
+    defp long_strings(_), do: []
+
+    # Two records stay on the normal scheduler; 200 cross the 20 KB dirty limit.
+    test "strings: :copy decodes the same terms with every string detached" do
+      for records <- [2, 200] do
+        json = document(records)
+        reference = Torque.decode!(json)
+        assert {:ok, ^reference} = Torque.decode(json, strings: :copy)
+        assert ^reference = Torque.decode!(json, strings: :copy)
+
+        copied = long_strings(Torque.decode!(json, strings: :copy))
+        assert copied != []
+        assert Enum.all?(copied, &(:binary.referenced_byte_size(&1) == byte_size(&1)))
+
+        # The default keeps unescaped strings as sub-binaries of the input.
+        assert Enum.any?(
+                 long_strings(reference),
+                 &(:binary.referenced_byte_size(&1) == byte_size(json))
+               )
+      end
+    end
+
+    test "strings: :reference is the default" do
+      json = document(2)
+      assert Torque.decode(json, strings: :reference) == Torque.decode(json)
+    end
+
+    test "invalid options raise" do
+      assert_raise ArgumentError, fn -> Torque.decode("1", strings: :bogus) end
+      assert_raise ArgumentError, fn -> Torque.decode("1", keys: :atoms) end
     end
   end
 

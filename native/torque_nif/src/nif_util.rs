@@ -1,9 +1,10 @@
 use std::mem::MaybeUninit;
 
 use rustler::sys::{
-    enif_get_map_size, enif_make_map_from_arrays, enif_make_tuple_from_array,
-    enif_map_iterator_create, enif_map_iterator_destroy, enif_map_iterator_get_pair,
-    enif_map_iterator_next, ErlNifMapIterator, ErlNifMapIteratorEntry, ERL_NIF_TERM,
+    enif_get_map_size, enif_make_map_from_arrays, enif_make_map_put, enif_make_new_map,
+    enif_make_tuple_from_array, enif_map_iterator_create, enif_map_iterator_destroy,
+    enif_map_iterator_get_pair, enif_map_iterator_next, ErlNifMapIterator, ErlNifMapIteratorEntry,
+    ERL_NIF_TERM,
 };
 use rustler::{Env, Term};
 
@@ -30,8 +31,9 @@ pub fn timeslice_percent(bytes: usize) -> i32 {
     ((reds * 100 / REDUCTION_COUNT) as i32).clamp(1, 100)
 }
 
-/// Largest map ERTS stores as a flatmap; bigger maps are hash maps.
-const FLATMAP_LIMIT: usize = 32;
+/// Largest map ERTS stores as a flatmap (`MAP_SMALL_MAP_LIMIT`); bigger maps
+/// are hash maps.
+pub const FLATMAP_LIMIT: usize = 32;
 
 /// Build a map from key and value arrays.
 ///
@@ -60,6 +62,25 @@ pub unsafe fn map_from_arrays(
     }
     let mut size = 0;
     enif_get_map_size(env.as_c_arg(), *map, &mut size) != 0 && size == count
+}
+
+/// Build a map from an object's keys and values. Duplicate keys fall back to
+/// inserting the members in order, so the last value for a key wins.
+#[inline]
+pub fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+    unsafe {
+        let mut map: ERL_NIF_TERM = 0;
+        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) {
+            return map;
+        }
+        map = enif_make_new_map(env.as_c_arg());
+        for (&key, &val) in keys.iter().zip(vals) {
+            let mut new_map: ERL_NIF_TERM = 0;
+            enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
+            map = new_map;
+        }
+        map
+    }
 }
 
 /// Forward-only iterator over a map's entries.

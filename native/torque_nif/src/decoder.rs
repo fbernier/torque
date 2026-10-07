@@ -11,6 +11,7 @@ use rustler::{
     schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+use std::borrow::Cow;
 
 const GET_MANY_STACK: usize = 64;
 
@@ -127,23 +128,28 @@ fn object_get<'v>(
     }
 }
 
-/// RFC 6901 permits only `~0` and `~1`; any other `~` is malformed.
+/// RFC 6901 unescaping of one pointer segment: `~1` is `/` and `~0` is `~`.
+/// Returns `None` for any other `~`, which RFC 6901 does not allow.
 #[inline]
-fn escapes_valid(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'~' {
-            match bytes.get(i + 1) {
-                Some(b'0') | Some(b'1') => i += 2,
-                _ => return false,
-            }
-        } else {
-            i += 1;
-        }
+fn unescape(segment: &str) -> Option<Cow<'_, str>> {
+    if !segment.contains('~') {
+        return Some(Cow::Borrowed(segment));
     }
-    true
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while let Some(i) = rest.find('~') {
+        out.push_str(&rest[..i]);
+        out.push(match rest.as_bytes().get(i + 1) {
+            Some(b'1') => '/',
+            Some(b'0') => '~',
+            _ => return None,
+        });
+        rest = &rest[i + 2..];
+    }
+    out.push_str(rest);
+    Some(Cow::Owned(out))
 }
+
 #[inline]
 fn pointer_lookup<'v>(
     value: &'v sonic_rs::Value,
@@ -169,50 +175,7 @@ fn pointer_lookup<'v>(
                 continue;
             }
         }
-        if segment.contains('~') {
-            if !escapes_valid(segment) {
-                return None;
-            }
-            if segment.len() > 512 {
-                let unescaped = segment.replace("~1", "/").replace("~0", "~");
-                current = object_get(current, &unescaped, unique_keys)?;
-            } else {
-                let bytes = segment.as_bytes();
-                let mut tmp = [0u8; 512];
-                let mut out_len = 0usize;
-                let mut i = 0usize;
-                while i < bytes.len() {
-                    if bytes[i] == b'~' && i + 1 < bytes.len() {
-                        match bytes[i + 1] {
-                            b'1' => {
-                                tmp[out_len] = b'/';
-                                out_len += 1;
-                                i += 2;
-                            }
-                            b'0' => {
-                                tmp[out_len] = b'~';
-                                out_len += 1;
-                                i += 2;
-                            }
-                            _ => {
-                                tmp[out_len] = bytes[i];
-                                out_len += 1;
-                                i += 1;
-                            }
-                        }
-                    } else {
-                        tmp[out_len] = bytes[i];
-                        out_len += 1;
-                        i += 1;
-                    }
-                }
-                // SAFETY: input is valid UTF-8 &str; substitutions write only ASCII bytes
-                let unescaped = unsafe { std::str::from_utf8_unchecked(&tmp[..out_len]) };
-                current = object_get(current, unescaped, unique_keys)?;
-            }
-        } else {
-            current = object_get(current, segment, unique_keys)?;
-        }
+        current = object_get(current, &unescape(segment)?, unique_keys)?;
     }
     Some(current)
 }
@@ -227,14 +190,20 @@ fn do_parse(
 
 /// Build the `{:error, _}` term for a parse failure. The vendored sonic-rs caps
 /// nesting; surface that as `:nesting_too_deep` for parity with get/encode.
-/// Other errors keep the sonic-rs message string.
+/// Other errors keep the sonic-rs message string, minus the excerpt of the
+/// input it appends after a blank line: those bytes can be anything the caller
+/// was sent, and the message ends up in logs and crash reports.
 #[inline]
 pub(crate) fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<'a> {
     let err_raw = atoms::error().as_c_arg();
     if err.is_recursion_limit() {
         make_tuple2(env, err_raw, atoms::nesting_too_deep().as_c_arg())
     } else {
-        make_tuple2(env, err_raw, format!("{}", err).encode(env).as_c_arg())
+        let message = err.to_string();
+        let message = message
+            .split_once("\n\n")
+            .map_or(&*message, |(head, _)| head);
+        make_tuple2(env, err_raw, message.encode(env).as_c_arg())
     }
 }
 
@@ -363,7 +332,7 @@ fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) 
 #[rustler::nif]
 fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    let result = native_decode::decode_to_term(env, input_term, json.as_slice());
+    let result = native_decode::decode_to_term(env, input_term, json.as_slice(), true);
     schedule::consume_timeslice(env, timeslice_percent(json.len()));
     result
 }
@@ -371,7 +340,21 @@ fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_dirty<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    native_decode::decode_to_term(env, input_term, json.as_slice())
+    native_decode::decode_to_term(env, input_term, json.as_slice(), true)
+}
+
+#[rustler::nif]
+fn decode_opts<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool) -> Term<'a> {
+    let input_term = json.encode(env).as_c_arg();
+    let result = native_decode::decode_to_term(env, input_term, json.as_slice(), !copy_strings);
+    schedule::consume_timeslice(env, timeslice_percent(json.len()));
+    result
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_opts_dirty<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool) -> Term<'a> {
+    let input_term = json.encode(env).as_c_arg();
+    native_decode::decode_to_term(env, input_term, json.as_slice(), !copy_strings)
 }
 
 // --- Pre-compiled pointers + fused parse/extract ---
@@ -400,14 +383,9 @@ fn compile_one(path: &str) -> NifResult<Vec<PathSeg>> {
         None => return Err(rustler::Error::BadArg),
     };
     for segment in rest.split('/') {
-        let key = if segment.contains('~') {
-            if !escapes_valid(segment) {
-                return Err(rustler::Error::BadArg);
-            }
-            segment.replace("~1", "/").replace("~0", "~")
-        } else {
-            segment.to_string()
-        };
+        let key = unescape(segment)
+            .ok_or(rustler::Error::BadArg)?
+            .into_owned();
         match array_index(segment) {
             Some(idx) => segs.push(PathSeg::Num { idx, key }),
             None => segs.push(PathSeg::Key(key)),
@@ -596,6 +574,9 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
                     Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
                     Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
+                    Some(Extracted::BigInt(raw)) => {
+                        native_decode::bignum_term(env, raw).unwrap_or(nil_raw)
+                    }
                     Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
                     Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
                     Some(Extracted::Raw(span)) => {
@@ -718,7 +699,11 @@ mod extract_regressions {
         extract(json, plan, Validate::Yes, Keys::Repeatable)
             .unwrap()
             .into_iter()
-            .map(|value| value.map(|value| owned(Some(value)).as_u64().unwrap()))
+            .map(|value| match value {
+                Some(Extracted::U64(n)) => Some(n),
+                None => None,
+                other => panic!("expected an unsigned scalar, got {other:?}"),
+            })
             .collect()
     }
 
@@ -728,9 +713,12 @@ mod extract_regressions {
     fn selected_container_root_outlives_extraction() {
         let mut plan = ExtractPlan::new();
         plan.add_path(std::iter::empty());
+        // A selected container with no longer path into it comes back as a
+        // raw span; descending into it is what makes the root an arena value.
+        plan.add_path([Seg::Index { idx: 0, key: "0" }].into_iter());
         for validate in [Validate::Yes, Validate::No] {
             let mut values = extract("[1]", &plan, validate, Keys::Repeatable).unwrap();
-            let root = owned(values.pop().unwrap());
+            let root = owned(values.swap_remove(0));
             let child = root.get(0).unwrap().clone();
             let clone = root.clone();
             drop(values);

@@ -207,7 +207,7 @@ pub(crate) const MAX_PARSE_DEPTH: usize = 128;
 /// A numeric token with no fraction or exponent is an integer literal; when
 /// such a token only reaches the `f64` path it overflowed i64/u64.
 #[inline(always)]
-fn is_integer_token(slice: &[u8]) -> bool {
+pub(crate) fn is_integer_token(slice: &[u8]) -> bool {
     !slice.iter().any(|&b| matches!(b, b'.' | b'e' | b'E'))
 }
 
@@ -330,6 +330,24 @@ where
         ret.map_err(|err| self.error(err.into()))
     }
 
+    /// Torque patch: recovers from a `parse_number` failure on the number
+    /// token starting at `start` when that token is an integer literal, which
+    /// fails only for being too large for `f64`. Returns its digits, or `err`
+    /// for every other failure, such as `1e400`. Called from the error branch
+    /// so that parsing ordinary numbers stays exactly as it was.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn huge_int(&mut self, start: usize, first: u8, err: Error) -> Result<&'de str> {
+        self.read.set_index(start + 1);
+        if self.do_skip_number(first).is_ok() {
+            let token = self.read.slice_unchecked(start, self.read.index());
+            if is_integer_token(token) {
+                return Ok(as_str(token));
+            }
+        }
+        Err(err)
+    }
+
     /// Parse a JSON string and visit it.
     /// When `strbuf` is Some, copies into the buffer (owned, calls visit_str).
     /// When `strbuf` is None, parses inplace zero-copy (calls visit_borrowed_str).
@@ -391,7 +409,19 @@ where
             check_visit!(self, ok)
         } else {
             let start = self.read.index() - 1;
-            let ok = match self.parse_number(first)? {
+            let number = match self.parse_number(first) {
+                Ok(number) => number,
+                Err(err) => {
+                    let raw = self.huge_int(start, first, err)?;
+                    let inf = if first == b'-' {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    };
+                    return check_visit!(self, vis.visit_overflow_int(raw, inf));
+                }
+            };
+            let ok = match number {
                 ParserNumber::Float(f) => {
                     let slice = self.read.slice_unchecked(start, self.read.index());
                     if is_integer_token(slice) {

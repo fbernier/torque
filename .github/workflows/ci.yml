@@ -29,17 +29,29 @@ jobs:
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test -p torque_nif
 
   test:
-    name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - otp: "28"
+          - os: ubuntu-latest
+            otp: "28"
             elixir: "1.18"
-          - otp: "27"
+          - os: ubuntu-latest
+            otp: "27"
+            elixir: "1.18"
+          # The oldest versions mix.exs allows. Pinned: setup-beam has no
+          # OTP 24 for Ubuntu releases after 24.04.
+          - os: ubuntu-24.04
+            otp: "24"
+            elixir: "1.15"
+          # Apple Silicon: the NEON escape kernels and parser paths.
+          - os: macos-14
+            otp: "28"
             elixir: "1.18"
     steps:
       - uses: actions/checkout@v6
@@ -54,3 +66,36 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
+      - if: runner.os == 'macOS'
+        run: cargo test -p torque_nif
+
+  dialyzer:
+    name: Dialyzer, docs and package
+    runs-on: ubuntu-latest
+    env:
+      # dialyxir and ex_doc are :dev-only dependencies.
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: "28"
+          elixir-version: "1.18"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.mix/dialyxir_*.plt
+            _build/dev/dialyxir_*.plt
+            _build/dev/dialyxir_*.plt.hash
+          key: plt-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: plt-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+
+      - run: mix deps.get
+      - run: mix dialyzer
+      - run: mix docs --warnings-as-errors
+      - run: mix hex.build
