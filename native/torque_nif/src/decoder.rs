@@ -11,6 +11,7 @@ use rustler::{
     schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+use std::borrow::Cow;
 
 const GET_MANY_STACK: usize = 64;
 
@@ -127,23 +128,28 @@ fn object_get<'v>(
     }
 }
 
-/// RFC 6901 permits only `~0` and `~1`; any other `~` is malformed.
+/// RFC 6901 unescaping of one pointer segment: `~1` is `/` and `~0` is `~`.
+/// Returns `None` for any other `~`, which RFC 6901 does not allow.
 #[inline]
-fn escapes_valid(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'~' {
-            match bytes.get(i + 1) {
-                Some(b'0') | Some(b'1') => i += 2,
-                _ => return false,
-            }
-        } else {
-            i += 1;
-        }
+fn unescape(segment: &str) -> Option<Cow<'_, str>> {
+    if !segment.contains('~') {
+        return Some(Cow::Borrowed(segment));
     }
-    true
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while let Some(i) = rest.find('~') {
+        out.push_str(&rest[..i]);
+        out.push(match rest.as_bytes().get(i + 1) {
+            Some(b'1') => '/',
+            Some(b'0') => '~',
+            _ => return None,
+        });
+        rest = &rest[i + 2..];
+    }
+    out.push_str(rest);
+    Some(Cow::Owned(out))
 }
+
 #[inline]
 fn pointer_lookup<'v>(
     value: &'v sonic_rs::Value,
@@ -169,50 +175,7 @@ fn pointer_lookup<'v>(
                 continue;
             }
         }
-        if segment.contains('~') {
-            if !escapes_valid(segment) {
-                return None;
-            }
-            if segment.len() > 512 {
-                let unescaped = segment.replace("~1", "/").replace("~0", "~");
-                current = object_get(current, &unescaped, unique_keys)?;
-            } else {
-                let bytes = segment.as_bytes();
-                let mut tmp = [0u8; 512];
-                let mut out_len = 0usize;
-                let mut i = 0usize;
-                while i < bytes.len() {
-                    if bytes[i] == b'~' && i + 1 < bytes.len() {
-                        match bytes[i + 1] {
-                            b'1' => {
-                                tmp[out_len] = b'/';
-                                out_len += 1;
-                                i += 2;
-                            }
-                            b'0' => {
-                                tmp[out_len] = b'~';
-                                out_len += 1;
-                                i += 2;
-                            }
-                            _ => {
-                                tmp[out_len] = bytes[i];
-                                out_len += 1;
-                                i += 1;
-                            }
-                        }
-                    } else {
-                        tmp[out_len] = bytes[i];
-                        out_len += 1;
-                        i += 1;
-                    }
-                }
-                // SAFETY: input is valid UTF-8 &str; substitutions write only ASCII bytes
-                let unescaped = unsafe { std::str::from_utf8_unchecked(&tmp[..out_len]) };
-                current = object_get(current, unescaped, unique_keys)?;
-            }
-        } else {
-            current = object_get(current, segment, unique_keys)?;
-        }
+        current = object_get(current, &unescape(segment)?, unique_keys)?;
     }
     Some(current)
 }
@@ -420,14 +383,9 @@ fn compile_one(path: &str) -> NifResult<Vec<PathSeg>> {
         None => return Err(rustler::Error::BadArg),
     };
     for segment in rest.split('/') {
-        let key = if segment.contains('~') {
-            if !escapes_valid(segment) {
-                return Err(rustler::Error::BadArg);
-            }
-            segment.replace("~1", "/").replace("~0", "~")
-        } else {
-            segment.to_string()
-        };
+        let key = unescape(segment)
+            .ok_or(rustler::Error::BadArg)?
+            .into_owned();
         match array_index(segment) {
             Some(idx) => segs.push(PathSeg::Num { idx, key }),
             None => segs.push(PathSeg::Key(key)),
