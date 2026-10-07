@@ -74,17 +74,12 @@ jobs:
         shell: bash
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Set up Elixir for PGO profiling (Linux)
-        if: matrix.job.pgo && runner.os == 'Linux'
+      - name: Set up Elixir for PGO profiling
+        if: matrix.job.pgo
         uses: erlef/setup-beam@v1
         with:
           otp-version: "27"
           elixir-version: "1.18"
-
-      - name: Set up Elixir for PGO profiling (macOS)
-        if: matrix.job.pgo && runner.os == 'macOS'
-        shell: bash
-        run: brew install elixir
 
       - name: Collect PGO profile
         if: matrix.job.pgo
