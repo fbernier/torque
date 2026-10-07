@@ -230,10 +230,7 @@ Pointers = torque:compile_pointers([<<"/id">>, <<"/site/domain">>], [{unique_key
 {ok, [Id, Domain]} = torque:parse_get_many_values(Json, Pointers).
 ```
 
-The full API: `decode/1,2` (`{strings, copy}`), `encode/1,2` (`dirty`),
-`parse/1,2` (`{unique_keys, true}`), `get/2,3`, `get_many/2`,
-`get_many_values/2`, `length/2`, `compile_pointers/1,2`
-(`{unique_keys, _}`, `{validate, false}`) and `parse_get_many_values/2`.
+The [Erlang API guide](guides/erlang.md) documents every function and option.
 
 A rebar3 build fetches the precompiled NIF for the platform from the GitHub
 release, checks it against the checksums shipped in the package, and caches it

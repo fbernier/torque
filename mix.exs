@@ -31,7 +31,15 @@ defmodule Torque.MixProject do
     [
       main: "Torque",
       source_ref: "v#{@version}",
-      extras: ["README.md": [title: "Overview"], LICENSE: [title: "License"]],
+      extras: [
+        "README.md": [title: "Overview"],
+        "guides/erlang.md": [title: "Erlang API"],
+        LICENSE: [title: "License"]
+      ],
+      # The Erlang `torque` module is documented by guides/erlang.md: its page
+      # would be torque.html, which overwrites Torque.html on the
+      # case-insensitive filesystem releases build docs on.
+      filter_modules: fn module, _meta -> module != :torque end,
       groups_for_docs: [
         Decoding: &(&1[:group] == :decode),
         Encoding: &(&1[:group] == :encode),
