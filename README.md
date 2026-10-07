@@ -4,6 +4,8 @@ High-performance JSON library for Elixir and Erlang via [Rustler](https://github
 
 Torque provides the fastest JSON encoding and decoding available in the BEAM ecosystem, with a selective field extraction API for workloads that only need a subset of fields from each document.
 
+Documentation: [hexdocs.pm/torque](https://hexdocs.pm/torque) (Elixir `Torque` and Erlang `torque` APIs).
+
 ## Features
 
 - SIMD-accelerated decoding (AVX2 on x86, NEON on ARM)

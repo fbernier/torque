@@ -57,7 +57,7 @@ defmodule Torque.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url},
+      links: %{"GitHub" => @source_url, "Docs" => "https://hexdocs.pm/torque"},
       build_tools: ["mix", "rebar3"],
       files: ~w(
         lib

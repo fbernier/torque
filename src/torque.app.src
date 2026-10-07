@@ -5,5 +5,8 @@
     {applications, [kernel, stdlib]},
     {env, []},
     {licenses, ["MIT"]},
-    {links, [{"GitHub", "https://github.com/lpgauth/torque"}]}
+    {links, [
+        {"GitHub", "https://github.com/lpgauth/torque"},
+        {"Docs", "https://hexdocs.pm/torque"}
+    ]}
 ]}.
