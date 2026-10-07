@@ -92,7 +92,7 @@ to tag on a mismatch), and the `{:torque, "~> x.y.z"}` install snippet in
 
 ## Architecture
 
-Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON). sonic-rs is **vendored** under `native/sonic-rs/` with a minimal patch (see that crate's `Cargo.toml`): its native push-based `JsonVisitor` is made public, its parser is capped at 128 nesting levels so deeply nested input returns an error instead of overflowing the stack, and an `extract` module walks a compiled path set in one pass. Two skip-path fixes ride along: checked `skip_string` scans with `StringBlock` instead of the generic 32-lane bitmask NEON has to emulate, and `Read` caches the pinned input's slice pointer because the enum lookup stopped inlining inside the skip path.
+Torque is a high-performance JSON library for Elixir using Rustler NIFs backed by sonic-rs (SIMD-accelerated JSON). sonic-rs is **vendored** under `native/sonic-rs/` with Torque patches, each listed in that crate's `Cargo.toml`. The main ones: its native push-based `JsonVisitor` is made public, its parser is capped at 128 nesting levels so deeply nested input returns an error instead of overflowing the stack, an `extract` module walks a compiled path set in one pass, and integers beyond 64 bits stay exact on every path (raw-number DOM nodes, `Extracted::BigInt`, and `Parser::huge_int` recovering integers too large even for `f64` from `parse_number`'s error branch). Two skip-path fixes ride along: checked `skip_string` scans with `StringBlock` instead of the generic 32-lane bitmask NEON has to emulate, and `Read` caches the pinned input's slice pointer because the enum lookup stopped inlining inside the skip path.
 
 ### Decoding Strategies
 
@@ -119,7 +119,7 @@ The release profile keeps `panic = "abort"`, so a panic anywhere in the NIF (inc
 
 ### Scheduler Awareness
 
-Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`. The `get/2` NIF always runs on a normal scheduler (sub-microsecond pointer traversal).
+Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU schedulers to avoid blocking normal BEAM schedulers. Encoding cannot cheaply predict output size, so dirty dispatch is opt-in via `dirty: true` on `encode/2`, `encode!/2`, and `encode_to_iodata/2`. The `get` family always runs on a normal scheduler. Its pointer traversal is sub-microsecond, but building the result costs as much as the selected subtree, so `get(doc, "")` on a large document blocks a normal scheduler for that long: `consume_timeslice` only reports the work afterwards. A term budget with a dirty retry was designed and deferred.
 
 ### Type Conversion
 
@@ -137,6 +137,7 @@ Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU 
 
 - `lib/torque.ex` — public API with `@doc`, typespecs, dirty scheduler dispatch
 - `lib/torque/native.ex` — RustlerPrecompiled NIF stubs (set `TORQUE_BUILD=true` to compile from source)
+- `lib/torque/cpu.ex`: x86-64 v2/v3 detection that picks the precompiled variant
 - `lib/torque/build.ex` — captures `TORQUE_BUILD` and makes switching it recompile `Torque.Native`
 - `lib/torque/encoder.ex`: `Torque.Encoder` protocol, `@derive` support via `__deriving__/3` on the `Any` impl, built-in `Date`/`Time`/`NaiveDateTime`/`DateTime` implementations
 - `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` + `CompiledPaths` (`PathSeg`) resources
@@ -144,5 +145,7 @@ Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU 
 - `native/torque_nif/src/native_decode.rs` — fused decoder; builds terms during the SIMD parse via sonic-rs's `JsonVisitor`
 - `native/torque_nif/src/encoder.rs` — direct term-walking JSON encoder
 - `native/torque_nif/src/types.rs` — sonic_rs Value → Erlang term conversion (used by get/get_many)
+- `native/torque_nif/src/escape.rs`: SIMD string escaping and UTF-8 validation for the encoder (NEON, AVX2, SSE2 and scalar kernels)
+- `native/torque_nif/src/nif_util.rs`: map building with the duplicate-key fallback, forward map iterator, timeslice accounting
 - `native/torque_nif/src/atoms.rs` — cached atoms (ok, error, nil, no_such_field, nesting_too_deep, unsupported_type, non_finite_float, invalid_key, malformed_proplist, invalid_utf8, unhandled_struct, `__struct__`)
-- `native/sonic-rs/` — vendored, Torque-patched sonic-rs (native `JsonVisitor` exposed + DOM recursion-depth limit)
+- `native/sonic-rs/`: vendored, Torque-patched sonic-rs (patch list in its `Cargo.toml`)
