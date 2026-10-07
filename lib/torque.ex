@@ -78,6 +78,12 @@ defmodule Torque do
   """
   @opaque pointers :: reference()
 
+  @typedoc """
+  An opaque handle to a parsed JSON document, returned by `parse/2`. Pass it to
+  `get/2`, `get_many/2`, `get_many_nil/2`, `get_many_defaults/2` or `length/2`.
+  """
+  @opaque document :: reference()
+
   # --- Decoding ---
 
   @doc """
@@ -455,7 +461,7 @@ defmodule Torque do
       {:ok, 1}
   """
   @doc group: :parse_get
-  @spec parse(binary(), keyword()) :: {:ok, reference()} | {:error, binary() | :nesting_too_deep}
+  @spec parse(binary(), keyword()) :: {:ok, document()} | {:error, binary() | :nesting_too_deep}
   def parse(json, opts \\ [])
 
   def parse(json, []) when is_binary(json) and byte_size(json) > @timeslice_bytes do
@@ -503,7 +509,7 @@ defmodule Torque do
       {:error, :no_such_field}
   """
   @doc group: :parse_get
-  @spec get(reference(), binary()) ::
+  @spec get(document(), binary()) ::
           {:ok, term()} | {:error, :no_such_field | :nesting_too_deep}
   def get(doc, path) when is_reference(doc) and is_binary(path) do
     Torque.Native.get(doc, path)
@@ -528,7 +534,7 @@ defmodule Torque do
       :default
   """
   @doc group: :parse_get
-  @spec get(reference(), binary(), term()) :: term()
+  @spec get(document(), binary(), term()) :: term()
   def get(doc, path, default) when is_reference(doc) and is_binary(path) do
     case Torque.Native.get(doc, path) do
       {:ok, value} -> value
@@ -559,7 +565,7 @@ defmodule Torque do
       [{:ok, 1}, {:ok, 2}, {:error, :no_such_field}]
   """
   @doc group: :parse_get
-  @spec get_many(reference(), [binary()]) ::
+  @spec get_many(document(), [binary()]) ::
           [{:ok, term()} | {:error, :no_such_field | :nesting_too_deep}]
   def get_many(doc, paths) when is_reference(doc) and is_list(paths) do
     Torque.Native.get_many(doc, paths)
@@ -595,7 +601,7 @@ defmodule Torque do
       [1, nil, nil]
   """
   @doc group: :parse_get
-  @spec get_many_nil(reference(), [binary()] | pointers()) :: [term()]
+  @spec get_many_nil(document(), [binary()] | pointers()) :: [term()]
   def get_many_nil(doc, paths) when is_reference(doc) and is_list(paths) do
     Torque.Native.get_many_nil(doc, paths)
   end
@@ -730,7 +736,7 @@ defmodule Torque do
       %{"/a" => 1, "/b" => 0, "/c" => "missing"}
   """
   @doc group: :parse_get
-  @spec get_many_defaults(reference(), %{binary() => term()}) ::
+  @spec get_many_defaults(document(), %{binary() => term()}) ::
           %{binary() => term()}
   def get_many_defaults(doc, defaults)
       when is_reference(doc) and is_map(defaults) do
@@ -760,7 +766,7 @@ defmodule Torque do
       nil
   """
   @doc group: :parse_get
-  @spec length(reference(), binary()) :: non_neg_integer() | nil
+  @spec length(document(), binary()) :: non_neg_integer() | nil
   def length(doc, path) when is_reference(doc) and is_binary(path) do
     Torque.Native.array_length(doc, path)
   end
