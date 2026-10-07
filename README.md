@@ -1,6 +1,6 @@
 # Torque
 
-High-performance JSON library for Elixir via [Rustler](https://github.com/rustler-magic/rustler) NIFs, powered by [sonic-rs](https://github.com/cloudwego/sonic-rs) (SIMD-accelerated).
+High-performance JSON library for Elixir and Erlang via [Rustler](https://github.com/rustler-magic/rustler) NIFs, powered by [sonic-rs](https://github.com/cloudwego/sonic-rs) (SIMD-accelerated).
 
 Torque provides the fastest JSON encoding and decoding available in the BEAM ecosystem, with a selective field extraction API for workloads that only need a subset of fields from each document.
 
@@ -26,6 +26,12 @@ def deps do
     {:torque, "~> 0.4.7"}
   ]
 end
+```
+
+or, with rebar3, to your `rebar.config` (see [Erlang](#erlang)):
+
+```erlang
+{deps, [{torque, "~> 0.4.7"}]}.
 ```
 
 Precompiled binaries are available for macOS and glibc Linux on `aarch64` and `x86_64` (with CPU-optimized variants on `x86_64`, below). Anything else, such as musl (Alpine) or Windows, builds from source: install a stable Rust toolchain and set `TORQUE_BUILD=true`.
@@ -201,6 +207,37 @@ plug Plug.Parsers,
 Structs, Ecto schemas included, must implement `Torque.Encoder` (for example
 `@derive {Torque.Encoder, only: [:id, :name]}`): a struct without an
 implementation raises rather than encoding its raw fields.
+
+## Erlang
+
+The `torque` module is the Erlang API. It follows Erlang conventions: JSON
+null is `null`, and the bulk lookups return `undefined` for a path the document
+does not contain, so it stays distinct from a JSON null. Results are
+`{ok, _} | {error, _}` tuples and options are proplists.
+
+```erlang
+{ok, #{<<"a">> := null}} = torque:decode(<<"{\"a\":null}">>),
+{ok, <<"{\"a\":null}">>} = torque:encode(#{a => null}),
+
+{ok, Doc} = torque:parse(Json),
+{ok, Domain} = torque:get(Doc, <<"/site/domain">>),
+[Id, undefined] = torque:get_many_values(Doc, [<<"/id">>, <<"/missing">>]),
+
+%% Compile fixed paths once, then extract them in one pass per document:
+Pointers = torque:compile_pointers([<<"/id">>, <<"/site/domain">>], [{unique_keys, true}]),
+{ok, [Id, Domain]} = torque:parse_get_many_values(Json, Pointers).
+```
+
+The full API: `decode/1,2` (`{strings, copy}`), `encode/1,2` (`dirty`),
+`parse/1,2` (`{unique_keys, true}`), `get/2,3`, `get_many/2`,
+`get_many_values/2`, `length/2`, `compile_pointers/1,2`
+(`{unique_keys, _}`, `{validate, false}`) and `parse_get_many_values/2`.
+
+A rebar3 build fetches the precompiled NIF for the platform from the GitHub
+release, checks it against the checksums shipped in the package, and caches it
+in the user cache directory. That needs OTP 25 or later; with
+`TORQUE_BUILD=true` the NIF is built with cargo instead, which works on any
+platform. `TORQUE_CPU_VARIANT` picks the x86_64 variant as it does for Mix.
 
 ## API
 
