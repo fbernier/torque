@@ -8,7 +8,7 @@ use rustler::sys::{
     enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
 };
 use rustler::{
-    schedule, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
+    schedule, Atom, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use std::borrow::Cow;
@@ -183,9 +183,16 @@ fn pointer_lookup<'v>(
 fn do_parse(
     bytes: &[u8],
     unique_keys: bool,
+    null: Atom,
+    missing: Atom,
 ) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
     let value = sonic_rs::from_slice::<sonic_rs::Value>(bytes)?;
-    Ok(ResourceArc::new(ParsedDocument { value, unique_keys }))
+    Ok(ResourceArc::new(ParsedDocument {
+        value,
+        unique_keys,
+        null,
+        missing,
+    }))
 }
 
 /// Build the `{:error, _}` term for a parse failure. The vendored sonic-rs caps
@@ -209,7 +216,7 @@ pub(crate) fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<
 
 #[rustler::nif]
 fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false) {
+    match do_parse(json.as_slice(), false, atoms::nil(), atoms::nil()) {
         Ok(resource) => {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
@@ -220,15 +227,21 @@ fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_dirty<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false) {
+    match do_parse(json.as_slice(), false, atoms::nil(), atoms::nil()) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
         Err(e) => parse_error_term(env, &e),
     }
 }
 
 #[rustler::nif]
-fn parse_opts<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys) {
+fn parse_opts<'a>(
+    env: Env<'a>,
+    json: Binary,
+    unique_keys: bool,
+    null: Atom,
+    missing: Atom,
+) -> Term<'a> {
+    match do_parse(json.as_slice(), unique_keys, null, missing) {
         Ok(resource) => {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
@@ -238,8 +251,14 @@ fn parse_opts<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn parse_opts_dirty<'a>(env: Env<'a>, json: Binary, unique_keys: bool) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys) {
+fn parse_opts_dirty<'a>(
+    env: Env<'a>,
+    json: Binary,
+    unique_keys: bool,
+    null: Atom,
+    missing: Atom,
+) -> Term<'a> {
+    match do_parse(json.as_slice(), unique_keys, null, missing) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
         Err(e) => parse_error_term(env, &e),
     }
@@ -253,10 +272,12 @@ fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'
     let ntd_raw = atoms::nesting_too_deep().as_c_arg();
     let mut nodes = 0usize;
     let result = match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
-            Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
-            None => make_tuple2(env, err_raw, ntd_raw),
-        },
+        Some(value) => {
+            match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, &mut nodes) {
+                Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
+                None => make_tuple2(env, err_raw, ntd_raw),
+            }
+        }
         None => make_tuple2(env, err_raw, nsf_raw),
     };
     consume_timeslice_nodes(env, nodes);
@@ -280,7 +301,7 @@ fn get_one_result(
     nodes: &mut usize,
 ) -> ERL_NIF_TERM {
     match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) => match value_to_term(env, value, MAX_DEPTH, nodes) {
+        Some(value) => match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, nodes) {
             Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
             None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
         },
@@ -325,14 +346,20 @@ fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) 
                 )
             }
         }
-        _ => atoms::nil().to_term(env),
+        _ => doc.missing.to_term(env),
     }
 }
 
 #[rustler::nif]
 fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    let result = native_decode::decode_to_term(env, input_term, json.as_slice(), true);
+    let result = native_decode::decode_to_term(
+        env,
+        input_term,
+        json.as_slice(),
+        true,
+        atoms::nil().as_c_arg(),
+    );
     schedule::consume_timeslice(env, timeslice_percent(json.len()));
     result
 }
@@ -340,21 +367,44 @@ fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_dirty<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    native_decode::decode_to_term(env, input_term, json.as_slice(), true)
+    native_decode::decode_to_term(
+        env,
+        input_term,
+        json.as_slice(),
+        true,
+        atoms::nil().as_c_arg(),
+    )
 }
 
 #[rustler::nif]
-fn decode_opts<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool) -> Term<'a> {
+fn decode_opts<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool, null: Atom) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    let result = native_decode::decode_to_term(env, input_term, json.as_slice(), !copy_strings);
+    let result = native_decode::decode_to_term(
+        env,
+        input_term,
+        json.as_slice(),
+        !copy_strings,
+        null.as_c_arg(),
+    );
     schedule::consume_timeslice(env, timeslice_percent(json.len()));
     result
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn decode_opts_dirty<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool) -> Term<'a> {
+fn decode_opts_dirty<'a>(
+    env: Env<'a>,
+    json: Binary<'a>,
+    copy_strings: bool,
+    null: Atom,
+) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    native_decode::decode_to_term(env, input_term, json.as_slice(), !copy_strings)
+    native_decode::decode_to_term(
+        env,
+        input_term,
+        json.as_slice(),
+        !copy_strings,
+        null.as_c_arg(),
+    )
 }
 
 // --- Pre-compiled pointers + fused parse/extract ---
@@ -400,6 +450,8 @@ fn compile_paths<'a>(
     paths: ListIterator<'a>,
     unique_keys: bool,
     validate: bool,
+    null: Atom,
+    missing: Atom,
 ) -> NifResult<Term<'a>> {
     let mut out = Vec::new();
     let mut plan = sonic_rs::extract::ExtractPlan::new();
@@ -418,6 +470,8 @@ fn compile_paths<'a>(
         plan,
         unique_keys,
         validate,
+        null,
+        missing,
     })
     .encode(env))
 }
@@ -433,23 +487,25 @@ fn plan_segs(
     })
 }
 
-/// Extract all compiled paths from an already-traversed `value` into a result
-/// list term, substituting nil for missing fields and depth-exceeded values.
+/// Extract all compiled paths from a parsed document into a result list term,
+/// substituting the document's `missing` term for missing fields and
+/// depth-exceeded values.
 #[inline]
 fn extract_compiled<'a>(
     env: Env<'a>,
-    value: &sonic_rs::Value,
+    doc: &ParsedDocument,
     compiled: &CompiledPaths,
     nodes: &mut usize,
 ) -> Term<'a> {
-    let nil_raw = atoms::nil().as_c_arg();
+    let null = doc.null.as_c_arg();
+    let missing = doc.missing.as_c_arg();
     let mut acc = TermAcc::with_hint(compiled.paths.len());
     for segs in compiled.paths.iter() {
-        let r = match pointer_lookup_compiled(value, segs, compiled.unique_keys) {
-            Some(v) => value_to_term(env, v, MAX_DEPTH, nodes)
+        let r = match pointer_lookup_compiled(&doc.value, segs, compiled.unique_keys) {
+            Some(v) => value_to_term(env, v, null, MAX_DEPTH, nodes)
                 .map(|t| t.as_c_arg())
-                .unwrap_or(nil_raw),
-            None => nil_raw,
+                .unwrap_or(missing),
+            None => missing,
         };
         acc.push(r);
     }
@@ -547,7 +603,8 @@ fn do_parse_get_many_nil<'a>(
 
     match sonic_rs::extract::extract(bytes, &compiled.plan, validate, keys) {
         Ok(values) => {
-            let nil_raw = atoms::nil().as_c_arg();
+            let null = compiled.null.as_c_arg();
+            let missing = compiled.missing.as_c_arg();
             // Decided once for the batch, so a result list is either all
             // borrowed or all copied.
             let borrow = borrow_input(bytes.len(), || {
@@ -575,18 +632,19 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
                     Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
                     Some(Extracted::BigInt(raw)) => {
-                        native_decode::bignum_term(env, raw).unwrap_or(nil_raw)
+                        native_decode::bignum_term(env, raw).unwrap_or(missing)
                     }
                     Some(Extracted::Bool(true)) => atoms::r#true().as_c_arg(),
                     Some(Extracted::Bool(false)) => atoms::r#false().as_c_arg(),
                     Some(Extracted::Raw(span)) => {
-                        native_decode::decode_span(env, input_term, bytes, span, borrow)
-                            .unwrap_or(nil_raw)
+                        native_decode::decode_span(env, input_term, bytes, span, borrow, null)
+                            .unwrap_or(missing)
                     }
-                    Some(Extracted::Value(v)) => value_to_term(env, v, MAX_DEPTH, nodes)
+                    Some(Extracted::Value(v)) => value_to_term(env, v, null, MAX_DEPTH, nodes)
                         .map(|t| t.as_c_arg())
-                        .unwrap_or(nil_raw),
-                    Some(Extracted::Null) | None => nil_raw,
+                        .unwrap_or(missing),
+                    Some(Extracted::Null) => null,
+                    None => missing,
                 };
                 list = unsafe { enif_make_list_cell(env.as_c_arg(), t, list) };
             }
@@ -651,7 +709,7 @@ fn get_many_nil_compiled<'a>(
     compiled: ResourceArc<CompiledPaths>,
 ) -> Term<'a> {
     let mut nodes = 0usize;
-    let result = extract_compiled(env, &doc.value, &compiled, &mut nodes);
+    let result = extract_compiled(env, &doc, &compiled, &mut nodes);
     consume_timeslice_nodes(env, nodes);
     result
 }
@@ -662,7 +720,8 @@ fn get_many_nil<'a>(
     doc: ResourceArc<ParsedDocument>,
     paths: ListIterator<'a>,
 ) -> NifResult<Term<'a>> {
-    let nil_raw = atoms::nil().as_c_arg();
+    let null = doc.null.as_c_arg();
+    let missing = doc.missing.as_c_arg();
     let mut nodes = 0usize;
     let mut acc = TermAcc::new();
 
@@ -670,11 +729,11 @@ fn get_many_nil<'a>(
         // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
         let path: &str = path_term.decode()?;
         let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
-            Some(value) => match value_to_term(env, value, MAX_DEPTH, &mut nodes) {
+            Some(value) => match value_to_term(env, value, null, MAX_DEPTH, &mut nodes) {
                 Some(term) => term.as_c_arg(),
-                None => nil_raw,
+                None => missing,
             },
-            None => nil_raw,
+            None => missing,
         };
         acc.push(r);
     }

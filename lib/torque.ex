@@ -135,11 +135,11 @@ defmodule Torque do
   end
 
   def decode(json, opts) when is_binary(json) and byte_size(json) > @timeslice_bytes do
-    Torque.Native.decode_opts_dirty(json, copy_strings!(opts))
+    Torque.Native.decode_opts_dirty(json, copy_strings!(opts), nil)
   end
 
   def decode(json, opts) when is_binary(json) do
-    Torque.Native.decode_opts(json, copy_strings!(opts))
+    Torque.Native.decode_opts(json, copy_strings!(opts), nil)
   end
 
   defp copy_strings!(opts) do
@@ -473,11 +473,11 @@ defmodule Torque do
   end
 
   def parse(json, opts) when is_binary(json) and byte_size(json) > @timeslice_bytes do
-    Torque.Native.parse_opts_dirty(json, unique_keys!(opts))
+    Torque.Native.parse_opts_dirty(json, unique_keys!(opts), nil, nil)
   end
 
   def parse(json, opts) when is_binary(json) do
-    Torque.Native.parse_opts(json, unique_keys!(opts))
+    Torque.Native.parse_opts(json, unique_keys!(opts), nil, nil)
   end
 
   defp unique_keys!(opts), do: Keyword.validate!(opts, unique_keys: false)[:unique_keys]
@@ -665,7 +665,7 @@ defmodule Torque do
   @spec compile_pointers([binary()], keyword()) :: pointers()
   def compile_pointers(paths, opts \\ []) when is_list(paths) do
     opts = Keyword.validate!(opts, unique_keys: false, validate: true)
-    Torque.Native.compile_paths(paths, opts[:unique_keys], opts[:validate])
+    Torque.Native.compile_paths(paths, opts[:unique_keys], opts[:validate], nil, nil)
   end
 
   @doc """

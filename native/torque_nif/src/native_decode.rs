@@ -199,6 +199,8 @@ struct TermBuilder<'a, 'b> {
     key_terms: &'b mut Vec<ERL_NIF_TERM>,
     ords: &'b mut Vec<KeyOrd>,
     keys: &'b mut KeyCache,
+    /// The term JSON null becomes.
+    null: ERL_NIF_TERM,
     too_deep: bool,
 }
 
@@ -421,7 +423,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
     #[inline]
     fn visit_null(&mut self) -> bool {
-        self.push(atoms::nil().as_c_arg());
+        self.push(self.null);
         true
     }
 
@@ -570,11 +572,13 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
 /// Decodes a whole document. With `borrow`, strings the parser did not have to
 /// unescape are sub-binaries of `input_term`; otherwise every string is copied.
+/// JSON null becomes `null`.
 pub fn decode_to_term<'a>(
     env: Env<'a>,
     input_term: ERL_NIF_TERM,
     bytes: &[u8],
     borrow: bool,
+    null: ERL_NIF_TERM,
 ) -> Term<'a> {
     let input = InputRef {
         term: input_term,
@@ -582,7 +586,7 @@ pub fn decode_to_term<'a>(
         len: bytes.len(),
         borrow,
     };
-    match decode_with(env, input, bytes) {
+    match decode_with(env, input, bytes, null) {
         Ok(Some(root)) => make_tuple2(env, atoms::ok().as_c_arg(), root),
         Ok(None) => make_tuple2(
             env,
@@ -606,6 +610,7 @@ pub fn decode_span<'a>(
     input: &[u8],
     span: &[u8],
     borrow: bool,
+    null: ERL_NIF_TERM,
 ) -> Option<ERL_NIF_TERM> {
     let input = InputRef {
         term: input_term,
@@ -613,7 +618,7 @@ pub fn decode_span<'a>(
         len: input.len(),
         borrow,
     };
-    decode_with(env, input, span).ok().flatten()
+    decode_with(env, input, span, null).ok().flatten()
 }
 
 enum Failure {
@@ -621,7 +626,12 @@ enum Failure {
     Parse(sonic_rs::Error),
 }
 
-fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF_TERM>, Failure> {
+fn decode_with(
+    env: Env,
+    input: InputRef,
+    bytes: &[u8],
+    null: ERL_NIF_TERM,
+) -> Result<Option<ERL_NIF_TERM>, Failure> {
     DECODE_BUFS.with(|cell| {
         let mut bufs = cell.borrow_mut();
         let DecodeBufs {
@@ -644,6 +654,7 @@ fn decode_with(env: Env, input: InputRef, bytes: &[u8]) -> Result<Option<ERL_NIF
             key_terms,
             ords,
             keys,
+            null,
             too_deep: false,
         };
 
