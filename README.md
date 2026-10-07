@@ -88,9 +88,14 @@ for faster field lookups (uses sonic-rs internal indexing instead of linear scan
 When the same fixed set of paths is extracted from every document, compile the
 pointers once and reuse the handle. `parse_get_many_nil/2` then reads the
 document in a single pass, building values only where a path ends and skipping
-everything else, without building an intermediate document. On a 1.2 KB bid
-request with 26 fields that is ~1.35× the previous fused parse; with 3 paths
-and `validate: false` (below) it is ~2.6×.
+everything else, without building an intermediate document. Against
+`parse/2` + `get_many_nil/2` with the same handle, on PGO builds:
+
+| | arm64 (M1 Pro) | x86_64 (Xeon E5-2630 v3) |
+|---|---|---|
+| 1.2 KB bid request, all 51 fields | ~3× faster | ~3.6× faster |
+| 1.2 KB bid request, 3 fields | ~1.3× faster | ~3× faster |
+| 776 KB feed, 3 fields | parity | ~3.2× faster |
 
 ```elixir
 # Once, at startup (e.g. into :persistent_term or application state; the
@@ -115,9 +120,10 @@ trusted input.
 
 It is not a free speed-up. A bracket scan over 64-byte blocks beats tokenizing
 a large subtree and loses to it on the few-byte scalars a dense path set leaves
-behind, so the win tracks how little of the document the paths select. Three
-paths out of a 2 KB request run ~3.6× faster unvalidated; 146 fields of the
-same request run ~1.2× slower. Measure your own path set.
+behind, so the win tracks how little of the document the paths select.
+Against a validated handle, on both machines, 3 paths run ~1.9× faster
+unvalidated on the 1.2 KB request and ~4× faster on the 776 KB feed, while all
+51 fields of the request run 3-7% slower. Measure your own path set.
 
 ```elixir
 pointers = Torque.compile_pointers(paths, unique_keys: true, validate: false)

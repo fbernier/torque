@@ -16,12 +16,12 @@ defmodule Torque do
       values only where a path ends and skipping everything else. For one-shot
       extraction — parse a payload, take a few fields, discard it — prefer this
       over `parse/2` + `get/2`: it never builds the document it is about to
-      throw away. That is worth ~1.4× on a request-shaped payload and fades to
-      parity as the document grows, since on a large one the plan walk costs
-      about what the document build it replaces did. The bigger lever is
-      `validate: false` on the handle, worth ~7× on a 450 KB feed read through
-      a handful of paths, but read its note in `compile_pointers/2` first: it
-      is only a win when the paths select a small part of the document.
+      throw away. Measured, it is never slower, and anywhere from parity to
+      several times faster depending on the document's size and the CPU. The
+      bigger lever on large documents is `validate: false` on the handle, but
+      read its note in `compile_pointers/2` first: it is only a win when the
+      paths select a small part of the document. The README has measured
+      figures.
 
     * **Full decode** — `decode/1` converts an entire JSON binary into
       Elixir terms in one pass.
@@ -617,8 +617,7 @@ defmodule Torque do
   re-split and unescape those pointer strings on every call — wasted work, since
   they never change. `compile_pointers/2` does it once and returns an opaque
   `t:pointers/0` handle that `parse_get_many_nil/2` and `get_many_nil/2` accept
-  in place of a path list, eliminating all per-call path parsing (≈2× faster
-  extraction on a typical field set).
+  in place of a path list, eliminating all per-call path parsing.
 
   Compile once at startup (e.g. into `:persistent_term`, application state or
   the process holding the documents) and reuse the handle for every document.
@@ -649,8 +648,7 @@ defmodule Torque do
       Measure before enabling it. Skipping a region structurally is a bracket
       scan over 64-byte blocks, which beats tokenizing a large subtree and
       loses to it on the few-byte scalars left over when the paths select most
-      of the document. Reading 3 paths out of a 2 KB request is ~3.6× faster
-      unvalidated; reading 146 of its fields is ~1.2× *slower*.
+      of the document, so the win tracks how little of it the paths select.
 
   Any other option raises `ArgumentError`.
 
