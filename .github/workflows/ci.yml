@@ -99,3 +99,31 @@ jobs:
       - run: mix dialyzer
       - run: mix docs --warnings-as-errors
       - run: mix hex.build
+
+  rebar3:
+    name: rebar3 (OTP 28)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          rebar3-version: "3.x"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # TORQUE_BUILD=true (workflow env): the NIF is built with cargo.
+      - run: rebar3 eunit
+
+      # The download path, against the release in the shipped checksum file. A
+      # published binary only loads into a build of the same NIF sources, so
+      # this stops at a verified install.
+      - name: Fetch a published NIF
+        env:
+          TORQUE_BUILD: ""
+        run: |
+          VSN=$(sed -n 's/.*"libtorque_nif-v\([0-9.]*\)-nif-.*/\1/p' checksum-Elixir.Torque.Native.exs | head -n1)
+          rm -f priv/native/torque_nif.so
+          TORQUE_NIF_VSN="$VSN" escript rebar/fetch_nif.escript
+          test -s priv/native/torque_nif.so
