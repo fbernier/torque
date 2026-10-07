@@ -1,33 +1,15 @@
 defmodule Torque.Native do
   @moduledoc false
 
-  version = Mix.Project.config()[:version]
+  # rebar/fetch_nif.escript puts the library in priv/native, run by the
+  # :torque_nif compiler (mix.exs) or rebar3's pre-compile hook.
+  @on_load :load_nif
 
-  # `Torque.Build` owns this flag so that switching TORQUE_BUILD recompiles
-  # this module; see the note there.
-  use RustlerPrecompiled,
-    otp_app: :torque,
-    crate: "torque_nif",
-    base_url: "https://github.com/lpgauth/torque/releases/download/v#{version}",
-    force_build: Torque.Build.force_build?(),
-    targets: ~w(
-      aarch64-apple-darwin
-      aarch64-unknown-linux-gnu
-      x86_64-apple-darwin
-      x86_64-unknown-linux-gnu
-    ),
-    nif_versions: ["2.15"],
-    version: version,
-    variants: %{
-      "x86_64-unknown-linux-gnu" => [
-        v3: &Torque.CPU.avx2?/0,
-        v2: &Torque.CPU.sse42?/0
-      ],
-      "x86_64-apple-darwin" => [
-        v3: &Torque.CPU.avx2?/0,
-        v2: &Torque.CPU.sse42?/0
-      ]
-    }
+  @doc false
+  def load_nif do
+    path = Path.join(:code.priv_dir(:torque), "native/torque_nif")
+    :erlang.load_nif(String.to_charlist(path), 0)
+  end
 
   def parse(_json), do: :erlang.nif_error(:nif_not_loaded)
   def parse_dirty(_json), do: :erlang.nif_error(:nif_not_loaded)

@@ -1,3 +1,32 @@
+defmodule Mix.Tasks.Compile.TorqueNif do
+  @moduledoc false
+  use Mix.Task.Compiler
+
+  # Puts the NIF in priv/native with the same script rebar3 builds run
+  # (rebar/fetch_nif.escript), so the package needs no Mix-only dependencies.
+  # The published package has no priv/, so it may not exist when Mix links
+  # the app's build directory; link it once the script has made it.
+  @impl true
+  def run(_args) do
+    root = Path.dirname(Mix.Project.project_file())
+
+    case System.cmd("escript", ["rebar/fetch_nif.escript"], cd: root, stderr_to_stdout: true) do
+      {output, 0} ->
+        IO.write(output)
+
+        Mix.Utils.symlink_or_copy(
+          Path.join(root, "priv"),
+          Path.join(Mix.Project.app_path(), "priv")
+        )
+
+        {:ok, []}
+
+      {output, status} ->
+        Mix.raise("torque: rebar/fetch_nif.escript exited with #{status}\n" <> output)
+    end
+  end
+end
+
 defmodule Torque.MixProject do
   use Mix.Project
 
@@ -14,9 +43,11 @@ defmodule Torque.MixProject do
       # after consolidation would have run, so the protocol has to stay open
       # in test. Every other env consolidates it.
       consolidate_protocols: Mix.env() != :test,
+      compilers: [:torque_nif | Mix.compilers()],
       deps: deps(),
       package: package(),
-      description: "High-performance JSON library for Elixir via Rustler NIFs (sonic-rs)",
+      description:
+        "High-performance JSON library for Elixir and Erlang via Rustler NIFs (sonic-rs)",
       docs: docs(),
       source_url: @source_url,
       homepage_url: @source_url
@@ -54,10 +85,8 @@ defmodule Torque.MixProject do
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:glazer, "~> 1.1", only: :bench},
-      {:jason, "~> 1.4", optional: true},
+      {:jason, "~> 1.4", only: [:test, :bench]},
       {:jiffy, "~> 2.0", only: :bench},
-      {:rustler, ">= 0.0.0", optional: true},
-      {:rustler_precompiled, "~> 0.8"},
       {:stream_data, "~> 1.1", only: :test}
     ]
   end
@@ -80,7 +109,7 @@ defmodule Torque.MixProject do
         Cargo.toml
         Cargo.lock
         Cross.toml
-        checksum-*.exs
+        checksums.txt
         mix.exs
         README.md
         LICENSE

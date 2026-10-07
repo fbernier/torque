@@ -20,7 +20,7 @@ TORQUE_BUILD=true rebar3 eunit     # Erlang API under a rebar3 build (builds int
 MIX_ENV=bench mix run bench/torque_bench.exs  # run benchmarks
 ```
 
-`TORQUE_BUILD=true` is required for local development to force compilation from Rust source instead of downloading precompiled binaries. Without it, `RustlerPrecompiled` will try to fetch binaries from GitHub releases. The flag is read when `Torque.Native` compiles, so `Torque.Build` (`lib/torque/build.ex`) makes it part of that module's staleness through `__mix_recompile__?/0`: without it a `_build` tree made without the variable keeps loading a downloaded NIF however later commands are invoked, which silently runs a *released* binary against local Rust changes and reports a green suite. The check cannot live in `Torque.Native`, because a module whose `on_load` fails is not loadable and Mix cannot ask it anything.
+`TORQUE_BUILD=true` is required for local development. Both build tools get the NIF from `rebar/fetch_nif.escript`: Mix through the `:torque_nif` compiler defined at the top of `mix.exs`, which runs before the Elixir compiler on every `mix compile`, and rebar3 through a pre-compile hook. With the variable set the script runs `cargo build --release` in `native/torque_nif` (so the repository's `.cargo/config.toml` and its `target-cpu=native` apply) and reinstalls `priv/native/torque_nif.so` only when the bytes change; cargo decides what is stale, the vendored sonic-rs included. Without it the script downloads the release asset for the app file's version, which exists only for published versions. `priv/native/torque_nif.stamp` records where the installed library came from (an asset name or `source`), so switching between the two never leaves a released binary running against local Rust changes.
 
 ## Profile-Guided Optimisation (PGO)
 
@@ -118,7 +118,7 @@ Atom names are read as Latin-1 into a stack buffer, because `ERL_NIF_UTF8` needs
 
 ### Erlang and rebar3
 
-One Hex package serves both build tools. rebar3 prefers a rebar3-buildable app when a package also has `mix.exs`, so `src/torque.app.src` and `rebar.config` make it build Torque itself rather than through rebar_mix. Mix compiles `src/` too (the `torque` Erlang API module), so an Erlang library depending on Torque works inside an Elixir project; it never compiles `rebar/src/`, which holds the rebar3-only `Elixir.Torque.Native` loader (the NIF registers under that name). The rebar3 pre-compile hook `rebar/fetch_nif.escript` does what RustlerPrecompiled does for Mix: it maps `system_architecture` and the x86 flag sets (kept in sync with `lib/torque/cpu.ex`) to a release asset, downloads it over verified TLS, checks it against `checksum-Elixir.Torque.Native.exs`, or runs cargo with `TORQUE_BUILD=true`. A published binary only loads into a build of the same NIF sources, so CI's download step stops at a verified install. `rebar.config` sets `base_dir` to `_build/rebar3` because Mix also builds into `_build/test/lib/torque`.
+One Hex package serves both build tools. rebar3 prefers a rebar3-buildable app when a package also has `mix.exs`, so `src/torque.app.src` and `rebar.config` make it build Torque itself rather than through rebar_mix. Mix compiles `src/` too (the `torque` Erlang API module), so an Erlang library depending on Torque works inside an Elixir project; it never compiles `rebar/src/`, which holds the rebar3-only `Elixir.Torque.Native` loader (the NIF registers under that name). `rebar/fetch_nif.escript` serves both build tools: it maps `system_architecture` (or `TORQUE_NIF_TARGET`) and the x86 flag sets to a release asset, downloads it over verified TLS, checks it against `checksums.txt` (`shasum -a 256` output that `release.sh` generates from the release's assets), and caches it under the user cache directory, or runs cargo with `TORQUE_BUILD=true`. Sharing it is what keeps the package free of Hex dependencies: rebar3 resolves a package's dependencies from its Hex metadata and cannot build Mix projects, so the 0.5.0 that still depended on `rustler_precompiled` was pulled from Hex before it could be fixed. A published binary only loads into a build of the same NIF sources, so CI's download step stops at a verified install. `rebar.config` sets `base_dir` to `_build/rebar3` because Mix also builds into `_build/test/lib/torque`.
 
 The Erlang API wants `null` for JSON null and `undefined` for a missing path where Elixir uses `nil` for both, so the NIFs take those atoms as arguments rather than hardcoding `nil`: `ParsedDocument` and `CompiledPaths` store them (lookups use the document's, fused extraction the handle's), `decode_opts` takes the null atom, and the encoder reads the atom that encodes as JSON null from a thread-local set on entry to each call, so the recursive encoder carries no extra parameter. Elixir passes `nil` everywhere, through the same NIFs.
 
@@ -145,11 +145,10 @@ Decode/parse inputs larger than 20 KB are automatically dispatched to dirty CPU 
 ### Key Files
 
 - `lib/torque.ex` — public API with `@doc`, typespecs, dirty scheduler dispatch
-- `lib/torque/native.ex` — RustlerPrecompiled NIF stubs (set `TORQUE_BUILD=true` to compile from source)
+- `lib/torque/native.ex`: NIF stubs and the `@on_load` that loads `priv/native/torque_nif`
 - `src/torque.erl`: Erlang API (`null` / `undefined` conventions); compiled by both Mix and rebar3
-- `src/torque.app.src`, `rebar.config`, `rebar/src/Elixir.Torque.Native.erl`, `rebar/fetch_nif.escript`: the rebar3 build (app file, rebar3-only NIF loader, precompiled-NIF fetch)
-- `lib/torque/cpu.ex`: x86-64 v2/v3 detection that picks the precompiled variant
-- `lib/torque/build.ex` — captures `TORQUE_BUILD` and makes switching it recompile `Torque.Native`
+- `rebar/fetch_nif.escript`: installs the NIF for both build tools (precompiled download with x86 variant selection and checksum check, or cargo); `mix.exs` runs it through `Mix.Tasks.Compile.TorqueNif`
+- `src/torque.app.src`, `rebar.config`, `rebar/src/Elixir.Torque.Native.erl`: the rebar3 build (app file, pre-compile hook, rebar3-only NIF loader)
 - `lib/torque/encoder.ex`: `Torque.Encoder` protocol, `@derive` support via `__deriving__/3` on the `Any` impl, built-in `Date`/`Time`/`NaiveDateTime`/`DateTime` implementations
 - `native/torque_nif/src/lib.rs` — NIF registration, `ParsedDocument` + `CompiledPaths` (`PathSeg`) resources
 - `native/torque_nif/src/decoder.rs` — parse, get, get_many, get_many_nil, decode NIFs; compiled-pointer + fused `parse_get_many_nil` path

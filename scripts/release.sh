@@ -104,15 +104,23 @@ gh run watch "$RUN_ID" --exit-status
 echo "==> Publishing release ${TAG}..."
 gh release edit "$TAG" --draft=false
 
-# Generate checksums
+# Generate checksums: rebar/fetch_nif.escript checks every download against
+# this file, which ships in the package.
 echo "==> Generating checksums..."
-TORQUE_BUILD=true mix rustler_precompiled.download Torque.Native --all --print
+ASSETS=$(mktemp -d)
+gh release download "$TAG" --dir "$ASSETS" --pattern '*.tar.gz'
+if ! ls "$ASSETS"/*.tar.gz >/dev/null 2>&1; then
+  echo "error: release ${TAG} has no NIF assets"
+  exit 1
+fi
+(cd "$ASSETS" && shasum -a 256 *.tar.gz) > checksums.txt
+rm -rf "$ASSETS"
 
 if [ -n "${SKIP_PUBLISH:-}" ]; then
-  echo "==> Checksums written to checksum-Elixir.Torque.Native.exs"
+  echo "==> Checksums written to checksums.txt"
   echo ""
   echo "Next steps:"
-  echo "  1. git add checksum-Elixir.Torque.Native.exs"
+  echo "  1. git add checksums.txt"
   echo "  2. git commit -m 'Add checksums for ${TAG}'"
   echo "  3. git push origin main"
   echo "  4. mix hex.publish"
@@ -120,8 +128,8 @@ if [ -n "${SKIP_PUBLISH:-}" ]; then
 fi
 
 echo "==> Committing checksums..."
-git add checksum-Elixir.Torque.Native.exs
-if [ -n "$(git status --porcelain checksum-Elixir.Torque.Native.exs)" ]; then
+git add checksums.txt
+if [ -n "$(git status --porcelain checksums.txt)" ]; then
   git commit -m "Add checksums for ${TAG}"
   git push origin HEAD
 else
