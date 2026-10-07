@@ -10,8 +10,8 @@
 //! result. After a successful parse the stack holds exactly the root term.
 
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_put,
-    enif_make_new_map, enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
+    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_sub_binary,
+    enif_make_uint64, ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
@@ -19,7 +19,7 @@ use std::cell::RefCell;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
-use crate::nif_util::{make_tuple2, map_from_arrays, FLATMAP_LIMIT};
+use crate::nif_util::{make_map, make_tuple2, FLATMAP_LIMIT};
 use crate::types::MAX_DEPTH;
 
 /// Cap on each retained thread-local buffer, so a one-off huge document
@@ -340,25 +340,6 @@ fn build_map(
         }
     }
     make_map(env, keys, vals)
-}
-
-#[inline]
-fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
-    unsafe {
-        let mut map: ERL_NIF_TERM = 0;
-        if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) {
-            map
-        } else {
-            // Duplicate keys: last value wins (matches value_to_term).
-            map = enif_make_new_map(env.as_c_arg());
-            for i in 0..keys.len() {
-                let mut new_map: ERL_NIF_TERM = 0;
-                enif_make_map_put(env.as_c_arg(), map, keys[i], vals[i], &mut new_map);
-                map = new_map;
-            }
-            map
-        }
-    }
 }
 
 // Erlang External Term Format tags for arbitrary-precision integers.

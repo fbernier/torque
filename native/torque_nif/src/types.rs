@@ -1,11 +1,11 @@
-use rustler::sys::{enif_make_list_from_array, enif_make_map_put, enif_make_new_map, ERL_NIF_TERM};
+use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
 use rustler::{Env, NewBinary, Term};
 use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
 use std::mem::MaybeUninit;
 
 use crate::atoms;
 use crate::native_decode::bignum_term;
-use crate::nif_util::map_from_arrays;
+use crate::nif_util::make_map;
 
 const STACK_SIZE: usize = 64;
 
@@ -119,20 +119,14 @@ pub fn value_to_term<'a>(
                     keys[i].write(make_binary_term(env, k).as_c_arg());
                     vals[i].write(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
-                let mut map: ERL_NIF_TERM = 0;
-                unsafe {
-                    if map_from_arrays(
-                        env,
-                        keys.as_ptr() as *const ERL_NIF_TERM,
-                        vals.as_ptr() as *const ERL_NIF_TERM,
-                        count,
-                        &mut map,
-                    ) {
-                        Some(Term::new(env, map))
-                    } else {
-                        build_map_dedup(env, obj, child_depth, nodes)
-                    }
-                }
+                // SAFETY: the loop initialised the first `count` slots of each.
+                let (keys, vals) = unsafe {
+                    (
+                        std::slice::from_raw_parts(keys.as_ptr() as *const ERL_NIF_TERM, count),
+                        std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, count),
+                    )
+                };
+                Some(unsafe { Term::new(env, make_map(env, keys, vals)) })
             } else {
                 let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 let mut vals: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
@@ -140,38 +134,8 @@ pub fn value_to_term<'a>(
                     keys.push(make_binary_term(env, k).as_c_arg());
                     vals.push(value_to_term(env, v, child_depth, nodes)?.as_c_arg());
                 }
-                let mut map: ERL_NIF_TERM = 0;
-                unsafe {
-                    if map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), count, &mut map) {
-                        Some(Term::new(env, map))
-                    } else {
-                        build_map_dedup(env, obj, child_depth, nodes)
-                    }
-                }
+                Some(unsafe { Term::new(env, make_map(env, &keys, &vals)) })
             }
         }
-    }
-}
-
-/// Fallback for objects with duplicate keys. Iterates all pairs so that the
-/// last value for each duplicate key wins, matching common JSON parser behaviour.
-/// Marked `#[cold]` so the optimiser keeps the duplicate-free fast path hot.
-#[cold]
-fn build_map_dedup<'a>(
-    env: Env<'a>,
-    obj: &sonic_rs::Object,
-    depth: u32,
-    nodes: &mut usize,
-) -> Option<Term<'a>> {
-    unsafe {
-        let mut map = enif_make_new_map(env.as_c_arg());
-        for (k, v) in obj.iter() {
-            let key = make_binary_term(env, k).as_c_arg();
-            let val = value_to_term(env, v, depth, nodes)?.as_c_arg();
-            let mut new_map: ERL_NIF_TERM = 0;
-            enif_make_map_put(env.as_c_arg(), map, key, val, &mut new_map);
-            map = new_map;
-        }
-        Some(Term::new(env, map))
     }
 }

@@ -304,6 +304,23 @@ defmodule Torque.PointerTest do
       {:ok, doc} = Torque.parse(~s({"a":1,"a":2}))
       assert [{:ok, %{"a" => 2}}] = Torque.get_many(doc, [""])
     end
+
+    # Past 64 members the object is built from heap arrays, and past 32 ERTS
+    # makes a hash map; duplicates there still resolve to the last value.
+    test "large objects with duplicate keys match decode/1" do
+      for size <- [40, 100] do
+        members = Enum.map(1..size, &~s("k#{&1}":{"v":[#{&1}]}))
+        dups = Enum.map(1..10, &~s("k#{&1}":{"v":"last #{&1}"}))
+        json = "{" <> Enum.join(members ++ dups, ",") <> "}"
+        expected = Torque.decode!(json)
+        assert map_size(expected) == size
+        assert expected["k1"] == %{"v" => "last 1"}
+
+        {:ok, doc} = Torque.parse(json)
+        assert {:ok, ^expected} = Torque.get(doc, "")
+        assert [^expected] = Torque.get_many_nil(doc, [""])
+      end
+    end
   end
 
   describe "get/3 error propagation" do
