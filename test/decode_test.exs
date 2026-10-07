@@ -146,7 +146,7 @@ defmodule Torque.DecodeTest do
 
       for order <- [keys, Enum.reverse(keys), Enum.shuffle(keys)] do
         json = "{" <> Enum.map_join(order, ",", &~s("#{&1}":"#{&1}")) <> "}"
-        expected = :json.decode(json)
+        expected = Jason.decode!(json)
 
         decoded = Torque.decode!(json)
         assert map_size(decoded) == length(keys)

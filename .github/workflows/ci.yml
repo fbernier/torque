@@ -44,6 +44,11 @@ jobs:
           - os: ubuntu-latest
             otp: "27"
             elixir: "1.18"
+          # The oldest versions mix.exs allows. Pinned: setup-beam has no
+          # OTP 24 for Ubuntu releases after 24.04.
+          - os: ubuntu-24.04
+            otp: "24"
+            elixir: "1.15"
           # Apple Silicon: the NEON escape kernels and parser paths.
           - os: macos-14
             otp: "28"
