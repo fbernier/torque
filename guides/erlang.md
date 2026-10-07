@@ -34,6 +34,7 @@ macOS and glibc Linux on `aarch64` and `x86_64`.
 |---|---|
 | `TORQUE_BUILD=true` | Build the NIF with cargo instead (any platform, needs a Rust toolchain) |
 | `TORQUE_CPU_VARIANT=v3` | Force an x86_64 variant (`v3`, `v2`, anything else for the baseline) |
+| `TORQUE_NIF_TARGET=<triple>` | Fetch the NIF for another platform, e.g. `x86_64-unknown-linux-gnu` |
 
 ## Decoding
 
