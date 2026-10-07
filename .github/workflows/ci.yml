@@ -65,10 +65,10 @@ jobs:
         run: cargo test -p torque_nif
 
   dialyzer:
-    name: Dialyzer
+    name: Dialyzer, docs and package
     runs-on: ubuntu-latest
     env:
-      # dialyxir is a :dev-only dependency.
+      # dialyxir and ex_doc are :dev-only dependencies.
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v6
@@ -92,3 +92,5 @@ jobs:
 
       - run: mix deps.get
       - run: mix dialyzer
+      - run: mix docs --warnings-as-errors
+      - run: mix hex.build
