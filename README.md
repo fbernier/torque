@@ -28,7 +28,7 @@ def deps do
 end
 ```
 
-Precompiled binaries are available for common targets. To compile from source, install a stable Rust toolchain and set `TORQUE_BUILD=true`.
+Precompiled binaries are available for macOS and glibc Linux on `aarch64` and `x86_64` (with CPU-optimized variants on `x86_64`, below). Anything else, such as musl (Alpine) or Windows, builds from source: install a stable Rust toolchain and set `TORQUE_BUILD=true`.
 
 A source build targets the platform's baseline CPU, so the binary runs on any machine of that architecture. On x86_64 that baseline is SSE2, which leaves the AVX2 parser paths out: set `RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"` to match the precompiled v3 variant, or `-C target-cpu=native` only when the binary will run on the machine that built it.
 
@@ -181,6 +181,27 @@ expected to encode to large output (more than roughly 20 KB):
 {:ok, json} = Torque.encode(big_term, dirty: true)
 ```
 
+## Using with Phoenix, Plug and Postgrex
+
+Torque provides the functions these libraries call on a JSON module
+(`encode_to_iodata!/1`, `encode!/1`, `decode!/1`), so it can replace Jason in
+their configuration:
+
+```elixir
+# config/config.exs
+config :phoenix, :json_library, Torque
+config :postgrex, :json_library, Torque
+
+# endpoint.ex
+plug Plug.Parsers,
+  parsers: [:urlencoded, :multipart, :json],
+  json_decoder: Torque
+```
+
+Structs, Ecto schemas included, must implement `Torque.Encoder` (for example
+`@derive {Torque.Encoder, only: [:id, :name]}`): a struct without an
+implementation raises rather than encoding its raw fields.
+
 ## API
 
 | Function | Description |
@@ -196,6 +217,7 @@ expected to encode to large output (more than roughly 20 KB):
 | `Torque.get(doc, path, default)` | Extract field with default for missing paths |
 | `Torque.get_many(doc, paths)` | Extract multiple fields in one NIF call |
 | `Torque.get_many_nil(doc, paths)` | Extract multiple fields, `nil` for missing |
+| `Torque.get_many_defaults(doc, defaults)` | Extract fields with per-path defaults (`%{path => default}`) |
 | `Torque.length(doc, path)` | Return length of array at path |
 | `Torque.parse(binary, opts)` | Parse JSON into opaque document reference |
 | `Torque.parse_get_many_nil(binary, pointers)` | Fused parse + extract of compiled pointers in one NIF call |
