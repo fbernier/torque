@@ -180,8 +180,8 @@ expected to encode to large output (more than roughly 20 KB):
 | Function | Description |
 |----------|-------------|
 | `Torque.compile_pointers(paths, opts)` | Pre-compile a fixed path set into a reusable handle |
-| `Torque.decode(binary)` | Decode JSON to Elixir terms |
-| `Torque.decode!(binary)` | Decode JSON, raising on error |
+| `Torque.decode(binary, opts)` | Decode JSON to Elixir terms (`strings: :copy` to detach strings from the input) |
+| `Torque.decode!(binary, opts)` | Decode JSON, raising on error |
 | `Torque.encode(term, opts)` | Encode term to JSON binary |
 | `Torque.encode!(term, opts)` | Encode term, raising on error |
 | `Torque.encode_to_iodata(term, opts)` | Encode term, returns binary directly (fastest) |

@@ -92,6 +92,16 @@ defmodule Torque do
 
   Automatically uses a dirty CPU scheduler for inputs larger than 20 KB.
 
+  ## Options
+
+    * `:strings`: `:reference` (the default) returns strings longer than 64
+      bytes as sub-binaries of `json` where no unescaping was needed, which
+      saves a copy but keeps all of `json` alive for as long as any of them
+      is. `:copy` gives every string its own binary: use it when only a small
+      part of a large document outlives the call.
+
+  Any other option raises `ArgumentError`.
+
   ## Examples
 
       iex> Torque.decode(~s({"a":1,"b":"hello"}))
@@ -100,21 +110,49 @@ defmodule Torque do
       iex> Torque.decode(~s([1,2,3]))
       {:ok, [1, 2, 3]}
 
+      iex> Torque.decode(~s({"a":"hello"}), strings: :copy)
+      {:ok, %{"a" => "hello"}}
+
       iex> match?({:error, _}, Torque.decode("invalid"))
       true
   """
   @doc group: :decode
-  @spec decode(binary()) :: {:ok, term()} | {:error, binary() | :nesting_too_deep}
-  def decode(json) when is_binary(json) and byte_size(json) > @timeslice_bytes do
+  @spec decode(binary(), keyword()) :: {:ok, term()} | {:error, binary() | :nesting_too_deep}
+  def decode(json, opts \\ [])
+
+  def decode(json, []) when is_binary(json) and byte_size(json) > @timeslice_bytes do
     Torque.Native.decode_dirty(json)
   end
 
-  def decode(json) when is_binary(json) do
+  def decode(json, []) when is_binary(json) do
     Torque.Native.decode(json)
+  end
+
+  def decode(json, opts) when is_binary(json) and byte_size(json) > @timeslice_bytes do
+    Torque.Native.decode_opts_dirty(json, copy_strings!(opts))
+  end
+
+  def decode(json, opts) when is_binary(json) do
+    Torque.Native.decode_opts(json, copy_strings!(opts))
+  end
+
+  defp copy_strings!(opts) do
+    case Keyword.validate!(opts, strings: :reference)[:strings] do
+      :reference ->
+        false
+
+      :copy ->
+        true
+
+      other ->
+        raise ArgumentError, "expected :strings to be :reference or :copy, got: #{inspect(other)}"
+    end
   end
 
   @doc """
   Decodes a JSON binary into Elixir terms, raising on error.
+
+  Accepts the same options as `decode/2`.
 
   ## Examples
 
@@ -122,9 +160,9 @@ defmodule Torque do
       %{"a" => 1}
   """
   @doc group: :decode
-  @spec decode!(binary()) :: term()
-  def decode!(json) when is_binary(json) do
-    case decode(json) do
+  @spec decode!(binary(), keyword()) :: term()
+  def decode!(json, opts \\ []) when is_binary(json) do
+    case decode(json, opts) do
       {:ok, term} -> term
       {:error, reason} -> raise ArgumentError, "decode error: #{reason}"
     end

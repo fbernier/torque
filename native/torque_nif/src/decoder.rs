@@ -369,7 +369,7 @@ fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) 
 #[rustler::nif]
 fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    let result = native_decode::decode_to_term(env, input_term, json.as_slice());
+    let result = native_decode::decode_to_term(env, input_term, json.as_slice(), true);
     schedule::consume_timeslice(env, timeslice_percent(json.len()));
     result
 }
@@ -377,7 +377,21 @@ fn decode<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_dirty<'a>(env: Env<'a>, json: Binary<'a>) -> Term<'a> {
     let input_term = json.encode(env).as_c_arg();
-    native_decode::decode_to_term(env, input_term, json.as_slice())
+    native_decode::decode_to_term(env, input_term, json.as_slice(), true)
+}
+
+#[rustler::nif]
+fn decode_opts<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool) -> Term<'a> {
+    let input_term = json.encode(env).as_c_arg();
+    let result = native_decode::decode_to_term(env, input_term, json.as_slice(), !copy_strings);
+    schedule::consume_timeslice(env, timeslice_percent(json.len()));
+    result
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_opts_dirty<'a>(env: Env<'a>, json: Binary<'a>, copy_strings: bool) -> Term<'a> {
+    let input_term = json.encode(env).as_c_arg();
+    native_decode::decode_to_term(env, input_term, json.as_slice(), !copy_strings)
 }
 
 // --- Pre-compiled pointers + fused parse/extract ---

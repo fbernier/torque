@@ -199,6 +199,54 @@ defmodule Torque.DecodeTest do
     end
   end
 
+  describe "decode/2 strings option" do
+    defp document(records) do
+      long = String.duplicate("s", 80)
+
+      "[" <>
+        Enum.map_join(1..records, ",", fn i ->
+          ~s({"id":#{i},"text":"#{long}#{i}","esc":"line\\n#{long}","nested":{"k":"#{long}"}})
+        end) <> "]"
+    end
+
+    defp long_strings(term) when is_map(term),
+      do: Enum.flat_map(term, fn {_, v} -> long_strings(v) end)
+
+    defp long_strings(term) when is_list(term), do: Enum.flat_map(term, &long_strings/1)
+    defp long_strings(term) when is_binary(term) and byte_size(term) > 64, do: [term]
+    defp long_strings(_), do: []
+
+    # Two records stay on the normal scheduler; 200 cross the 20 KB dirty limit.
+    test "strings: :copy decodes the same terms with every string detached" do
+      for records <- [2, 200] do
+        json = document(records)
+        reference = Torque.decode!(json)
+        assert {:ok, ^reference} = Torque.decode(json, strings: :copy)
+        assert ^reference = Torque.decode!(json, strings: :copy)
+
+        copied = long_strings(Torque.decode!(json, strings: :copy))
+        assert copied != []
+        assert Enum.all?(copied, &(:binary.referenced_byte_size(&1) == byte_size(&1)))
+
+        # The default keeps unescaped strings as sub-binaries of the input.
+        assert Enum.any?(
+                 long_strings(reference),
+                 &(:binary.referenced_byte_size(&1) == byte_size(json))
+               )
+      end
+    end
+
+    test "strings: :reference is the default" do
+      json = document(2)
+      assert Torque.decode(json, strings: :reference) == Torque.decode(json)
+    end
+
+    test "invalid options raise" do
+      assert_raise ArgumentError, fn -> Torque.decode("1", strings: :bogus) end
+      assert_raise ArgumentError, fn -> Torque.decode("1", keys: :atoms) end
+    end
+  end
+
   describe "decode!/1" do
     test "valid json" do
       assert %{"a" => 1} = Torque.decode!(~s({"a":1}))

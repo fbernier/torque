@@ -589,12 +589,19 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     }
 }
 
-pub fn decode_to_term<'a>(env: Env<'a>, input_term: ERL_NIF_TERM, bytes: &[u8]) -> Term<'a> {
+/// Decodes a whole document. With `borrow`, strings the parser did not have to
+/// unescape are sub-binaries of `input_term`; otherwise every string is copied.
+pub fn decode_to_term<'a>(
+    env: Env<'a>,
+    input_term: ERL_NIF_TERM,
+    bytes: &[u8],
+    borrow: bool,
+) -> Term<'a> {
     let input = InputRef {
         term: input_term,
         base: bytes.as_ptr(),
         len: bytes.len(),
-        borrow: true,
+        borrow,
     };
     match decode_with(env, input, bytes) {
         Ok(Some(root)) => make_tuple2(env, atoms::ok().as_c_arg(), root),
