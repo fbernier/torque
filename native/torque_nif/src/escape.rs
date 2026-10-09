@@ -966,6 +966,7 @@ mod tests {
     #[test]
     fn the_kernels_write_nothing_past_six_times_the_input() {
         type Kernel = fn(*const u8, usize, *mut u8) -> usize;
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut kernels: Vec<(&str, Kernel)> = vec![
             ("escape", |s, l, d| unsafe { escape_dispatch(s, l, d) }),
             ("validate", |s, l, d| unsafe {
